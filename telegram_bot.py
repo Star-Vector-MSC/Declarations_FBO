@@ -202,7 +202,8 @@ async def send_chunks(message, text):
 
 def create_dispatcher():
     dispatcher = Dispatcher()
-    generation_lock = asyncio.Lock()
+    delivery_slots = asyncio.Semaphore(3)
+    checklist_lock = asyncio.Lock()
     navigation = {}
 
     async def show_navigation(message, mode, records, stage, cabinet=None, selected=None, page=0):
@@ -322,10 +323,9 @@ def create_dispatcher():
     async def deliver(message, selected=None, cabinet=None, supply_id=None):
         if not await authorized(message):
             return
-        if generation_lock.locked():
-            await message.answer('Уже формирую файлы. Дождитесь результата и повторите запрос.')
-            return
-        async with generation_lock:
+        if delivery_slots.locked():
+            await message.answer('Запрос принят в очередь. Пришлю файлы автоматически, повторять номер не нужно.')
+        async with delivery_slots:
             folder = None
             progress = await message.answer('Достаю готовые файлы из локальной базы…')
             try:
@@ -470,10 +470,10 @@ def create_dispatcher():
                 await callback.message.answer('Нажимайте только те поставки, куда уже загрузили ДТ.',
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
                 return
-            if generation_lock.locked():
-                await callback.message.answer('Другая операция ещё выполняется. Повторите нажатие позже.')
-                return
-            async with generation_lock:
+            if checklist_lock.locked():
+                await callback.message.answer('Подтверждение принято в очередь. Обработаю автоматически; '
+                                              'следующий файл можно запросить уже сейчас.')
+            async with checklist_lock:
                 if action == 'audit':
                     result = await asyncio.to_thread(lambda: Checklist().status(
                         batch['records'], batch['shipment_date'], scope_supplies=batch.get('scope_supplies')))

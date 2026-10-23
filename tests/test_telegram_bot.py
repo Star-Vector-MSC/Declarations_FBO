@@ -120,5 +120,154 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
                 client.return_value.mark.assert_called_once_with([second])
 
 
+class ConcurrentHandlerTests(unittest.IsolatedAsyncioTestCase):
+    def flow(self):
+        dispatcher = app.create_dispatcher()
+        supply = next(h.callback for h in dispatcher.message.handlers if h.callback.__name__ == 'supply')
+        confirm = dispatcher.callback_query.handlers[0].callback
+        return supply, confirm
+
+    def message(self, number='123'):
+        return SimpleNamespace(from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(type=ChatType.PRIVATE), text='/supply '+number,
+            answer=AsyncMock(return_value=SimpleNamespace(edit_text=AsyncMock())),
+            answer_document=AsyncMock())
+
+    def callback(self, letter='a'):
+        return SimpleNamespace(from_user=SimpleNamespace(id=123), message=self.message(),
+                               data='done:'+letter*12, answer=AsyncMock())
+
+    def batch(self):
+        return dict(id='a'*12, shipment_date='2026-10-25',
+                    records=[dict(cabinet='A', supply_id='1')])
+
+    async def test_file_is_delivered_during_slow_checkbox_write(self):
+        import threading
+        started, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+        def slow_mark(records):
+            loop.call_soon_threadsafe(started.set)
+            if not release.wait(5):
+                raise TimeoutError('Test did not release checkbox writer')
+            return dict(checked=1, updated=1, blocked=[])
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            path = folder/'123.xlsx'
+            path.write_bytes(b'workbook')
+            supply, confirm = self.flow()
+            message, callback = self.message(), self.callback()
+            with patch.object(app, 'setting', return_value='123'), \
+                 patch.object(app, 'load_batch', return_value=self.batch()), \
+                 patch.object(app, 'BATCHES', folder), \
+                 patch.object(app, 'cache_service') as cache, patch.object(app, 'Checklist') as client, \
+                 patch.object(app, 'generate_files', new_callable=AsyncMock,
+                    return_value=(folder, dict(total=1, created=1, missing=0, cabinets=1), '2026-10-25')), \
+                 patch.object(app, 'direct_documents', return_value=([('A','123',path)],[])), \
+                 patch.object(app, 'save_batch', return_value=self.batch()):
+                cache.return_value.evict_confirmed = AsyncMock()
+                client.return_value.mark.side_effect = slow_mark
+                task = asyncio.create_task(confirm(callback))
+                try:
+                    await asyncio.wait_for(started.wait(), 2)
+                    await asyncio.wait_for(supply(message), 2)
+                    message.answer_document.assert_awaited_once()
+                    self.assertFalse(task.done())
+                finally:
+                    release.set()
+                    await asyncio.wait_for(task, 2)
+
+    async def test_confirmation_completes_while_file_delivery_is_waiting(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        async def slow_file(*args, **kwargs):
+            started.set()
+            await release.wait()
+            raise RuntimeError('Simulated file error')
+        with tempfile.TemporaryDirectory() as directory:
+            supply, confirm = self.flow()
+            callback = self.callback()
+            with patch.object(app, 'setting', return_value='123'), \
+                 patch.object(app, 'generate_files', side_effect=slow_file), \
+                 patch.object(app, 'load_batch', return_value=self.batch()), \
+                 patch.object(app, 'BATCHES', Path(directory)), \
+                 patch.object(app, 'cache_service') as cache, patch.object(app, 'Checklist') as client:
+                cache.return_value.evict_confirmed = AsyncMock()
+                client.return_value.mark.return_value = dict(checked=1, updated=1, blocked=[])
+                task = asyncio.create_task(supply(self.message()))
+                try:
+                    await asyncio.wait_for(started.wait(), 2)
+                    await asyncio.wait_for(confirm(callback), 2)
+                    client.return_value.mark.assert_called_once()
+                    self.assertFalse(task.done())
+                finally:
+                    release.set()
+                    await asyncio.wait_for(task, 2)
+
+    async def test_two_confirmations_are_serialized_without_dropping_second(self):
+        import threading
+        started, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+        calls = []
+        def mark(records):
+            calls.append('start')
+            if len(calls) == 1:
+                loop.call_soon_threadsafe(started.set)
+                if not release.wait(5):
+                    raise TimeoutError('Test did not release first confirmation')
+            calls.append('end')
+            return dict(checked=1, updated=1, blocked=[])
+        with tempfile.TemporaryDirectory() as directory:
+            _, confirm = self.flow()
+            first, second = self.callback(), self.callback('b')
+            with patch.object(app, 'setting', return_value='123'), \
+                 patch.object(app, 'load_batch', return_value=self.batch()), \
+                 patch.object(app, 'BATCHES', Path(directory)), \
+                 patch.object(app, 'cache_service') as cache, patch.object(app, 'Checklist') as client:
+                cache.return_value.evict_confirmed = AsyncMock()
+                client.return_value.mark.side_effect = mark
+                first_task = asyncio.create_task(confirm(first))
+                second_task = None
+                try:
+                    await asyncio.wait_for(started.wait(), 2)
+                    # First await is the queue notification; the actual writer remains busy.
+                    queued = asyncio.Event()
+                    second.message.answer.side_effect = lambda *a, **k: queued.set()
+                    second_task = asyncio.create_task(confirm(second))
+                    await asyncio.wait_for(queued.wait(), 2)
+                    self.assertEqual(calls, ['start'])
+                    self.assertFalse(second_task.done())
+                finally:
+                    release.set()
+                    await asyncio.wait_for(asyncio.gather(first_task, *([second_task] if second_task else [])), 2)
+                self.assertEqual(calls, ['start','end','start','end'])
+                self.assertEqual(client.return_value.mark.call_count, 2)
+
+    async def test_excess_file_requests_are_queued_and_executed(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        entered = []
+        async def slow_file(*args, **kwargs):
+            entered.append(kwargs['supply_id'])
+            if len(entered) == 3:
+                started.set()
+            await release.wait()
+            raise RuntimeError('Simulated cache miss')
+        supply, _ = self.flow()
+        messages = [self.message(str(n)) for n in range(1,5)]
+        with patch.object(app, 'setting', return_value='123'), \
+             patch.object(app, 'generate_files', side_effect=slow_file):
+            tasks = [asyncio.create_task(supply(m)) for m in messages[:3]]
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                queued = asyncio.Event()
+                messages[3].answer.side_effect = lambda *a, **k: queued.set() or SimpleNamespace(edit_text=AsyncMock())
+                tasks.append(asyncio.create_task(supply(messages[3])))
+                await asyncio.wait_for(queued.wait(), 2)
+                self.assertEqual(len(entered),3)
+            finally:
+                release.set()
+                await asyncio.wait_for(asyncio.gather(*tasks),2)
+            self.assertEqual(entered,['1','2','3','4'])
+
+
+
 if __name__ == '__main__':
     unittest.main()
