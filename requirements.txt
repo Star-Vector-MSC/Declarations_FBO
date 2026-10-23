@@ -1,0 +1,6 @@
+google-auth[requests]>=2.0,<3
+openpyxl>=3.1,<4
+psycopg[binary]>=3.1,<4
+tzdata
+python-dotenv>=1.0,<2
+aiogram>=3.31,<4
