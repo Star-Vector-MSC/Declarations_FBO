@@ -44,9 +44,20 @@ def all_records(rows):
 
 
 def signature(records):
-    """Order-independent goods snapshot; checkbox changes invalidate the supply."""
-    fields = ('nm_id', 'date', 'quantity', 'free_stock', 'wild', 'product', 'checked')
-    return sorted(tuple(normalize(r.get(f, '')) for f in fields) for r in records)
+    """Delivery identity, independent of volatile stock and checkbox formatting.
+
+    Stock is an input of the scheduled snapshot, not a reason to evict that
+    snapshot between refreshes. A title change matters only if country changes.
+    Pending/checked state is checked separately by pending_groups.
+    """
+    def number(value):
+        try:
+            return str(integer(value))
+        except ValueError:
+            return normalize(value)
+    return sorted((number(r['nm_id']), parse_date(r['date']).isoformat(),
+                   number(r['quantity']), normalize(r['wild']),
+                   '860' if 'казан' in normalize(r['product']) else '156') for r in records)
 
 
 def pending_groups(records):
@@ -128,9 +139,14 @@ class CacheStore:
             removed = 0
             for row in db.execute('SELECT cabinet_key,supply,records FROM files').fetchall():
                 key = row['cabinet_key'], row['supply']
-                if key not in groups or signature(json.loads(row['records'])) != signature(groups[key]):
+                if key not in groups:
                     db.execute('DELETE FROM files WHERE cabinet_key=? AND supply=?', key)
                     removed += 1
+                elif signature(json.loads(row['records'])) != signature(groups[key]):
+                    # Keep the supply discoverable and explain the blocked file.
+                    db.execute('UPDATE files SET workbook=NULL, reason=? WHERE cabinet_key=? AND supply=?',
+                        ('В плане изменились состав, дата, количество или страна товара. '
+                         'Нажмите «Обновить базу».', *key))
             db.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)', ('pruned_at', now().isoformat()))
             db.execute('PRAGMA incremental_vacuum')
         return removed

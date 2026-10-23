@@ -49,11 +49,40 @@ class CacheTests(unittest.TestCase):
             self.store.publish([('broken',)], [])
         self.assertEqual(self.store.info()['files'], 1)
 
-    def test_manual_checkbox_or_changed_stock_invalidates_file(self):
-        self.assertEqual(self.store.prune([dict(record(), free_stock='21')]), 1)
-        self.store.publish([entry(self.goods)], [])
+    def test_stock_change_keeps_scheduled_snapshot_available_without_network(self):
+        self.assertEqual(self.store.prune([dict(record(), free_stock='21')]), 0)
+        with patch('file_cache.Sheets', side_effect=AssertionError('No network')):
+            folder, counts, _ = self.store.materialize(supply_id='123', root=self.root/'delivery')
+        self.assertEqual((folder/'Shop'/'123.xlsx').read_bytes(), b'prepared workbook')
+        self.assertEqual(counts['created'], 1)
+
+    def test_manual_checkbox_removes_completed_file(self):
         self.assertEqual(self.store.prune([record(checked='TRUE')]), 1)
         self.assertEqual(self.store.info()['files'], 0)
+
+    def test_changed_quantity_blocks_file_with_reason_instead_of_losing_supply(self):
+        self.store.prune([dict(record(), quantity='11')])
+        folder, counts, _ = self.store.materialize(supply_id='123', root=self.root/'delivery')
+        self.assertEqual((counts['total'], counts['created'], counts['missing']), (1,0,1))
+        self.assertEqual(self.store.info()['problems'],1)
+        self.assertFalse(list(folder.glob('*/*.xlsx')))
+        self.assertIn('Обновить базу', (folder/'СПИСОК_ФАЙЛОВ.csv').read_text(encoding='utf-8-sig'))
+
+    def test_invalid_quantity_blocks_only_affected_supply(self):
+        second=[record(supply='789')]
+        self.store.publish([entry(self.goods),entry(second)],self.goods+second)
+        self.store.prune([dict(record(),quantity='ошибка'),*second])
+        self.assertEqual(self.store.info()['files'],1)
+        self.assertEqual(self.store.info()['problems'],1)
+
+    def test_equivalent_unchecked_values_do_not_evict_snapshot(self):
+        self.assertEqual(self.store.prune([record(checked='')]),0)
+        self.assertEqual(self.store.info()['files'],1)
+
+    def test_country_change_blocks_old_workbook(self):
+        self.store.prune([dict(record(), product='Казан')])
+        self.assertEqual(self.store.info()['files'],0)
+        self.assertEqual(self.store.info()['problems'],1)
 
     def test_partial_checked_goods_do_not_form_partial_workbook(self):
         live = [record(), dict(record(checked='TRUE'), nm_id='789')]
