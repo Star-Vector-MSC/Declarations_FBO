@@ -25,7 +25,11 @@ def now():
 
 
 def group_key(record):
-    return normalize(record['cabinet']), str(integer(record['supply_id']))
+    supply = integer(record['supply_id'])
+    cabinet = normalize(record['cabinet'])
+    if supply <= 0 or not cabinet:
+        raise ValueError('Missing or invalid supply identity')
+    return cabinet, str(supply)
 
 
 def all_records(rows):
@@ -63,9 +67,19 @@ def signature(records):
 def pending_groups(records):
     groups = defaultdict(list)
     for record in records:
-        groups[group_key(record)].append(record)
+        try:
+            key = group_key(record)
+        except (ValueError, TypeError):
+            # Approved planning rows may not have a WB supply number yet.
+            continue
+        groups[key].append(record)
+    def valid_article(record):
+        try:
+            return integer(record['nm_id']) > 0
+        except (ValueError, TypeError):
+            return False
     return {key: goods for key, goods in groups.items()
-            if all(normalize(r['checked']) in ('', 'false') for r in goods)
+            if all(normalize(r['checked']) in ('', 'false') and valid_article(r) for r in goods)
             and len({r['date'] for r in goods}) == 1}
 
 
@@ -96,11 +110,18 @@ class CacheStore:
 
     def publish(self, entries, navigation):
         # A failed source read/build never reaches this atomic replacement.
+        unassigned = 0
+        for record in navigation:
+            try:
+                group_key(record)
+            except (ValueError, TypeError):
+                unassigned += 1
         with self.connect() as db:
             db.execute('DELETE FROM files')
             db.executemany('INSERT INTO files VALUES (?,?,?,?,?,?,?,?)', entries)
             for key, value in [('updated_at', now().isoformat()), ('last_error', ''),
-                               ('status_dates', json.dumps(sorted({r['date'] for r in navigation})))]:
+                               ('status_dates', json.dumps(sorted({r['date'] for r in navigation}))),
+                               ('unassigned_rows', str(unassigned))]:
                 db.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)', (key, value))
 
     def info(self):

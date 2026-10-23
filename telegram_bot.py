@@ -533,6 +533,7 @@ def create_dispatcher():
             info = await asyncio.to_thread(cache_service().store.info)
             updated = info.get('updated_at', 'ещё не обновлялась')
             await message.answer(f'Excel в базе: {info["files"]}\nТребуют проверки: {info["problems"]}\n'
+                f'Строки без номера поставки или кабинета: {info.get("unassigned_rows", "0")} (пропущены)\n'
                 f'Последнее обновление: {updated}\nАвтообновление: каждые 6 часов.\n'
                 'Очистка по галочкам: каждые 5 минут и после «Готово».\n'
                 + ('Последнее обновление не удалось; выдаются сохранённые файлы.' if info.get('last_error') else ''),

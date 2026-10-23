@@ -84,6 +84,19 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(self.store.info()['files'],0)
         self.assertEqual(self.store.info()['problems'],1)
 
+    def test_unassigned_plan_rows_do_not_break_other_supplies(self):
+        live=[record(),record(supply=''),record(supply='не назначен'),record(supply='0')]
+        self.assertEqual(list(pending_groups(live)),[('shop','123')])
+        self.assertEqual(self.store.prune(live),0)
+        self.store.publish([entry(self.goods)],live)
+        self.assertEqual(self.store.info()['unassigned_rows'],'3')
+        self.assertEqual(self.store.info()['files'],1)
+
+    def test_missing_article_blocks_whole_supply_instead_of_partial_export(self):
+        live=[record(),dict(record(),nm_id='')]
+        self.assertEqual(pending_groups(live),{})
+        self.assertEqual(self.store.prune(live),1)
+
     def test_partial_checked_goods_do_not_form_partial_workbook(self):
         live = [record(), dict(record(checked='TRUE'), nm_id='789')]
         self.assertEqual(pending_groups(live), {})
