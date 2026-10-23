@@ -82,60 +82,52 @@ class RulesTests(unittest.TestCase):
 
 class KitRulesTests(unittest.TestCase):
     def receipts(self):
-        # Two different shipments with matching components; exact equality picks the second.
-        return {component: [dict(arrival='20.10.2026', quantity='100',
-                    dt='10131010/201026/1234567', row=10+i, vehicle='CAR-NEW',truck='NEW'),
-                dict(arrival='19.10.2026', quantity='100',dt='10131010/191026/1234567',
-                    row=20+i,vehicle='CAR-OLD',truck='OLD')]
-                for i,component in enumerate(('wild1945','wild2135'))}
+        return {'wild1945': [dict(arrival='20.10.2026',quantity='300',
+            dt='10131010/201026/1234567',row=10,vehicle='',truck=''),
+            dict(arrival='',quantity='100',dt='',row=20,vehicle='OTHER',truck='OTHER')]}
 
-    def test_components_cover_stock_and_share_boundary_vehicle_and_dt(self):
+    def test_kit_uses_only_filled_declaration_from_authorized_component(self):
         dt,trace=choose_vendor_dt('wild103',self.receipts(),200,date(2026,10,22))
-        self.assertEqual(dt,'10131010/191026/1234567')
-        self.assertEqual({r['component'] for r in trace},{'wild1945','wild2135'})
-        self.assertEqual([r['cumulative'] for r in trace],[100,200,100,200])
+        self.assertEqual(dt,'10131010/201026/1234567')
+        self.assertEqual({r['component'] for r in trace},{'wild1945'})
 
-    def test_equal_dt_with_different_vehicles_is_blocked(self):
+    def test_other_component_and_transport_do_not_block_authorized_source(self):
         receipts=self.receipts()
-        receipts['wild2135'][1]['vehicle']='OTHER'
-        with self.assertRaisesRegex(ValueError,'машина'):
-            choose_vendor_dt('wild103',receipts,200,date(2026,10,22))
-
-    def test_same_vehicle_with_different_dt_is_blocked(self):
-        receipts=self.receipts()
-        receipts['wild2135'][1]['dt']='10131010/191026/7654321'
-        with self.assertRaisesRegex(ValueError,'ДТ компонентов'):
-            choose_vendor_dt('wild103',receipts,200,date(2026,10,22))
-
-    def test_planned_component_without_arrival_does_not_count(self):
-        receipts=self.receipts()
-        for row in receipts['wild2135']: row['arrival']=''
-        with self.assertRaisesRegex(ValueError,'wild2135'):
-            choose_vendor_dt('wild103',receipts,200,date(2026,10,22))
-
-    def test_missing_component_does_not_use_direct_kit_receipt(self):
-        receipts=self.receipts()
-        receipts['wild103']=receipts.pop('wild2135')
-        with self.assertRaisesRegex(ValueError,'wild2135'):
-            choose_vendor_dt('wild103',receipts,200,date(2026,10,22))
-
-    def test_transport_must_be_present_but_common_truck_can_identify_it(self):
-        receipts=self.receipts()
-        for component in receipts.values():
-            component[1]['vehicle']=''
-            component[1]['truck']=''
-        with self.assertRaisesRegex(ValueError,'машина'):
-            choose_vendor_dt('wild103',receipts,200,date(2026,10,22))
-        for component in receipts.values(): component[1]['truck']='TRUCK-2'
+        receipts['wild2135']=[dict(arrival='',quantity='100',dt='',row=30,vehicle='OTHER',truck='OTHER')]
         self.assertEqual(choose_vendor_dt('wild103',receipts,200,date(2026,10,22))[0],
-                         '10131010/191026/1234567')
+                         '10131010/201026/1234567')
+
+    def test_multiple_filled_declarations_require_review(self):
+        receipts=self.receipts()
+        receipts['wild1945'][1]['dt']='10131010/191026/7654321'
+        with self.assertRaisesRegex(ValueError,'несколько'):
+            choose_vendor_dt('wild103',receipts,200,date(2026,10,22))
+
+    def test_missing_source_is_not_replaced_with_other_component(self):
+        receipts={'wild2135':self.receipts()['wild1945']}
+        with self.assertRaisesRegex(ValueError,'wild1945'):
+            choose_vendor_dt('wild103',receipts,200,date(2026,10,22))
+
+    def test_unarrived_source_or_insufficient_quantity_is_not_accepted(self):
+        receipts=self.receipts()
+        with self.assertRaises(ValueError):
+            choose_vendor_dt('wild103',receipts,301,date(2026,10,22))
+        receipts['wild1945'][0]['arrival']=''
+        with self.assertRaises(ValueError):
+            choose_vendor_dt('wild103',receipts,200,date(2026,10,22))
+
+    def test_invalid_filled_declaration_is_not_accepted(self):
+        receipts=self.receipts()
+        receipts['wild1945'][0]['dt']='invalid'
+        with self.assertRaises(ValueError):
+            choose_vendor_dt('wild103',receipts,200,date(2026,10,22))
 
     def test_prepare_keeps_finished_kit_article(self):
         records=[dict(wild='wild103D',free_stock='200',quantity='5',cabinet='Shop',product='Комплект')]
         prepare(records,self.receipts(),date(2026,10,22))
         self.assertEqual(records[0]['state'],'READY')
         self.assertEqual(records[0]['wild'],'wild103D')
-        self.assertEqual(records[0]['dt'],'10131010/191026/1234567')
+        self.assertEqual(records[0]['dt'],'10131010/201026/1234567')
 
     def test_receipts_loader_reads_transport_by_header(self):
         rows=[['wild','Кол-во к заказу','ФАКТИЧЕСКАЯ ДАТА ПРИБЫТИЯ НА СКЛАД ОТ НАС',

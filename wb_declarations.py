@@ -153,34 +153,25 @@ def choose_dt(receipts, stock, as_of):
     raise ValueError(f'Arrived quantity {total} is below free stock {stock}')
 
 
-# Component quantities are per one finished kit; never replace the WB article.
-KITS = {'wild103': (('wild1945', 1), ('wild2135', 1))}
+# Explicit user-approved source for this finished kit; keep its WB article.
+KIT_DT_SOURCE = {'wild103': 'wild1945'}
 
 
 def choose_vendor_dt(vendor, receipts, stock, as_of):
-    if vendor not in KITS:
+    if vendor not in KIT_DT_SOURCE:
         return choose_dt(receipts.get(vendor, []), stock, as_of)
-    selected, trace = [], []
-    for component, per_kit in KITS[vendor]:
-        try:
-            dt, used = choose_dt(receipts.get(component, []), stock * per_kit, as_of)
-        except ValueError as exc:
-            raise ValueError(f'Комплект {vendor}, компонент {component}: {exc}') from None
-        selected.append((dt, used[-1]))
-        trace.extend({**row, 'component': component, 'per_kit': per_kit} for row in used)
-    first = selected[0][1]
-    for _, boundary in selected[1:]:
-        vehicles = [normalize(r.get('vehicle', '')) for r in (first, boundary)]
-        trucks = [normalize(r.get('truck', '')) for r in (first, boundary)]
-        if all(vehicles):
-            same_transport = vehicles[0] == vehicles[1]
-        else:
-            same_transport = bool(all(trucks) and trucks[0] == trucks[1])
-        if not same_transport:
-            raise ValueError(f'Комплект {vendor}: не подтверждена одна машина для компонентов')
-    if len({dt for dt, _ in selected}) != 1:
-        raise ValueError(f'Комплект {vendor}: ДТ компонентов не совпадают')
-    return selected[0][0], trace
+    source = KIT_DT_SOURCE[vendor]
+    filled = [r for r in receipts.get(source, []) if str(r['dt']).strip()]
+    declarations = {str(r['dt']).strip() for r in filled}
+    if not declarations:
+        raise ValueError(f'Комплект {vendor}: у {source} нет заполненной ДТ')
+    if len(declarations) != 1:
+        raise ValueError(f'Комплект {vendor}: у {source} несколько ДТ, требуется проверка')
+    try:
+        dt, used = choose_dt(filled, stock, as_of)
+    except ValueError as exc:
+        raise ValueError(f'Комплект {vendor}, источник {source}: {exc}') from None
+    return dt, [{**row, 'component': source, 'per_kit': 1} for row in used]
 
 
 def shipment_queue(rows, selected_date, as_of, cabinet=None, supply_id=None, include_checked=False):
