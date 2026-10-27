@@ -237,12 +237,18 @@ def parse_archive(text):
         raise ArchiveError("not a planner memory archive")
     if type(body["schema_version"]) is not int or body["schema_version"] != SCHEMA_VERSION:
         raise ArchiveError("unsupported archive schema version")
-    if type(body["sha256"]) is not str or body["sha256"] != _digest(body["events"]):
+    try:
+        digest = _digest(body["events"])
+    except (ValueError, RecursionError) as exc:  # e.g. escaped lone surrogate (UnicodeEncodeError)
+        raise ArchiveError(f"archive data is not canonical UTF-8: {exc}") from None
+    if type(body["sha256"]) is not str or body["sha256"] != digest:
         raise ArchiveError("archive checksum mismatch (corrupted)")
     try:
         _validate_events(body["events"])
     except ValueError as exc:
         raise ArchiveError(f"invalid archive history: {exc}") from None
+    if len(_render(body["events"]).encode("utf-8")) > MAX_BYTES:
+        raise ArchiveError(f"canonical export would exceed {MAX_BYTES} bytes; nothing restored")
     return body["events"]
 
 
@@ -437,7 +443,7 @@ class MemoryStore:
 
     def restore_markdown(self, text):
         """Explicit restore: 'restored' into empty DB, 'unchanged' if identical, else ConflictError."""
-        events = parse_archive(text)
+        events = parse_archive(text)  # also rejects oversized canonical export before any write
         with self._txn() as con:
             current = self._load(con)
             if current == events:

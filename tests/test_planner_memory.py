@@ -175,6 +175,52 @@ class PlannerMemoryTest(unittest.TestCase):
                     dst.restore_markdown(text)
                 self.assertEqual(dst.history(), [])
 
+    def test_escaped_lone_surrogate_is_archive_error(self):
+        s, _ = self.populated()
+        md = s.export_markdown()
+        line = next(ln for ln in md.split("\n") if ln.startswith('{"events":'))
+        # Escaped JSON sequence only (ASCII in source); json.loads yields a lone surrogate.
+        bad = md.replace(line, line.replace("Keep two pallets", "Keep \\ud800 pallets", 1))
+        self.assertIn("\\ud800", bad)
+        empty, local = self.store("e.db"), self.store("l.db")
+        local.propose("local rule")
+        for dst in (empty, local):
+            before = dst.history()
+            with self.subTest(db=dst.db_path):
+                with self.assertRaises(pm.ArchiveError) as cm:
+                    dst.restore_markdown(bad)
+                self.assertIsInstance(cm.exception, pm.PlannerMemoryError)
+                self.assertEqual(dst.history(), before)
+        with self.assertRaises(pm.ArchiveError):
+            pm.parse_archive(bad)
+
+    def test_restore_rejects_archive_whose_full_export_exceeds_limit(self):
+        s = self.store("big.db")
+        for n in range(3):
+            s.propose(f"long rule {n} " + "w" * 1500, reason="r" * 1500)
+        full = s.export_markdown()
+        line = next(ln for ln in full.split("\n") if ln.startswith('{"events":'))
+        compact = f"{pm.MARKER}\n```json\n{line}\n```\n"  # valid: human summary omitted
+        small, big = len(compact.encode("utf-8")), len(full.encode("utf-8"))
+        cap = (small + big) // 2
+        self.assertLess(small, cap)
+        self.assertGreater(big, cap)
+        ok = self.store("ok.db")
+        self.assertEqual(ok.restore_markdown(compact), "restored")  # fine under real cap
+        self.assertEqual(ok.export_markdown(), full)
+        dst = self.store("dst.db", backup="dst.md")
+        local = self.store("local.db")
+        local.propose("local rule")
+        before = local.history()
+        with mock.patch.object(pm, "MAX_BYTES", cap):
+            with self.assertRaises(pm.ArchiveError):
+                dst.restore_markdown(compact)
+            with self.assertRaises(pm.ArchiveError):
+                local.restore_markdown(compact)
+        self.assertEqual(dst.history(), [])
+        self.assertFalse(os.path.exists(self.path("dst.md")))
+        self.assertEqual(local.history(), before)
+
     def test_nonempty_different_destination_refused(self):
         s, _ = self.populated()
         dst = self.store("b.db")
