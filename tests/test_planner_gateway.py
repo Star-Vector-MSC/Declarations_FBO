@@ -47,12 +47,15 @@ class FakeSession:
             return {"userEnteredValue": {"formulaValue": s}}
         self.tpl = [{}] * 38
         self.tpl[13], self.tpl[19], self.tpl[25], self.tpl[36] = f("=M2"), f("=S2/X2"), f("=ARRAYFORMULA(A2:A)"), f("=T2")
-        self.posts, self.fail, self.grid = [], False, []
+        self.posts, self.fail, self.grid, self.hook = [], False, [], None
+        self.rc, self.ids = 3, dict(IDS)
 
     def request(self, method, url, params=None, json=None, timeout=None):
         assert url.startswith(ps._API + "fake-base")
         if method == "POST":
             self.posts.append(copy.deepcopy(json))
+            if self.hook:  # a human types a row at the bottom between our GET and POST
+                self.hook()
             self.apply(json["requests"])
             if self.fail:
                 raise ConnectionError("response lost")
@@ -63,11 +66,20 @@ class FakeSession:
             self.grid.append(params["ranges"])
             return Resp({"sheets": [{"data": [{"rowData": [{"values": self.tpl}]}]}]})
         return Resp({"sheets": [{"properties": {"sheetId": i, "title": t, "gridProperties": {
-            "rowCount": 3 if i == 777 else 99}}} for t, i in IDS.items()]})
+            "rowCount": self.rc if t == ps.T_TARGET else 99}}} for t, i in self.ids.items()]})
 
     def apply(self, reqs):
         rows = self.tabs[ps.T_TARGET]
         for r in reqs:
+            if "appendDimension" in r:
+                self.rc += r["appendDimension"]["length"]
+            d = r.get("insertDimension")
+            if d:
+                a, b = d["range"]["startIndex"], d["range"]["endIndex"]
+                assert a < self.rc, "insert beyond grid"
+                rows.extend([] for _ in range(a - len(rows)))
+                rows[a:a] = [[] for _ in range(b - a)]
+                self.rc += b - a
             u = r.get("updateCells")
             if u:
                 g, c = u["range"], u["range"]["startColumnIndex"]
@@ -83,7 +95,7 @@ class FakeSession:
 class GatewayTest(unittest.TestCase):
     def setUp(self):
         self.old = sys.modules.get("wb_declarations")
-        sys.modules["wb_declarations"] = types.SimpleNamespace(KEY="unused", SHIPMENTS=["fake-base", "fake-prod"])
+        sys.modules["wb_declarations"] = types.SimpleNamespace(KEY="unused", SHIPMENTS=("fake-base", 100))
         self.s = FakeSession()
         self.gw = ps.PlannerSheets(session=self.s)
         plan = planner.build_plan(self.gw.snapshot(), {}, "2026-11-02", "Коледино")
@@ -115,7 +127,8 @@ class GatewayTest(unittest.TestCase):
         self.assertTrue(url.endswith("range=A3"))
         reqs = self.s.posts[0]["requests"]
         self.assertNotIn("USER_ENTERED", json.dumps(reqs))
-        self.assertEqual(reqs[0], {"appendDimension": {"sheetId": 777, "dimension": "ROWS", "length": 1}})
+        self.assertEqual(reqs[0], {"insertDimension": {"range": {"sheetId": 777, "dimension": "ROWS", "startIndex": 2,
+                                                                 "endIndex": 4}, "inheritFromBefore": True}})
         for r in reqs:
             (_, b), = r.items()
             self.assertEqual((b.get("destination") or b.get("range") or b)["sheetId"], 777)
@@ -170,10 +183,90 @@ class GatewayTest(unittest.TestCase):
             self.gw.publish(forged)
         self.assertEqual(self.s.posts, [])
 
-    def test_production_spreadsheet_refused(self):
-        sys.modules["wb_declarations"] = types.SimpleNamespace(KEY="unused", SHIPMENTS=["same", "same"])
+    def test_config_gid_and_swapped_titles_refused(self):
+        for bad in (["same", "same"], ["fake-base", "100"], ["fake-base", True], ["fake-base"]):
+            sys.modules["wb_declarations"] = types.SimpleNamespace(KEY="unused", SHIPMENTS=bad)
+            with self.assertRaises(ps.PlannerSheetsError):
+                ps.PlannerSheets(session=self.s).snapshot()
+        sys.modules["wb_declarations"] = types.SimpleNamespace(KEY="unused", SHIPMENTS=("fake-base", 100))
+        for swap in ({ps.T_ORIG: 777, ps.T_TARGET: 100}, {ps.T_ORIG: 100, ps.T_TARGET: 100}):
+            self.s.ids.update(swap)
+            with self.assertRaises(ps.PlannerSheetsError):
+                ps.PlannerSheets(session=self.s).snapshot()
+            with self.assertRaises(ps.PlannerSheetsError):
+                ps.PlannerSheets(session=self.s).publish(self.draft)
+        self.assertEqual(self.s.posts, [])
+
+    def test_insert_rows_keep_concurrent_human_row(self):
+        t = self.s.tabs[ps.T_TARGET]
+        self.s.hook = lambda: t.append(["человек", "x"])
+        self.assertTrue(self.gw.publish(self.draft).endswith("range=A3"))
+        self.assertEqual((t[1][:3], t[4], len(t)), (["ручная", "", "=1+1"], ["человек", "x"], 5))
+        self.assertEqual([t[2][COL("Артикул")], t[3][COL("Артикул")]], ["A1", "12345"])
+        kinds = {next(iter(r)) for r in self.s.posts[0]["requests"]}
+        self.assertEqual(kinds, {"insertDimension", "copyPaste", "updateCells"})
+        out = [{"updateCells": {"range": {"sheetId": 777, "startRowIndex": 1, "endRowIndex": 2}}}]
         with self.assertRaises(ps.PlannerSheetsError):
-            ps.PlannerSheets(session=self.s).snapshot()
+            ps._guard(out, 777, 100, 2, 4)
+
+    def test_grid_extended_before_insert(self):
+        self.s.rc = 2
+        self.gw.publish(self.draft)
+        self.assertEqual(self.s.posts[0]["requests"][:2], [
+            {"appendDimension": {"sheetId": 777, "dimension": "ROWS", "length": 1}},
+            {"insertDimension": {"range": {"sheetId": 777, "dimension": "ROWS", "startIndex": 2, "endIndex": 4},
+                                 "inheritFromBefore": True}}])
+        self.assertEqual(self.s.tabs[ps.T_TARGET][3][COL("Артикул")], "12345")
+
+    def test_wiped_ids_after_lost_response_blocked(self):
+        self.s.fail = True
+        with self.assertRaises(ps.PublishUncertainError):
+            self.gw.publish(self.draft)
+        self.s.fail = False
+        t = self.s.tabs[ps.T_TARGET]
+        for r in t[2:4]:
+            r[COL("Комментарии")] = r[len(ps.ORIGINAL)] = ""
+        n = len(t)
+        with self.assertRaises(ps.PublishConflictError):
+            self.gw.publish(self.draft)
+        self.assertEqual((len(self.s.posts), len(t)), (1, n))
+
+    def test_replay_compares_all_owned_cells(self):
+        self.gw.publish(self.draft)
+        t, hdr = self.s.tabs[ps.T_TARGET], list(ps.ORIGINAL + ps.META)
+        for name, v in (("wild", "W9"), ("Плановая дата прибытия авто на вб", 46001), ("Правила плана", "{}"),
+                        ("Шт в коробе", ""), ("Прогноз после", 12345.5), ("Склад Wildberries", "Казань")):
+            c = hdr.index(name)
+            old, t[3][c] = t[3][c], v
+            with self.assertRaises(ps.PublishConflictError, msg=name):
+                self.gw.publish(self.draft)
+            t[3][c] = old
+        t[2][COL("Количество")] = 48.0
+        t[2], t[3] = t[3], t[2]
+        self.assertTrue(self.gw.publish(self.draft).endswith("range=A3"))
+        del t[3]
+        with self.assertRaises(ps.PublishConflictError):
+            self.gw.publish(self.draft)
+        self.assertEqual(len(self.s.posts), 1)
+
+    def test_scalar_formula_predicate_and_refusals(self):
+        ok = ("=1+1", "=M2", "=S2/X2", "=T2", "=$A$1*(2+B$3)^2%", "= -A1 - 3.5")
+        bad = ("=SEQUENCE(9)", "=FILTER(A2:A,B2:B)", "=SORT(A2:A9)", "=UNIQUE(A2:A)", "=TRANSPOSE(A1:C1)",
+               '=SPLIT(A1,",")', "=SUM(A1)", "=LOG10(5)", "=A1:A3", "={1,2}", "=Sheet1!A1", "=", "=(1", "=1+", "=A1 B1")
+        self.assertTrue(all(map(ps._scalar, ok)))
+        self.assertFalse(any(map(ps._scalar, bad)))
+        row = self.s.tabs[ps.T_TARGET][1]
+        for f in bad[:6]:
+            row.append(f)
+            with self.assertRaises(ps.PlannerSheetsError, msg=f):
+                self.gw.publish(self.draft)
+            row.pop()
+        self.assertEqual(self.s.posts, [])
+        self.s.tpl[13] = {"userEnteredValue": {"formulaValue": "=SEQUENCE(9)"}}
+        self.gw.publish(self.draft)
+        src = [r["copyPaste"]["source"]["startColumnIndex"] for r in self.s.posts[0]["requests"]
+               if "copyPaste" in r and r["copyPaste"]["source"]["sheetId"] == 100]
+        self.assertEqual(src, [36])
 
 
 class StoreTest(unittest.TestCase):

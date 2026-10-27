@@ -26,7 +26,8 @@ META = ("ID плана", "Версия плана", "Прогноз до", "Пр
 MSK = timezone(timedelta(hours=3), "MSK")  # Moscow: fixed UTC+3, no DST
 _EPOCH = date(1899, 12, 30)
 _DF = {"numberFormat": {"type": "DATE", "pattern": "dd.mm.yyyy"}}
-_SPILL = re.compile(r"ARRAYFORMULA|IMPORTRANGE|FLATTEN|QUERY\s*\(|SEQUENCE\s*\(|^\s*=\s*\{", re.I)
+_TOK = re.compile(r"\s*(?:(\$?[A-Za-z]{1,3}\$?[1-9][0-9]*|[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)|([-+*/^%()]))")
+_NUMRE = re.compile(r"[+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 _HEX12 = re.compile(r"[0-9a-f]{12}")
 _UNSURE = ("Связь с Google Sheets прервалась во время записи, результат неизвестен. Повторите публикацию "
            "той же версии: повтор проверит маркеры и не создаст дубликатов.")
@@ -82,6 +83,43 @@ def _dv(v):
 
 def _serial(iso):
     return None if iso is None else (date.fromisoformat(iso) - _EPOCH).days
+
+
+def _cmp(v):
+    """Comparable cell value (sheet value or our CellData): numbers -> Fraction (48 == 48.0 == "48"), blank -> None."""
+    if isinstance(v, dict):
+        u = v.get("userEnteredValue") or {}
+        v = u.get("stringValue", u.get("numberValue"))
+    s = "" if v is None else str(v).strip()
+    return Fraction(s) if _NUMRE.fullmatch(s) else (s or None)
+
+
+def _scalar(f):
+    """Provably scalar formula: '=' then numbers / single-cell refs ($A$1), + - * / ^ %, parentheses, spaces."""
+    if not isinstance(f, str) or not f.startswith("="):
+        return False
+    s, i, depth, opnd = f[1:].rstrip(), 0, 0, False
+    while i < len(s):
+        m = _TOK.match(s, i)
+        if not m:
+            return False
+        i, a, op = m.end(), m.group(1), m.group(2)
+        if a or op == "(":
+            if opnd:  # operand/call directly after an operand (e.g. LOG10(5)) is not arithmetic
+                return False
+            depth, opnd = depth + (op == "("), bool(a)
+        elif op == ")":
+            if not opnd or not depth:
+                return False
+            depth -= 1
+        elif op == "%":
+            if not opnd:
+                return False
+        elif opnd:
+            opnd = False
+        elif op not in "+-":
+            return False
+    return opnd and depth == 0
 
 
 def _sid(x):
@@ -144,14 +182,20 @@ def _draft(d):
     return did, ver, plan
 
 
-def _guard(reqs, tid, oid):
-    """Every write destination must be the test sheet; only formula copy may read the original."""
+def _guard(reqs, tid, oid, r0, r1):
+    """Every write destination must be the test sheet, cells only inside the rows inserted at [r0, r1);
+    only formula copy may read the original."""
     for r in reqs:
         (kind, b), = r.items()
-        dst = {"appendDimension": b, "copyPaste": b.get("destination"), "updateCells": b.get("range")}.get(kind)
+        dst = {"appendDimension": b, "insertDimension": b.get("range"), "copyPaste": b.get("destination"),
+               "updateCells": b.get("range")}.get(kind)
         src = b["source"]["sheetId"] if kind == "copyPaste" else tid
         if (not dst or dst.get("sheetId") != tid or src not in (tid, oid)
-                or (src == oid and b.get("pasteType") != "PASTE_FORMULA")):
+                or (src == oid and b.get("pasteType") != "PASTE_FORMULA")
+                or (kind == "insertDimension"
+                    and (dst.get("dimension"), dst.get("startIndex"), dst.get("endIndex")) != ("ROWS", r0, r1))
+                or (kind in ("copyPaste", "updateCells")
+                    and not r0 <= dst.get("startRowIndex", -1) < dst.get("endRowIndex", -1) <= r1)):
             raise PlannerSheetsError("Внутренняя проверка: запись вне тестового листа запрещена")
 
 
@@ -164,15 +208,15 @@ class PlannerSheets:
     def _config(self):
         if self._cfg is None:
             try:
-                import wb_declarations as wb  # existing project config only
-                base, prod, key = _sid(wb.SHIPMENTS[0]), {_sid(x) for x in list(wb.SHIPMENTS)[1:2]}, wb.KEY
+                import wb_declarations as wb  # existing project config only: (workbook_id, original_sheet_gid)
+                base, og, key = _sid(wb.SHIPMENTS[0]), wb.SHIPMENTS[1], wb.KEY
             except PlannerSheetsError:
                 raise
             except Exception:
                 raise PlannerSheetsError("Конфигурация таблиц недоступна") from None
-            if base in prod:
+            if type(og) is not int or og < 0:
                 raise PlannerSheetsError("Конфигурация таблиц некорректна")
-            self._cfg = base, key
+            self._cfg = base, key, og
         return self._cfg
 
     def _http(self):
@@ -216,8 +260,10 @@ class PlannerSheets:
             if len(m) != 1:
                 raise PlannerSheetsError(f"Лист «{t}» должен быть ровно один")
             ids[t] = {"sheetId": m[0].get("sheetId", 0), "rows": m[0].get("gridProperties", {}).get("rowCount", 0)}
-        tid = ids[T_TARGET]["sheetId"]
-        if tid in {ids[t]["sheetId"] for t in (T_TEST, T_PACK, T_ORIG)}:
+        tid, og = ids[T_TARGET]["sheetId"], self._config()[2]
+        if ids[T_ORIG]["sheetId"] != og:
+            raise PlannerSheetsError(f"Лист «{T_ORIG}» не совпадает с настроенным исходным листом")
+        if tid == og or tid in {ids[t]["sheetId"] for t in (T_TEST, T_PACK, T_ORIG)}:
             raise PlannerSheetsError("Тестовый лист совпадает с исходным")
         if self._pinned is None:
             self._pinned = tid
@@ -264,18 +310,37 @@ class PlannerSheets:
         def g(r, n, o=0):
             return _cell(r, cols[_c(n, o)])
 
-        sd = _serial(plan["date"])
+        sd, arr, rules = _serial(plan["date"]), _serial(plan.get("arrival_date")), _canon(plan["rules"])
+
+        def cells(ln):  # the ONE owned input+metadata cell map: used for writing and for replay comparison
+            return {_c("Дата отгрузки (склад)"): _dv(sd), _c("Плановая дата прибытия авто на вб"): _dv(arr),
+                    _c("Склад Wildberries"): _sv(plan["warehouse"]), _c("wild"): _sv(ln["wild"]),
+                    _c("Артикул"): _sv(ln["article"]), _c("Название магазина"): _sv(ln["cabinet"]),
+                    _c("Тип поставки"): _sv("Монопаллета"), _c("Количество"): _nv(ln["quantity"]),
+                    _c("Шт в коробе"): _nv(ln["box_qty"]), _c("Шт на паллете"): _nv(ln["pallet_qty"]),
+                    _c("Итого паллет"): _nv(ln["pallets"]), _c("Итого коробов"): _nv(ln["quantity"] // ln["box_qty"]),
+                    _c("средние продажи в день по артикулу"): _nv(ln["sales7"]),
+                    _c("Комментарии"): _sv(f"ТЕСТ. План {did} v{ver}: {ln['reason']}"),
+                    _c("ID плана"): _sv(did), _c("Версия плана"): _nv(ver),
+                    _c("Прогноз до"): _nv(ln["forecast_before"]), _c("Прогноз после"): _nv(ln["forecast_after"]),
+                    _c("Причина"): _sv(ln["reason"]), _c("Снимок данных"): _sv(plan["source_hash"]),
+                    _c("Правила плана"): _sv(rules)}
+
+        per = [cells(ln) for ln in plan["lines"]]
+        keys, need = list(per[0]), ("ID плана", "Версия плана", "Снимок данных", "Правила плана")
+        for r in rows[1:]:  # plan rows whose ID/required markers were wiped while other traces remain: orphans
+            com = _s(g(r, "Комментарии"))
+            marked = any(not planner._blank(g(r, m)) for m in META) or str(com or "").startswith("ТЕСТ. План ")
+            if marked and any(planner._blank(g(r, m)) for m in need):
+                raise PublishConflictError("В тестовом листе есть строки плана с неполными маркерами (стёрт ID?); "
+                                           "запись не выполнена, проверьте лист вручную")
         # Markers first (before live-source hash): an exported revision is never written twice.
         mine = [i for i in range(1, len(rows)) if planner._ident(g(rows[i], "ID плана")) == did]
         if mine:
             if any(planner._num(g(rows[i], "Версия плана")) != ver for i in mine):
                 raise PublishConflictError("Другая версия этого плана уже выгружена; повторная выгрузка запрещена")
-            got = Counter((planner._ident(g(r, "Артикул")), planner._ident(g(r, "Название магазина")),
-                           planner._num(g(r, "Количество")), planner._num(g(r, "Дата отгрузки (склад)")),
-                           _s(g(r, "Склад Wildberries")), _s(g(r, "Снимок данных"))) for r in (rows[i] for i in mine))
-            want = Counter((ln["article"], ln["cabinet"], Fraction(ln["quantity"]), Fraction(sd), plan["warehouse"],
-                            plan["source_hash"]) for ln in plan["lines"])
-            if got != want:
+            got = Counter(tuple(_cmp(_cell(rows[i], cols[k])) for k in keys) for i in mine)
+            if got != Counter(tuple(_cmp(p[k]) for k in keys) for p in per):
                 raise PublishConflictError("Строки этой версии в тестовом листе неполны или изменены; "
                                            "запись не выполнена, проверьте лист вручную")
             return self._link(tid, mine[0] + 1)
@@ -294,8 +359,9 @@ class PlannerSheets:
         last = len(rows)
         while last > 1 and all(planner._blank(c) for c in rows[last - 1]):
             last -= 1
-        if any(isinstance(c, str) and c.startswith("=") and _SPILL.search(c) for r in rows for c in r):
-            raise PlannerSheetsError("В тестовом листе есть формулы-массивы; дописывать строки под ними небезопасно")
+        if any(isinstance(c, str) and c.startswith("=") and not _scalar(c) for r in rows for c in r):
+            raise PlannerSheetsError("В тестовом листе есть формулы сложнее простой арифметики; "
+                                     "дописывать строки небезопасно")
         oc = _bind(orig[0], ORIGINAL, T_ORIG)
         act = oc[_c(ORIGINAL[0])]
         tpl = max((i for i in range(1, len(orig)) if not planner._blank(_cell(orig[i], act))), default=None)
@@ -305,29 +371,15 @@ class PlannerSheets:
         def area(c0, c1, sid=tid, r0=start, r1=end):
             return {"sheetId": sid, "startRowIndex": r0, "endRowIndex": r1, "startColumnIndex": c0, "endColumnIndex": c1}
 
-        reqs = [{"appendDimension": {"sheetId": tid, "dimension": "ROWS", "length": end - rc}}] if end > rc else []
-        fr = last - 1 if last >= 2 else (1 if rc >= 2 else None)
+        # Grid needs a row at `start`; then insert n fresh rows there (rows typed meanwhile shift down, preserved).
+        reqs = [{"appendDimension": {"sheetId": tid, "dimension": "ROWS", "length": last + 1 - rc}}] if last >= rc else []
+        reqs.append({"insertDimension": {"range": {"sheetId": tid, "dimension": "ROWS", "startIndex": start,
+                                                   "endIndex": end}, "inheritFromBefore": start > 1}})
+        fr = last - 1 if last >= 2 else (end if rc >= 2 else None)
         if fr is not None:
             reqs += [{"copyPaste": {"source": area(0, width, r0=fr, r1=fr + 1), "destination": area(0, width),
                                     "pasteType": t, "pasteOrientation": "NORMAL"}}
                      for t in ("PASTE_FORMAT", "PASTE_DATA_VALIDATION")]
-        arr, rules = _serial(plan.get("arrival_date")), _canon(plan["rules"])
-
-        def cells(ln):
-            return {_c("Дата отгрузки (склад)"): _dv(sd), _c("Плановая дата прибытия авто на вб"): _dv(arr),
-                    _c("Склад Wildberries"): _sv(plan["warehouse"]), _c("wild"): _sv(ln["wild"]),
-                    _c("Артикул"): _sv(ln["article"]), _c("Название магазина"): _sv(ln["cabinet"]),
-                    _c("Тип поставки"): _sv("Монопаллета"), _c("Количество"): _nv(ln["quantity"]),
-                    _c("Шт в коробе"): _nv(ln["box_qty"]), _c("Шт на паллете"): _nv(ln["pallet_qty"]),
-                    _c("Итого паллет"): _nv(ln["pallets"]), _c("Итого коробов"): _nv(ln["quantity"] // ln["box_qty"]),
-                    _c("средние продажи в день по артикулу"): _nv(ln["sales7"]),
-                    _c("Комментарии"): _sv(f"ТЕСТ. План {did} v{ver}: {ln['reason']}"),
-                    _c("ID плана"): _sv(did), _c("Версия плана"): _nv(ver),
-                    _c("Прогноз до"): _nv(ln["forecast_before"]), _c("Прогноз после"): _nv(ln["forecast_after"]),
-                    _c("Причина"): _sv(ln["reason"]), _c("Снимок данных"): _sv(plan["source_hash"]),
-                    _c("Правила плана"): _sv(rules)}
-
-        per = [cells(ln) for ln in plan["lines"]]
         if tpl is not None:  # formula cells only, from the latest actual original row
             d = self._api("GET", "", {"ranges": f"{_rng(T_ORIG)}!{tpl + 1}:{tpl + 1}",
                                       "fields": "sheets(data(rowData(values(userEnteredValue))))"})
@@ -337,7 +389,7 @@ class PlannerSheets:
                 vals = []
             for key, ocol in oc.items():
                 f = ((vals[ocol] if ocol < len(vals) else {}).get("userEnteredValue") or {}).get("formulaValue")
-                if f and key not in per[0] and not _SPILL.search(f):
+                if f and key not in per[0] and _scalar(f):  # unverifiable formulas are skipped, never copied
                     reqs.append({"copyPaste": {"source": area(ocol, ocol + 1, oid, tpl, tpl + 1),
                                                "destination": area(cols[key], cols[key] + 1),
                                                "pasteType": "PASTE_FORMULA", "pasteOrientation": "NORMAL"}})
@@ -346,6 +398,6 @@ class PlannerSheets:
             dated = "userEnteredFormat" in per[0][key]
             reqs.append({"updateCells": {"range": area(c, c + 1), "rows": [{"values": [p[key]]} for p in per],
                                          "fields": "userEnteredValue" + ",userEnteredFormat.numberFormat" * dated}})
-        _guard(reqs, tid, oid)
+        _guard(reqs, tid, oid, start, end)
         self._api("POST", ":batchUpdate", body={"requests": reqs})
         return self._link(tid, start + 1)
