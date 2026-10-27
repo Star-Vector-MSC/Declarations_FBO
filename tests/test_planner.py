@@ -8,10 +8,17 @@ TH = ["wild", "Артикул", "Название магазина", "Назва
       "Средние продажи 3 дня", "Средние продажи 7 дней", "Средние продажи 14 дней", "Средние продажи 30 дней",
       "Прогнозные остатки в днях", "Прогнозные остатки в днях", "Остаток на дней по вилду"]
 PH = ["wild", "шт в коробе", "Штук на палете", "шт в коробе", "Штук на палете"]
+PI, AI = TH.index("Название товара"), TH.index("Артикул")
 
 
 def T(w, a, cab="C1", stock=1000, cur=5, s=(10, 10, 10, 10), fc=2, wd=40, fc2=99):
     return [w, a, cab, "Item " + a, stock, cur, *s, fc, fc2, wd]
+
+
+def TP(w, a, product, cab="C1", **kw):
+    row = T(w, a, cab, **kw)
+    row[PI] = product  # header lookup, not hardcoded offset
+    return row
 
 
 def PK(w, box=10, pal=400):
@@ -181,6 +188,84 @@ class PlannerTest(unittest.TestCase):
                 P.build_plan(s, None, *args)
         res = P.build_plan(s, None, "2026-10-28", "WH")
         self.assertEqual((res["source_hash"], res["arrival_date"], res["date"]), ("h1", None, "2026-10-28"))
+
+    # --- regressions: invalid free stock blocks the whole wild ---
+
+    def test_invalid_stock_in_any_row_blocks_whole_wild(self):
+        for badv in (None, "", "  ", "#N/A", float("nan"), float("inf"), float("-inf"), True, False, -5, "-10"):
+            rows = [T("W1", "A", "C1", 1000), T("W1", "A", "C2", badv), T("W2", "B")]
+            pk = [PK("W1"), PK("W2")]
+            res = self.plan(rows, pk)
+            self.assertEqual(self.q(res), {("B", "C1"): 100}, repr(badv))
+            self.assertTrue(any("wild W1:" in w and "free stock" in w for w in res["warnings"]), repr(badv))
+            for cab in ("C1", "C2"):
+                with self.assertRaisesRegex(ValueError, "free stock"):
+                    self.plan(rows, pk, fixed=[fx("A", 10, "override", cab=cab)])
+
+    def test_invalid_stock_in_skipped_row_still_blocks(self):
+        bad_row = T("W1", "X", "C2", "#N/A")
+        bad_row[AI] = None  # row skipped for identity, but its wild stock is still invalid
+        res = self.plan([T("W1", "A"), bad_row], [PK("W1")])
+        self.assertEqual(res["lines"], [])
+        self.assertTrue(any("wild W1:" in w and "free stock" in w for w in res["warnings"]))
+
+    def test_all_invalid_stock_fails_cleanly(self):
+        rows = [T("W1", "A", "C1", None), T("W1", "A", "C2", "#N/A")]
+        res = self.plan(rows, [PK("W1")])
+        self.assertEqual((res["lines"], res["total_pallets"]), ([], 0.0))
+        self.assertTrue(any("wild W1:" in w and "blocked" in w for w in res["warnings"]))
+        with self.assertRaisesRegex(ValueError, "free stock"):
+            self.plan(rows, [PK("W1")], fixed=[fx("A", 10)])
+
+    def test_zero_and_consistent_localized_stock(self):
+        res = self.plan([T("W1", "A", "C1", 0), T("W1", "A", "C2", "0")], [PK("W1")])
+        self.assertEqual(res["lines"], [])
+        self.assertFalse(any("wild W1:" in w for w in res["warnings"]))
+        self.assertTrue(any("no feasible" in w for w in res["warnings"]))
+        res = self.plan([T("W1", "A", "C1", "1 000"), T("W1", "A", "C2", 1000.0)], [PK("W1")])
+        self.assertEqual(self.q(res), {("A", "C1"): 100, ("A", "C2"): 100})
+
+    # --- regressions: permanent FBO bans ---
+
+    def test_banned_groups_never_planned(self):
+        labels = ["Газовые горелки туристические", "Парфюм для дома", "  ГАЗОВЫЕ   горелки  ",
+                  "парфюм  ДЛЯ дома ", "Газовые горелки", "газовые горёлки туристические"]
+        for lab in labels:
+            rows = [TP("W1", "A", lab, fc=0, s=(50,) * 4), T("W2", "B")]
+            pk = [PK("W1"), PK("W2")]
+            res = self.plan(rows, pk, min_sales=1, min_wild_days=0, max_current_days=100)
+            self.assertEqual(self.q(res), {("B", "C1"): 100}, lab)
+            self.assertEqual(res["eligible_count"], 1, lab)
+            self.assertTrue(any("wild W1:" in w and "banned" in w and "FBO" in w for w in res["warnings"]), lab)
+            with self.assertRaisesRegex(ValueError, "banned"):
+                self.plan(rows, pk, fixed=[fx("A", 10, "manager override")])
+
+    def test_banned_rejected_before_capacity(self):
+        rows = [TP("W1", "A", "Парфюм для дома", stock=10 ** 6, s=(100,) * 4, fc=0), T("W2", "B")]
+        res = self.plan(rows, [PK("W1", 1, 7), PK("W2")], capacity=20)
+        self.assertEqual(self.q(res), {("B", "C1"): 100})
+        self.assertEqual(res["total_pallets"], 0.25)
+
+    def test_banned_any_row_blocks_wild_in_every_cabinet(self):
+        skipped = TP("W3", "X", "Газовые горелки туристические", cab="C2")
+        skipped[AI] = None
+        rows = [T("W1", "A", "C1"), TP("W1", "A", "Газовые горелки туристические", cab="C2"),
+                T("W1", "Z", "C3"), T("W2", "B"), T("W3", "C"), skipped]
+        pk = [PK("W1"), PK("W2"), PK("W3")]
+        res = self.plan(rows, pk)
+        self.assertEqual(self.q(res), {("B", "C1"): 100})
+        self.assertEqual(res["eligible_count"], 1)
+        for a, cab in (("A", "C1"), ("A", "C2"), ("Z", "C3"), ("C", "C1")):
+            with self.assertRaisesRegex(ValueError, "banned"):
+                self.plan(rows, pk, fixed=[fx(a, 10, "must ship", cab=cab)])
+
+    def test_unrelated_categories_remain_eligible(self):
+        for lab in ("Газовые баллоны", "Парфюм для тела", "Горелка для фондю", "Item A", None):
+            res = self.plan([TP("W1", "A", lab), T("W2", "B")], [PK("W1"), PK("W2")])
+            self.assertEqual(self.q(res), {("A", "C1"): 100, ("B", "C1"): 100}, lab)
+            self.assertFalse(any("banned" in w for w in res["warnings"]), lab)
+        self.assertIsNone(P._banned("Горелки газовые"))
+        self.assertIsNone(P._banned("Газовые горелкими"))
 
 
 if __name__ == "__main__":

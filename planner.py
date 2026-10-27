@@ -19,6 +19,9 @@ _TEST = {"wild": ("wild", 0, 1), "article": ("артикул", 0, 1), "cabinet":
 _PACK = {"wild": ("wild", 0, 1), "box": ("шт в коробе", 1, 2), "pallet": ("штук на палете", 1, 2)}
 _METRICS = ("cur", "s3", "s7", "s14", "s30", "forecast", "wild_days")
 _NUM_RE = re.compile(r"[+-]?(?:\d+(?:[.,]\d+)?|[.,]\d+)")
+# Permanent FBO safeguards (not configurable, not overridable by thresholds or fixed entries).
+_BAN_EXACT = "парфюм для дома"
+_BAN_PREFIX = "газовые горелки"
 
 
 def default_rules():
@@ -55,6 +58,18 @@ def _ident(v):
         return str(v)
     if isinstance(v, float) and math.isfinite(v) and v.is_integer():
         return str(int(v))
+    return None
+
+
+def _banned(product):
+    """Return the permanently FBO-banned group matched by a product group label, else None."""
+    if not isinstance(product, str):
+        return None
+    p = _norm(product)
+    if p == _BAN_EXACT:
+        return _BAN_EXACT
+    if p == _BAN_PREFIX or p.startswith(_BAN_PREFIX + " "):
+        return _BAN_PREFIX
     return None
 
 
@@ -157,8 +172,19 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
         meta[k] = snapshot.get(k)
 
     warn, src, dup = [], {}, set()
+    # Per physical wild, from EVERY source row carrying that wild (incl. skipped/duplicate rows): conservative.
+    stocks, badstock, banned = {}, set(), {}
     for n, c in _table(snapshot.get("test"), _TEST, "test"):
         w, a, cab = (_ident(c[k]) for k in ("wild", "article", "cabinet"))
+        if w:
+            st = _num(c["stock"])
+            if st is None or st < 0:
+                badstock.add(w)
+            else:
+                stocks.setdefault(w, set()).add(st)
+            g = _banned(c["product"])
+            if g and w not in banned:
+                banned[w] = g
         if not (w and a and cab):
             warn.append(f"test row {n}: missing or invalid wild/article/cabinet; skipped")
             continue
@@ -171,10 +197,7 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
         rec.update(wild=w, article=a, cabinet=cab, row=n, product=_ident(c["product"]))
         src[(a, cab)] = rec
 
-    stocks, packs, bad, budget, pack = {}, {}, {}, {}, {}
-    for x in src.values():
-        if x["stock"] is not None:
-            stocks.setdefault(x["wild"], set()).add(x["stock"])
+    packs, bad, budget, pack = {}, {}, {}, {}
     for n, c in _table(snapshot.get("packing"), _PACK, "packing"):
         w = _ident(c["wild"])
         if not w:
@@ -187,7 +210,11 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
         packs.setdefault(w, set()).add((int(b), int(p)) if ok else None)
     for w in sorted({x["wild"] for x in src.values()}):
         s, pk = stocks.get(w, set()), packs.get(w, set())
-        if len(s) != 1:
+        if w in banned:
+            bad[w] = f"banned product group '{banned[w]}' is never planned for FBO"
+        elif w in badstock:
+            bad[w] = "invalid or missing free stock value in at least one source row"
+        elif len(s) != 1:
             bad[w] = "conflicting free stock budgets" if s else "missing free stock budget"
         elif len(pk) != 1 or None in pk:
             bad[w] = "invalid or conflicting mono packing" if pk else "missing mono packing"
@@ -220,6 +247,9 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
         if x is None:
             raise ValueError(f"{lab}: no exact source row")
         w = x["wild"]
+        if w in banned:
+            raise ValueError(f"{lab}: wild {w} is permanently banned for FBO (group '{banned[w]}'); "
+                             "fixed entries cannot override this")
         if _norm(w) in ex_w or _norm(key[1]) in ex_c:
             raise ValueError(f"{lab}: wild or cabinet is excluded by rules")
         if w in bad:
@@ -239,6 +269,8 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
     fixed_keys = {(fx["article"], fx["cabinet"]) for fx in r["fixed"]}
     cands, eligible = [], 0
     for key, x in src.items():
+        if x["wild"] in banned:
+            continue  # permanent ban: rejected before any eligibility/quantity work
         if key in fixed_keys or _norm(x["wild"]) in ex_w or _norm(key[1]) in ex_c:
             continue
         if any(x[k] is None for k in _METRICS):
