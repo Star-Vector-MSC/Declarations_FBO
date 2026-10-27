@@ -173,7 +173,7 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
 
     warn, src, dup = [], {}, set()
     # Per physical wild, from EVERY source row carrying that wild (incl. skipped/duplicate rows): conservative.
-    stocks, badstock, banned = {}, set(), {}
+    stocks, badstock, banned, badgroup = {}, set(), {}, set()
     for n, c in _table(snapshot.get("test"), _TEST, "test"):
         w, a, cab = (_ident(c[k]) for k in ("wild", "article", "cabinet"))
         if w:
@@ -185,6 +185,8 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
             g = _banned(c["product"])
             if g and w not in banned:
                 banned[w] = g
+            if not (isinstance(c["product"], str) and c["product"].strip()):
+                badgroup.add(w)  # ban status cannot be verified -> block whole wild
         if not (w and a and cab):
             warn.append(f"test row {n}: missing or invalid wild/article/cabinet; skipped")
             continue
@@ -212,6 +214,8 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
         s, pk = stocks.get(w, set()), packs.get(w, set())
         if w in banned:
             bad[w] = f"banned product group '{banned[w]}' is never planned for FBO"
+        elif w in badgroup:
+            bad[w] = "missing/invalid product group ('Название товара'); permanent FBO ban cannot be verified"
         elif w in badstock:
             bad[w] = "invalid or missing free stock value in at least one source row"
         elif len(s) != 1:
@@ -269,8 +273,8 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
     fixed_keys = {(fx["article"], fx["cabinet"]) for fx in r["fixed"]}
     cands, eligible = [], 0
     for key, x in src.items():
-        if x["wild"] in banned:
-            continue  # permanent ban: rejected before any eligibility/quantity work
+        if x["wild"] in banned or x["wild"] in badgroup:
+            continue  # permanent ban / unverifiable group: rejected before any eligibility/quantity work
         if key in fixed_keys or _norm(x["wild"]) in ex_w or _norm(key[1]) in ex_c:
             continue
         if any(x[k] is None for k in _METRICS):
