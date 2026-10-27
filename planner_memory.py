@@ -5,6 +5,7 @@ declarations) and optionally an explicit Markdown backup path. Nothing here read
 config, secrets or the network. Restore is always explicit (restore_markdown); readable
 handwritten notes are never treated as machine data. The SHA-256 digest detects
 corruption only; it is not authentication. Secret detection is best-effort only.
+The backup path may never be the database or its SQLite -wal/-shm/-journal files.
 """
 import contextlib
 import datetime as _dt
@@ -37,6 +38,7 @@ _EVENT_KEYS = {"seq", "event_id", "type", "entry_id", "at"}
 _COLUMNS = ["seq", "event_id", "payload"]
 _CREATE_SQL = ("CREATE TABLE events(seq INTEGER PRIMARY KEY, "
                "event_id TEXT NOT NULL UNIQUE, payload TEXT NOT NULL)")
+_SQLITE_FILES = ("", "-wal", "-shm", "-journal")  # database + SQLite companion files
 _LOCKS = {}
 _LOCKS_GUARD = threading.Lock()
 
@@ -286,9 +288,17 @@ class MemoryStore:
         self._init_db()  # never writes the backup file
 
     def _backup_target(self, path):
+        """Refuse the DB and its -wal/-shm/-journal files (spelled and resolved, case-normalized)."""
         path = os.path.abspath(os.fspath(path))
-        if os.path.normcase(os.path.realpath(path)) == os.path.normcase(os.path.realpath(self.db_path)):
-            raise ValueError("backup path must differ from the database path")
+        norm = lambda p: os.path.normcase(os.fsdecode(p))
+        protected = set()
+        for base in {os.fsdecode(self.db_path), os.fsdecode(os.path.realpath(self.db_path))}:
+            for suffix in _SQLITE_FILES:
+                name = base + suffix
+                protected.update((norm(name), norm(os.path.realpath(name))))
+        if {norm(path), norm(os.path.realpath(path))} & protected:
+            raise ValueError("backup path must differ from the database and its SQLite "
+                             "-wal/-shm/-journal files")
         return path
 
     @contextlib.contextmanager
@@ -436,7 +446,8 @@ class MemoryStore:
     def write_backup(self, path=None):
         if path is None and self.backup_path is None:
             raise ValueError("no backup path configured or given")
-        target = self.backup_path if path is None else self._backup_target(path)
+        # Re-validate every time (configured path may have been mutated); before opening the DB.
+        target = self._backup_target(self.backup_path if path is None else path)
         with self._txn() as con:  # snapshot + write under lock: never stale
             _atomic_write(target, _render(self._load(con)).encode("utf-8"))
         return target

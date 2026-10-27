@@ -19,6 +19,11 @@ def read(path):
         return fh.read()
 
 
+def read_bytes(path):
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
 def rebuild(md, mutate):
     """Mutate the machine body and re-seal it with a valid digest (synthetic tampering)."""
     lines = md.split("\n")
@@ -43,6 +48,9 @@ class PlannerMemoryTest(unittest.TestCase):
 
     def store(self, name="m.db", backup=None):
         return pm.MemoryStore(self.path(name), backup and self.path(backup))
+
+    def tmp_files(self):
+        return [n for n in os.listdir(self.dir) if n.endswith(".tmp")]
 
     def populated(self, name="a.db"):
         s = self.store(name)
@@ -133,6 +141,75 @@ class PlannerMemoryTest(unittest.TestCase):
         self.assertEqual(dst.restore_markdown(md.replace("\n", "\r\n")), "unchanged")
         self.assertEqual(dst.export_markdown(), md)
 
+    def test_backup_target_rejects_database_and_sqlite_sidecars(self):
+        s, _ = self.populated("live.db")
+        db = self.path("live.db")
+        before, db_bytes = s.history(), read_bytes(db)
+        names = ["live.db", "live.db-wal", "live.db-shm", "live.db-journal"]
+        if os.name == "nt":  # Windows paths are case-insensitive
+            names += [n.upper() for n in names] + ["Live.DB-Wal"]
+        sidecars = {db + sfx: f"sentinel {sfx}".encode() for sfx in ("-wal", "-shm", "-journal")}
+        for existing in (False, True):
+            if existing:  # pre-existing sidecar bytes must survive every rejection
+                for p, data in sidecars.items():
+                    with open(p, "wb") as fh:
+                        fh.write(data)
+            for name in names:
+                bad = self.path(name)
+                with self.subTest(existing=existing, name=name):
+                    with self.assertRaises(ValueError):
+                        pm.MemoryStore(db, bad)
+                    with self.assertRaises(ValueError):
+                        s.write_backup(bad)
+                    s.backup_path = bad  # mutated configured path is re-validated
+                    try:
+                        with self.assertRaises(ValueError):
+                            s.write_backup()
+                    finally:
+                        s.backup_path = None
+            for p, data in sidecars.items():
+                if existing:
+                    self.assertEqual(read_bytes(p), data)
+                else:
+                    self.assertFalse(os.path.exists(p))
+            self.assertEqual(read_bytes(db), db_bytes)
+            self.assertEqual(self.tmp_files(), [])
+        for p in sidecars:
+            os.remove(p)  # only test sentinels; then verify the DB itself
+        self.assertEqual(read_bytes(db), db_bytes)
+        self.assertEqual(self.store("live.db").history(), before)
+        # Unrelated files remain allowed.
+        self.assertTrue(os.path.exists(s.write_backup(self.path("live.db.md"))))
+
+    def test_backup_target_rejects_alias_resolved_sidecars(self):
+        s = self.store("real.db")
+        s.propose("keep")
+        before = s.history()
+        real, wal = self.path("real.db"), self.path("real.db-wal")
+        try:
+            os.symlink(wal, self.path("alias.md"))
+            os.symlink(real, self.path("link.db"))
+        except (OSError, NotImplementedError, AttributeError) as exc:
+            self.skipTest(f"symlinks unavailable: {exc}")
+        ln = pm.MemoryStore(self.path("link.db"))
+        db_bytes = read_bytes(real)
+        with open(wal, "wb") as fh:
+            fh.write(b"sentinel wal")
+        cases = [(s, self.path("alias.md")), (ln, wal), (ln, self.path("link.db-wal")),
+                 (ln, self.path("link.db-journal")), (ln, real), (ln, self.path("alias.md"))]
+        for st, bad in cases:
+            with self.subTest(db=st.db_path, bad=bad):
+                with self.assertRaises(ValueError):
+                    pm.MemoryStore(st.db_path, bad)
+                with self.assertRaises(ValueError):
+                    st.write_backup(bad)
+        self.assertEqual(read_bytes(wal), b"sentinel wal")
+        self.assertTrue(os.path.islink(self.path("alias.md")))
+        self.assertEqual(read_bytes(real), db_bytes)
+        self.assertEqual(self.tmp_files(), [])
+        os.remove(wal)
+        self.assertEqual(self.store("real.db").history(), before)
+
     def test_user_text_cannot_forge_machine_block(self):
         s = self.store()
         s.propose("x\n" + pm.MARKER + "\n```json\n{}\n```")
@@ -174,6 +251,42 @@ class PlannerMemoryTest(unittest.TestCase):
                 with self.assertRaises(pm.ArchiveError):
                     dst.restore_markdown(text)
                 self.assertEqual(dst.history(), [])
+
+    def test_restore_failure_after_first_insert_rolls_back(self):
+        src, _ = self.populated()
+        md = src.export_markdown()
+        bp = self.path("dst.md")
+        with open(bp, "w", encoding="utf-8", newline="") as fh:
+            fh.write("previous backup\n")
+        dst = self.store("dst.db", backup="dst.md")
+        real_connect, seen = sqlite3.connect, []
+
+        class FailAfterFirstInsert:
+            """Delegates to a real connection; executemany inserts one row, then fails."""
+            def __init__(self, con):
+                self._con = con
+
+            def __getattr__(self, name):
+                return getattr(self._con, name)
+
+            def executemany(self, sql, rows):
+                rows = list(rows)
+                self._con.execute(sql, rows[0])
+                seen.append(self._con.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+                raise sqlite3.OperationalError("injected failure after first insert")
+
+        fake = lambda *a, **k: FailAfterFirstInsert(real_connect(*a, **k))
+        with mock.patch.object(pm.sqlite3, "connect", fake):
+            with self.assertRaises(pm.StorageError):
+                dst.restore_markdown(md)
+        self.assertEqual(seen, [1])  # first event really was inserted before the failure
+        self.assertEqual(self.store("dst.db").history(), [])  # reopened: no partial history
+        with closing(sqlite3.connect(self.path("dst.db"))) as con:
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
+        self.assertEqual(read(bp), "previous backup\n")
+        self.assertEqual(self.tmp_files(), [])
+        self.assertEqual(self.store("dst.db", backup="dst.md").restore_markdown(md), "restored")
+        self.assertEqual(read(bp), md)
 
     def test_escaped_lone_surrogate_is_archive_error(self):
         s, _ = self.populated()
