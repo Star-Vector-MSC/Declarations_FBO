@@ -423,10 +423,10 @@ class PlannerController:
         if len(text) > 600:
             await msg.answer("Слишком длинное указание (до 600 символов). Разбейте его на части.")
             return True
-        prev = st.get("ai_prev")  # (dialogue so far, open questions): bounded, the original request is always kept
-        full = (f"{prev[0]}\n[Вопросы бота: {' | '.join(prev[1])}]\n[Ответ владельца: {text}]" if prev else text)
-        if len(full) > 1500:
-            full = full[:500] + " … " + full[-1000:]
+        prev = st.get("ai_prev")  # (original request kept whole, bounded clarification log, open questions)
+        orig, log = (prev[0], f"{prev[1]}\n[Вопросы бота: {' | '.join(prev[2])}]\n[Ответ владельца: {text}]"[-1000:]) \
+            if prev else (text, "")
+        full = f"{orig}\n{log}" if log else orig
         await msg.answer("Разбираю указание…")
         did, ver = st["id"], st["ver"]
 
@@ -441,7 +441,7 @@ class PlannerController:
             return True
         head = f"Понял так: {p.understood}\nОбласть: {planner_ai.scope_text(p.scope)}."
         if p.questions:
-            st["ai_prev"] = (full, [q[:200] for q in p.questions[:5]])
+            st["ai_prev"] = (orig, log, [q[:200] for q in p.questions[:5]])
             st.pop("proposal", None)
             await msg.answer(head + "\nНужно уточнить (ничего не изменено):\n" + "\n".join("• " + q for q in p.questions))
             return True

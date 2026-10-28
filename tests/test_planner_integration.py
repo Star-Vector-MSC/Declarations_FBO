@@ -346,10 +346,12 @@ class AssistantTests(UiBase):
         q = ["В" * 200] * 5
         self.answers = [araw(questions=q), araw(questions=q), araw([dict(type="exclude_wild", wild="W2")])]
         m = await self.settings()
-        for text in ("а" * 600, "б" * 600, "в" * 600):
+        first = "а" * 570 + " КОНЕЦ_ОГРАНИЧЕНИЯ"  # a constraint at the very end of the original request
+        for text in (first, "б" * 600, "в" * 600):
             m.text = text
             await self.ctl.handle_message(m)
         self.assertEqual(len(self.calls), 3)  # every follow-up still reached the model
+        self.assertIn("КОНЕЦ_ОГРАНИЧЕНИЯ", self.calls[2])  # and the original request was never truncated
         self.assertIn("Применить", buttons(m))
         self.assertTrue(all(len(c) < 20000 for c in self.calls))
 

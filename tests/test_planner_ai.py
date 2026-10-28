@@ -142,6 +142,8 @@ class RunnerTests(unittest.TestCase):
                        "--ignore-rules", 'forced_login_method="chatgpt"'):
             self.assertIn(needed, cmd)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
+        for f in ("shell_tool", "unified_exec", "apps", "plugins"):  # built-in tools are switched off
+            self.assertEqual(cmd[cmd.index(f) - 1], "--disable")
         self.assertNotIn("OPENAI_API_KEY", env)
         self.assertNotIn("CODEX_API_KEY", env)
         self.assertEqual(env["KEEP"], "1")

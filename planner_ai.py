@@ -47,6 +47,9 @@ _LABEL = {"min_sales": "Продажи от", "max_current_days": "Запас д
           "excluded_wild": "Исключённые wild", "excluded_cabinets": "Исключённые кабинеты", "fixed": "Обязательные строки"}
 _SCOPE_TEXT = {"this_plan": "только этот план", "once_exception": "разовое исключение", "product_preference":
                "предпочтение по товару", "permanent_rule": "постоянное правило", "unclear": "не определена"}
+# Built-in capabilities switched off: the model must be a pure text-in/JSON-out function (no shell, plugins, apps, browser).
+_NO_TOOLS = tuple(x for f in ("shell_tool", "unified_exec", "apps", "plugins", "browser_use", "computer_use")
+                  for x in ("--disable", f))
 Proposal = namedtuple("Proposal", "understood scope rules summary questions")
 
 
@@ -77,7 +80,7 @@ def find_codex():
 
 def _failure(stderr):
     s = (stderr or "").casefold()
-    if any(x in s for x in ("usage limit", "rate limit", "quota", "limit reached", "too many requests")):
+    if any(x in s for x in ("usage limit", "rate limit", "quota", "limit reached", "too many requests", "429")):
         return "лимит подписки ChatGPT исчерпан или временно ограничен"
     if any(x in s for x in ("not logged in", "login", "unauthorized", "401", "auth")):
         return "вход ChatGPT в Codex недействителен (нужен codex login)"
@@ -108,7 +111,7 @@ def run_codex(prompt, timeout=TIMEOUT, runner=subprocess.run, finder=find_codex)
         # --ignore-user-config/--ignore-rules: no MCP servers, hooks or rules inherited from the owner's CLI config
         # (auth still comes from CODEX_HOME); forced_login_method refuses any non-ChatGPT credentials.
         cmd = [*codex, "exec", "-m", MODEL, "-c", f"model_reasoning_effort={EFFORT}", "-c",
-               'forced_login_method="chatgpt"', "--ignore-user-config", "--ignore-rules", "--sandbox", "read-only",
+               'forced_login_method="chatgpt"', "--ignore-user-config", "--ignore-rules", *_NO_TOOLS, "--sandbox", "read-only",
                "--skip-git-repo-check", "--ephemeral", "-C", tmp, "--output-schema", schema,
                "--output-last-message", out, "-"]
         try:
