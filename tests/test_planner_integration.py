@@ -162,6 +162,95 @@ class WizardTests(UiBase):
         self.assertNotIn("Коледино", buttons(m))
 
 
+class PreliminaryPlanTests(UiBase):
+    async def start(self):
+        m = msg("Новый план")
+        await self.ctl.handle_message(m)
+        m.text = "Завтра"
+        await self.ctl.handle_message(m)
+        return m
+
+    async def prelim(self, via_text=False):
+        m = await self.start()
+        if via_text:
+            m.text = "Пока без склада, надо проверять слоты по товарам"
+            self.assertTrue(await self.ctl.handle_message(m))
+        else:
+            c, _ = cb(buttons(m)["Пока без склада"], m)
+            await self.ctl.handle_callback(c)
+        c, _ = cb(buttons(m)["33 паллет"], m)
+        await self.ctl.handle_callback(c)
+        return m, buttons(m)
+
+    async def test_preliminary_plan_saved_without_warehouse_and_not_publishable(self):
+        for via_text in (False, True):
+            m, b = await self.prelim(via_text)
+            self.assertIn("Склад не выбран", said(m))
+            self.assertIn("слотов", said(m))  # slots were NOT checked automatically; the note says so
+            self.assertIn("Выбрать склад", b)
+            self.assertNotIn("Записать в тестовый лист", b)
+            d = self.ctl.store.list(OWNER, 1)[0]
+            self.assertIsNone(d["plan"]["warehouse"])
+            self.assertTrue(d["plan"]["lines"])
+            did, ver = d["id"], d["version"]
+            for act in ("pub",):  # forged callbacks cannot publish or confirm a plan without a warehouse
+                c, m2 = cb(f"pl:{act}:{did}:{ver}", m)
+                await self.ctl.handle_callback(c)
+                self.assertIn("Склад не выбран", said(m2))
+            c, m2 = cb(f"pl:ok:{did}:{ver}", m)
+            await self.ctl.handle_callback(c)
+            self.assertEqual(self.sheets.published, [])
+            self.assertIsNone(self.ctl.store.get(OWNER, did)["exported_version"])
+
+    async def test_warehouse_chosen_later_creates_new_version_then_publishes(self):
+        m, b = await self.prelim()
+        d0 = self.ctl.store.list(OWNER, 1)[0]
+        c, m1 = cb(b["Выбрать склад"])
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.store.get(OWNER, d0["id"])["version"], 1)  # choosing alone stores nothing
+        c, m2 = cb(buttons(m1)["Коледино"])
+        await self.ctl.handle_callback(c)
+        d1 = self.ctl.store.get(OWNER, d0["id"])
+        self.assertEqual((d1["version"], d1["plan"]["warehouse"]), (2, "Коледино"))
+        self.assertEqual(self.ctl.store.get(OWNER, d0["id"], 1)["plan"]["warehouse"], None)  # history kept
+        self.assertEqual(d1["plan"]["lines"], d0["plan"]["lines"])
+        b2 = buttons(m2)
+        self.assertNotIn("Выбрать склад", b2)
+        c, m3 = cb(b2["Записать в тестовый лист"])
+        await self.ctl.handle_callback(c)
+        c, _ = cb(buttons(m3)["Подтвердить запись"])
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.sheets.published, [(d0["id"], 2)])
+
+    async def test_stale_or_foreign_warehouse_buttons_change_nothing(self):
+        m, b = await self.prelim()
+        did = self.ctl.store.list(OWNER, 1)[0]["id"]
+        for data in ("pl:sp:0", "pl:sp:99", "pl:wn"):
+            c, m2 = cb(data, m)
+            await self.ctl.handle_callback(c)
+            self.assertIn("устарела", said(m2))
+        self.assertEqual(self.ctl.store.get(OWNER, did)["version"], 1)
+        c, m3 = cb(b["Выбрать склад"], m)
+        await self.ctl.handle_callback(c)
+        c, _ = cb("pl:cn", m3)
+        await self.ctl.handle_callback(c)
+        c, m4 = cb("pl:sp:0", m3)
+        await self.ctl.handle_callback(c)
+        self.assertIn("устарела", said(m4))
+        self.assertEqual(self.ctl.store.get(OWNER, did)["version"], 1)
+
+    async def test_listing_and_lines_work_without_warehouse(self):
+        await self.prelim()
+        m = msg("Мои планы")
+        await self.ctl.handle_message(m)
+        self.assertIn("без склада", next(iter(buttons(m))))
+
+    async def test_unknown_warehouse_text_is_not_swallowed(self):
+        m = await self.start()
+        m.text = "12345678"
+        self.assertFalse(await self.ctl.handle_message(m))
+
+
 class EditPublishTests(UiBase):
     async def test_settings_require_apply_and_stale_rejected(self):
         m, b = await self.plan()

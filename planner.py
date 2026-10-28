@@ -161,8 +161,8 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
     ad = None if arrival_date is None else _date(arrival_date, "arrival_date")
     if ad is not None and ad < sd:
         raise ValueError("arrival_date must not be before shipment_date")
-    if not isinstance(warehouse, str) or not warehouse.strip():
-        raise ValueError("warehouse must be a non-empty string")
+    if warehouse is not None and (not isinstance(warehouse, str) or not warehouse.strip()):
+        raise ValueError("warehouse must be a non-empty string or None (preliminary plan without a warehouse)")
     if not isinstance(snapshot, dict):
         raise ValueError("snapshot must be a dict")
     meta = {}
@@ -314,7 +314,7 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
             how = "whole boxes"
         emit(x, q, f"regular: {how} toward {_f(T)} days", False)
 
-    return {"rules": r, "date": sd.isoformat(), "warehouse": warehouse.strip(),
+    return {"rules": r, "date": sd.isoformat(), "warehouse": None if warehouse is None else warehouse.strip(),
             "arrival_date": ad.isoformat() if ad else None, "lines": lines, "warnings": warn,
             "eligible_count": eligible, "total_pallets": _f(total), "remaining_pallets": _f(cap - total),
             "source_hash": meta["source_hash"], "captured_at": meta["captured_at"]}

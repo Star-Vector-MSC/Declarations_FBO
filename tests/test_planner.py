@@ -186,12 +186,21 @@ class PlannerTest(unittest.TestCase):
 
     def test_bad_call_arguments(self):
         s = snap([T("W1", "A")], [PK("W1")])
-        for args in [("2026-13-01", "WH"), ("28.10.2026", "WH"), ("2026-10-28", ""), ("2026-10-28", None),
-                     ("2026-10-28", "WH", "2026-10-01")]:
+        for args in [("2026-13-01", "WH"), ("28.10.2026", "WH"), ("2026-10-28", ""), ("2026-10-28", "  "),
+                     ("2026-10-28", 5), ("2026-10-28", "WH", "2026-10-01")]:
             with self.assertRaises(ValueError):
                 P.build_plan(s, None, *args)
         res = P.build_plan(s, None, "2026-10-28", "WH")
         self.assertEqual((res["source_hash"], res["arrival_date"], res["date"]), ("h1", None, "2026-10-28"))
+
+    def test_plan_without_warehouse_is_a_real_preliminary_plan(self):
+        s = snap([T("W1", "A")], [PK("W1")])
+        with_wh = P.build_plan(s, None, "2026-10-28", "WH")
+        pre = P.build_plan(s, None, "2026-10-28", None)
+        self.assertIsNone(pre["warehouse"])  # never a random or placeholder warehouse
+        self.assertEqual(pre["lines"], with_wh["lines"])
+        self.assertTrue(pre["lines"])
+        json.dumps(pre, allow_nan=False)
 
     # --- regressions: invalid free stock blocks the whole wild ---
 

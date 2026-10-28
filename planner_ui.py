@@ -19,6 +19,9 @@ ENTRY = ("Новый план", "Мои планы")
 LEAVE = ("Декларации", "Главное меню")  # reset the planner state; the declarations handler then runs as before
 OLD_BUTTONS = ("Ближайшая отгрузка", "Обновить базу", "База файлов", "Выбрать дату", "Проверить отметки",
                "Файлы по кабинету", "По номеру поставки")
+NO_WH = "склад не выбран"
+NO_WH_NOTE = ("Склад не выбран: это предварительный состав. Доступность слотов автоматически не проверялась "
+              "(такой проверки в боте нет), склад выберите сами. Запись в тестовый лист возможна только после выбора склада.")
 GENERIC = "Операция не выполнена. Повторите позже."
 MEM_DOWN = "Память помощника недоступна — создание и запись планов заблокированы, пока её не восстановят."
 HELP = ("Команды настроек (по одной в сообщении):\n"
@@ -127,12 +130,14 @@ def preview_text(d):
     p, r = d["plan"], d["plan"]["rules"]
     lines = [f"ТЕСТОВЫЙ план {d['id']} · версия {d['version']}",
              "Запись возможна только в лист «Планирование FBO — ТЕСТ».",
-             f"Отгрузка {p['date']} · склад {p['warehouse']} · машина {r['capacity']} паллет",
+             f"Отгрузка {p['date']} · склад {p['warehouse'] or NO_WH} · машина {r['capacity']} паллет",
              f"Строк: {len(p['lines'])} · загрузка {p['total_pallets']} паллет",
              f"Правила: продажи от {r['min_sales']}, запас до {r['max_current_days']}, остаток wild от "
              f"{r['min_wild_days']}, цель {r['target_days']}, максимум {r['max_days']}; "
              f"исключений wild {len(r['excluded_wild'])}, кабинетов {len(r['excluded_cabinets'])}, "
              f"обязательных строк {len(r['fixed'])}"]
+    if p["warehouse"] is None:
+        lines.append(NO_WH_NOTE)
     if p["remaining_pallets"] and p["remaining_pallets"] > 0:
         lines.append(f"Недобор: {p['remaining_pallets']} паллет (правила сами не ослабляются; смените машину или условия).")
     if not p["lines"]:
@@ -225,9 +230,10 @@ class PlannerController:
         if d["version"] != d["latest_version"] or d.get("exported_version") is not None:
             return _kb(top + [[_btn("Мои планы", "list")]])
         other = 20 if d["plan"]["rules"]["capacity"] == 33 else 33
+        last = ([_btn("Выбрать склад", "sw", i, v)] if d["plan"]["warehouse"] is None
+                else [_btn("Записать в тестовый лист", "pub", i, v)])
         return _kb(top + [[_btn("Пересчитать", "rc", i, v), _btn("Настройки", "set", i, v)],
-                          [_btn(f"Машина {other} паллет", "cap", i, v, other)],
-                          [_btn("Записать в тестовый лист", "pub", i, v)]])
+                          [_btn(f"Машина {other} паллет", "cap", i, v, other)], last])
 
     async def _show(self, msg, d):
         await msg.answer(preview_text(d), reply_markup=self._keys(d))
@@ -235,7 +241,7 @@ class PlannerController:
     def _build(self, uid, rules, day, wh, arrival=None, draft=None, alive=None):  # runs in a worker thread
         self._mem_ok()
         snap = self.sheets.snapshot()
-        if wh not in snap["warehouses"]:
+        if wh is not None and wh not in snap["warehouses"]:
             raise _Blocked("Такого склада сейчас нет в таблице. Начните новый план.")
         plan = planner.build_plan(snap, rules, day, wh, arrival)
         with self._commit:  # owner/menu re-check after the slow read, atomically with the store
@@ -278,7 +284,7 @@ class PlannerController:
             async with self._lock:
                 return await (self._new(uid, message) if text == "Новый план" else self._list(uid, ct, message))
         st = self._st.get(uid)
-        if not st or st["step"] not in ("date", "wh", "cap", "settings"):
+        if not st or st["step"] not in ("date", "wh", "cap", "settings", "pickwh"):
             return False
         if st["step"] == "settings" and text.isdigit():
             return False  # supply numbers are never intercepted
@@ -308,7 +314,7 @@ class PlannerController:
         if not ds:
             await msg.answer("Сохранённых планов пока нет.", reply_markup=self._main())
             return True
-        rows = [[_btn(f"{d['id']} v{d['latest_version']} · {d['plan']['date']} · {d['plan']['warehouse']}"[:60],
+        rows = [[_btn(f"{d['id']} v{d['latest_version']} · {d['plan']['date']} · {d['plan']['warehouse'] or 'без склада'}"[:60],
                       "op", d["id"], d["latest_version"])] for d in ds]
         await msg.answer("Ваши последние планы:", reply_markup=_kb(rows))
         return True
@@ -341,16 +347,26 @@ class PlannerController:
             return True
         self._st[uid] = {"step": "wh", "date": day.isoformat(), "whs": whs[:40]}
         rows = [[_btn(w[:40], "wh", i)] for i, w in enumerate(self._st[uid]["whs"])]
-        await msg.answer(f"Дата {day.strftime('%d.%m.%Y')}. Выберите склад:", reply_markup=_kb(rows))
+        rows.append([_btn("Пока без склада", "wn")])
+        await msg.answer(f"Дата {day.strftime('%d.%m.%Y')}. Выберите склад или нажмите «Пока без склада» — "
+                         "соберу предварительный состав, склад выберете позже:", reply_markup=_kb(rows))
         return True
 
     async def _t_wh(self, uid, ct, msg, text, st):
-        return await self._pick_wh(uid, msg, st["whs"].index(text)) if text in st["whs"] else False
+        if text in st["whs"]:
+            return await self._pick_wh(uid, msg, st["whs"].index(text))
+        if re.search(r"(?i)\bбез склада\b", text):  # also «Пока без склада, надо проверять слоты по товарам»
+            return await self._pick_wh(uid, msg, None)
+        return False
+
+    async def _t_pickwh(self, uid, ct, msg, text, st):
+        return False  # the warehouse is chosen with the buttons only
 
     async def _pick_wh(self, uid, msg, idx):
         st = self._st[uid]
-        st.update(step="cap", wh=st["whs"][idx])
-        await msg.answer(f"Склад {st['wh']}. Выберите машину:", reply_markup=_kb(
+        st.update(step="cap", wh=None if idx is None else st["whs"][idx])
+        await msg.answer((f"Склад {st['wh']}." if idx is not None else "Склад не выбран — будет предварительный состав.")
+                         + " Выберите машину:", reply_markup=_kb(
             [[_btn("33 паллет", "wc", 33), _btn("20 паллет", "wc", 20)]]))
         return True
 
@@ -367,7 +383,8 @@ class PlannerController:
                                     live=True)
         if ok:
             self._st.pop(uid, None)
-            await msg.answer("План рассчитан и сохранён как черновик (в таблицу ничего не записано).",
+            await msg.answer("План рассчитан и сохранён как черновик (в таблицу ничего не записано)."
+                             + (" Склад выберете позже в этом плане." if d["plan"]["warehouse"] is None else ""),
                              reply_markup=self._main())
             await self._show(msg, d)
         return True
@@ -400,11 +417,11 @@ class PlannerController:
             if len(cb.data.encode()) > 64 or parts[0] != "pl":
                 raise ValueError
             act, a = parts[1], parts[2:]
-            if act in ("op", "ln", "mem", "rc", "set", "cap", "pub", "ok", "ap"):
+            if act in ("op", "ln", "mem", "rc", "set", "cap", "pub", "ok", "ap", "sw"):
                 if not (len(a) >= 2 and _ID.fullmatch(a[0]) and a[1].isdigit()):
                     raise ValueError
                 a = [a[0], int(a[1])] + a[2:]
-            elif act not in ("list", "cn", "wh", "wc"):
+            elif act not in ("list", "cn", "wh", "wc", "wn", "sp"):
                 raise ValueError
         except (ValueError, IndexError, AttributeError):
             await msg.answer("Кнопка устарела. Откройте «Мои планы».")
@@ -430,7 +447,7 @@ class PlannerController:
         if st:
             st.pop("proposal", None)
             st.pop("confirm", None)
-            if st["step"] == "settings":
+            if st["step"] in ("settings", "pickwh"):
                 self._st.pop(uid)
         await msg.answer("Отменено, ничего не изменено.")
 
@@ -440,6 +457,13 @@ class PlannerController:
             await msg.answer("Кнопка устарела. Начните заново: «Новый план».")
             return
         await self._pick_wh(uid, msg, int(idx))
+
+    async def _c_wn(self, uid, ct, msg):
+        st = self._st.get(uid)
+        if not st or st["step"] != "wh":
+            await msg.answer("Кнопка устарела. Начните заново: «Новый план».")
+            return
+        await self._pick_wh(uid, msg, None)
 
     async def _c_wc(self, uid, ct, msg, n):
         if n not in ("20", "33"):
@@ -484,9 +508,10 @@ class PlannerController:
         d = await self._draft(uid, did, ver)
         await self._revise(uid, ct, msg, d, d["plan"]["rules"])
 
-    async def _revise(self, uid, ct, msg, d, rules):
+    async def _revise(self, uid, ct, msg, d, rules, warehouse=...):
         p = d["plan"]
-        ok, new = await self._guarded(uid, ct, msg, self._build, uid, rules, p["date"], p["warehouse"],
+        ok, new = await self._guarded(uid, ct, msg, self._build, uid, rules, p["date"],
+                                      p["warehouse"] if warehouse is ... else warehouse,
                                       p.get("arrival_date"), d, live=True)
         if ok:
             await msg.answer("Пересчитано: сохранена новая неизменяемая версия (в таблицу ничего не записано).")
@@ -496,6 +521,34 @@ class PlannerController:
         await self._draft(uid, did, ver)
         self._st[uid] = {"step": "settings", "id": did, "ver": ver}
         await msg.answer(HELP)
+
+    async def _c_sw(self, uid, ct, msg, did, ver):
+        d = await self._draft(uid, did, ver)
+        if d["plan"]["warehouse"] is not None:
+            raise _Blocked("В этом плане склад уже выбран.")
+
+        def work():
+            self._mem_ok()
+            return self.sheets.snapshot()["warehouses"]
+        ok, whs = await self._guarded(uid, ct, msg, work)
+        if not ok:
+            return
+        if not whs:
+            await msg.answer("В таблице нет складов Wildberries.")
+            return
+        self._st[uid] = {"step": "pickwh", "id": did, "ver": ver, "whs": whs[:40]}
+        await msg.answer("Выберите склад для плана (будет сохранена новая версия, в таблицу ничего не записывается):",
+                         reply_markup=_kb([[_btn(w[:40], "sp", i)] for i, w in enumerate(self._st[uid]["whs"])]
+                                          + [[_btn("Отмена", "cn")]]))
+
+    async def _c_sp(self, uid, ct, msg, idx):
+        st = self._st.get(uid)
+        if not st or st["step"] != "pickwh" or not idx.isdigit() or int(idx) >= len(st["whs"]):
+            await msg.answer("Кнопка устарела. Откройте план в «Моих планах».")
+            return
+        self._st.pop(uid)
+        d = await self._draft(uid, st["id"], st["ver"])
+        await self._revise(uid, ct, msg, d, d["plan"]["rules"], st["whs"][int(idx)])
 
     async def _c_cap(self, uid, ct, msg, did, ver, n):
         d = await self._draft(uid, did, ver)
@@ -518,6 +571,8 @@ class PlannerController:
 
     async def _c_pub(self, uid, ct, msg, did, ver):
         d = await self._draft(uid, did, ver)
+        if d["plan"]["warehouse"] is None:
+            raise _Blocked("Склад не выбран: сначала нажмите «Выбрать склад». Запись предварительного состава невозможна.")
         self._st[uid] = {"step": "confirm", "confirm": (did, ver)}
         await msg.answer(f"Записать план {did} v{ver} ({len(d['plan']['lines'])} строк) в лист «Планирование FBO — ТЕСТ»? "
                          "Источники будут перепроверены перед записью; в «Отгрузка FBO» запись невозможна.",
@@ -531,6 +586,9 @@ class PlannerController:
             return
         if (self._st.get(uid) or {}).get("confirm") != (did, ver) or d["version"] != d["latest_version"]:
             await msg.answer("Сначала нажмите «Записать в тестовый лист» у актуальной версии.")
+            return
+        if d["plan"]["warehouse"] is None:
+            await msg.answer("Склад не выбран: запись невозможна.")
             return
         self._st.pop(uid, None)
         await msg.answer("Перепроверяю источники и записываю в тестовый лист…")
