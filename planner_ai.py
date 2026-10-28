@@ -19,7 +19,7 @@ import planner
 MODEL = "gpt-6.1-sol"
 EFFORT = "low"
 TIMEOUT = 100
-MAX_TEXT = 1500
+MAX_TEXT = 2500
 MAX_ACTIONS = 12
 SCOPES = ("this_plan", "once_exception", "product_preference", "permanent_rule", "unclear")
 _NUMBERS = ("min_sales", "max_current_days", "min_wild_days", "target_days", "max_days")
@@ -91,15 +91,29 @@ def run_codex(prompt, timeout=TIMEOUT, runner=subprocess.run, finder=find_codex)
     codex = finder()
     if not codex:
         raise AIUnavailable("Codex CLI не найден на компьютере бота; ИИ-разбор недоступен (платный API не используется).")
+    env = {k: v for k, v in os.environ.items() if k not in ("OPENAI_API_KEY", "CODEX_API_KEY")}
+    try:  # only the ChatGPT subscription login is acceptable; a saved API-key login would be billed per token
+        st = runner([*codex, "login", "status"], capture_output=True, text=True, encoding="utf-8", timeout=30, env=env)
+    except subprocess.TimeoutExpired:
+        raise AIUnavailable("Codex не ответил на проверку входа; ИИ-разбор недоступен.") from None
+    except OSError as e:
+        raise AIUnavailable(f"Codex CLI не запустился ({type(e).__name__}).") from None
+    said = ((st.stdout or "") + (st.stderr or "")).casefold()
+    if st.returncode != 0 or "chatgpt" not in said:
+        raise AIUnavailable("Codex не авторизован через подписку ChatGPT (нужен codex login с ChatGPT); платный API "
+                            "не используется, ИИ-разбор недоступен.")
     with tempfile.TemporaryDirectory() as tmp:
         schema, out = os.path.join(tmp, "schema.json"), os.path.join(tmp, "answer.json")
         Path(schema).write_text(json.dumps(SCHEMA), encoding="utf-8")
-        cmd = [*codex, "exec", "-m", MODEL, "-c", f"model_reasoning_effort={EFFORT}", "--sandbox", "read-only",
+        # --ignore-user-config/--ignore-rules: no MCP servers, hooks or rules inherited from the owner's CLI config
+        # (auth still comes from CODEX_HOME); forced_login_method refuses any non-ChatGPT credentials.
+        cmd = [*codex, "exec", "-m", MODEL, "-c", f"model_reasoning_effort={EFFORT}", "-c",
+               'forced_login_method="chatgpt"', "--ignore-user-config", "--ignore-rules", "--sandbox", "read-only",
                "--skip-git-repo-check", "--ephemeral", "-C", tmp, "--output-schema", schema,
                "--output-last-message", out, "-"]
         try:
             r = runner(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=timeout,
-                       env={k: v for k, v in os.environ.items() if k not in ("OPENAI_API_KEY", "CODEX_API_KEY")})
+                       env=env)
         except subprocess.TimeoutExpired:
             raise AIUnavailable(f"Codex не ответил за {timeout} с; повторите позже или используйте фиксированные команды.") from None
         except OSError as e:
@@ -190,7 +204,7 @@ def validate_proposal(raw, rules, cat):
     except ValueError as e:
         raise AIRejected("Недопустимые настройки: " + str(e)[:200]) from None
     diff = [f"{_LABEL[k]}: {_show(rules[k])} → {_show(new[k])}" for k in new if new[k] != rules[k]]
-    if raw["scope"] == "unclear" and "scope" not in " ".join(questions):
+    if raw["scope"] == "unclear" and not questions:
         questions.append("На что распространить это указание: только на этот план, как разовое исключение, "
                          "как предпочтение по товару или как постоянное правило?")
     return Proposal(raw["understood"].strip(), raw["scope"], new, diff, questions)

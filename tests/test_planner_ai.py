@@ -116,8 +116,10 @@ class PromptTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
-    def fake(self, rc=0, stderr="", answer=None, record=None, exc=None):
+    def fake(self, rc=0, stderr="", answer=None, record=None, exc=None, login="Logged in using ChatGPT"):
         def runner(cmd, **kw):
+            if cmd[1:3] == ["login", "status"]:
+                return SimpleNamespace(returncode=0 if login else 1, stdout=login or "", stderr="")
             if record is not None:
                 record.update(cmd=cmd, kw=kw)
             if exc:
@@ -136,7 +138,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(res["scope"], "this_plan")
         cmd, env = rec["cmd"], rec["kw"]["env"]
         self.assertEqual(rec["kw"]["input"], "hi")
-        for needed in ("--sandbox", "read-only", "--ephemeral", "--output-schema", "gpt-6.1-sol"):
+        for needed in ("--sandbox", "read-only", "--ephemeral", "--output-schema", "gpt-6.1-sol", "--ignore-user-config",
+                       "--ignore-rules", 'forced_login_method="chatgpt"'):
             self.assertIn(needed, cmd)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
         self.assertNotIn("OPENAI_API_KEY", env)
@@ -157,6 +160,15 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(ai.AIUnavailable) as cm:
             ai.run_codex("x", finder=lambda: None)
         self.assertIn("не найден", str(cm.exception))
+
+    def test_non_subscription_login_is_refused_before_any_model_call(self):
+        calls = []
+        for login in ("Logged in using an API key", "", "Not logged in"):
+            run = self.fake(answer=json.dumps(raw()), login=login, record=calls)
+            with self.subTest(login), self.assertRaises(ai.AIUnavailable) as cm:
+                ai.run_codex("x", runner=run, finder=lambda: ["codex"])
+            self.assertIn("ChatGPT", str(cm.exception))
+        self.assertEqual(calls, [])  # `exec` was never started
 
     def test_unreadable_answer_is_rejected(self):
         for ans in (None, "not json"):

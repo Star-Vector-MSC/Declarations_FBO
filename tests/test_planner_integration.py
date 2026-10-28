@@ -338,8 +338,20 @@ class AssistantTests(UiBase):
         m.text = "второй"
         await self.ctl.handle_message(m)
         self.assertIn("исключи мыло", self.calls[1])  # the earlier request and the question travel with the answer
+        self.assertIn("второй", self.calls[1])
         self.assertIn("Какой именно товар", self.calls[1])
         self.assertIn("Применить", buttons(m))
+
+    async def test_clarification_chain_stays_within_limits(self):
+        q = ["В" * 200] * 5
+        self.answers = [araw(questions=q), araw(questions=q), araw([dict(type="exclude_wild", wild="W2")])]
+        m = await self.settings()
+        for text in ("а" * 600, "б" * 600, "в" * 600):
+            m.text = text
+            await self.ctl.handle_message(m)
+        self.assertEqual(len(self.calls), 3)  # every follow-up still reached the model
+        self.assertIn("Применить", buttons(m))
+        self.assertTrue(all(len(c) < 20000 for c in self.calls))
 
     async def test_invented_item_is_asked_not_applied(self):
         self.answers = [araw([dict(type="exclude_wild", wild="W404")])]
