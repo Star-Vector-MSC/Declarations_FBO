@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 import planner
+import planner_ai
 from planner_sheets import MSK, PlannerSheets, PlannerSheetsError, SourceChangedError
 from planner_storage import DraftError, DraftStore
 
@@ -28,7 +29,8 @@ HELP = ("Команды настроек (по одной в сообщении)
         "Продажи от 8 · Запас до 10 · Остаток wild от 30 · Цель 10 · Максимум 13 · Машина 20\n"
         "Исключить wild wild123 · Исключить кабинет Название\n"
         "Добавить АРТИКУЛ | КАБИНЕТ | КОЛИЧЕСТВО | ПРИЧИНА · Убрать АРТИКУЛ | КАБИНЕТ\n"
-        "Свободный текст не поддерживается. Изменения применяются только после «Применить».")
+        "Можно и обычным текстом (разбирает ИИ): «исключи кабинет …», «поставь машину 20», «добавь обязательно …». "
+        "Неясное я уточню. Изменения применяются только после «Применить».")
 _NUMCMD = (("остаток wild от", "min_wild_days"), ("продажи от", "min_sales"), ("запас до", "max_current_days"),
            ("цель", "target_days"), ("максимум", "max_days"))
 _LABEL = {"min_sales": "Продажи от", "max_current_days": "Запас до", "min_wild_days": "Остаток wild от",
@@ -39,12 +41,16 @@ _DATE = re.compile(r"\d{2}\.\d{2}\.\d{4}")
 PAGE = 10
 
 
+class UnknownCommand(ValueError):
+    """Not one of the fixed settings commands (candidate for the free-text AI path)."""
+
+
 class _Blocked(Exception):
     """User-facing refusal raised inside worker threads."""
 
 
 def _err(e):
-    if isinstance(e, (PlannerSheetsError, DraftError, _Blocked)):
+    if isinstance(e, (PlannerSheetsError, DraftError, _Blocked, planner_ai.AIUnavailable, planner_ai.AIRejected)):
         return str(e)
     if isinstance(e, ValueError):
         return "Не удалось построить план: " + str(e)[:300]
@@ -73,8 +79,10 @@ def _num(s):
 def parse_command(text, rules):
     """One settings command -> (new validated rules, summary). ValueError carries a user-facing message."""
     t = " ".join(text.split())
-    if not t or len(t) > 300:
+    if not t:
         raise ValueError(HELP)
+    if len(t) > 300:  # no fixed command is this long: hand over to the free-text path (which has its own limit)
+        raise UnknownCommand(HELP)
     new, low = copy.deepcopy(rules), t.casefold()
     for prefix, key in _NUMCMD:
         if low.startswith(prefix + " "):
@@ -105,7 +113,7 @@ def parse_command(text, rules):
                 raise ValueError("Такой обязательной строки нет. Формат: Убрать АРТИКУЛ | КАБИНЕТ")
             new["fixed"] = keep
         else:
-            raise ValueError("Не понял указание, ничего не изменено.\n" + HELP)
+            raise UnknownCommand("Не понял указание, ничего не изменено.\n" + HELP)
     try:
         new = planner.validate_rules(new)
     except ValueError as e:
@@ -168,8 +176,8 @@ def lines_text(d, page):
 class PlannerController:
     """handle_message(message)->bool (True = consumed), handle_callback(callback), reset(owner)."""
 
-    def __init__(self, store=None, sheets=None, memory=None, is_owner=None, data_dir=None):
-        self._store, self._sheets, self._memory = store, sheets, memory
+    def __init__(self, store=None, sheets=None, memory=None, is_owner=None, data_dir=None, ai=None):
+        self._store, self._sheets, self._memory, self._ai = store, sheets, memory, ai
         self._is_owner, self._data_dir = is_owner, data_dir
         self._lock, self._st, self._gen = asyncio.Lock(), {}, {}
         self._commit = threading.Lock()  # serialises "check still wanted + store" with reset()
@@ -200,6 +208,10 @@ class PlannerController:
             self._memory = MemoryStore(os.path.join(self._dir(), "planner_memory.sqlite3"),
                                        os.path.join(self._dir(), "planner_memory-ledger.md"))
         return self._memory
+
+    @property
+    def ai(self):
+        return self._ai or planner_ai.interpret
 
     # helpers -------------------------------------------------------------------------------------------------
     def _owner(self, uid, chat_type):
@@ -395,6 +407,8 @@ class PlannerController:
             if d["version"] != st["ver"] or d.get("exported_version") is not None:
                 raise _Blocked("План изменился; откройте актуальную версию в «Моих планах».")
             rules, summary = parse_command(text, d["plan"]["rules"])
+        except UnknownCommand:
+            return await self._t_ai(uid, ct, msg, text, st)
         except (ValueError, _Blocked, DraftError) as e:
             await msg.answer(_err(e) if not isinstance(e, ValueError) else str(e))
             return True
@@ -402,6 +416,45 @@ class PlannerController:
         st.update(proposal=rules, nonce=nonce)
         await msg.answer("Предлагаемые изменения (пока не применены):\n" + summary, reply_markup=_kb(
             [[_btn("Применить", "ap", st["id"], st["ver"], nonce), _btn("Отмена", "cn")]]))
+        return True
+
+    async def _t_ai(self, uid, ct, msg, text, st):
+        """Free text -> model proposal -> (clarifying questions | confirmation). Never applies anything itself."""
+        if len(text) > 600:
+            await msg.answer("Слишком длинное указание (до 600 символов). Разбейте его на части.")
+            return True
+        prev = st.get("ai_prev")
+        full = (f"Раньше владелец написал: {prev[0]}\nВопросы бота: {' | '.join(prev[1])}\nОтвет владельца: {text}"
+                if prev else text)
+        await msg.answer("Разбираю указание…")
+        did, ver = st["id"], st["ver"]
+
+        def work():
+            self._mem_ok()
+            d = self.store.get(uid, did)
+            if d["version"] != ver or d.get("exported_version") is not None:
+                raise _Blocked("План изменился; откройте актуальную версию в «Моих планах».")
+            return self.ai(full, d["plan"]["rules"], self.sheets.snapshot(), d["plan"]["lines"])
+        ok, p = await self._guarded(uid, ct, msg, work)
+        if not ok or self._st.get(uid) is not st:  # failed, or the menu/another action replaced the state meanwhile
+            return True
+        head = f"Понял так: {p.understood}\nОбласть: {planner_ai.scope_text(p.scope)}."
+        if p.questions:
+            st["ai_prev"] = (full[-900:], p.questions)
+            st.pop("proposal", None)
+            await msg.answer(head + "\nНужно уточнить (ничего не изменено):\n" + "\n".join("• " + q for q in p.questions))
+            return True
+        st.pop("ai_prev", None)
+        if not p.summary:
+            await msg.answer(head + "\nИзменений в условиях нет.")
+            return True
+        nonce = secrets.token_hex(3)
+        st.update(proposal=p.rules, nonce=nonce)
+        await msg.answer(head + "\nПредлагаемые изменения (пока не применены; количества, остатки, короба и вместимость "
+                         "проверит расчёт после «Применить»):\n" + "\n".join(p.summary)
+                         + ("\nВ память это пока не сохраняется: изменение действует только в этом плане."
+                            if p.scope != "this_plan" else ""),
+                         reply_markup=_kb([[_btn("Применить", "ap", did, ver, nonce), _btn("Отмена", "cn")]]))
         return True
 
     # callbacks -----------------------------------------------------------------------------------------------

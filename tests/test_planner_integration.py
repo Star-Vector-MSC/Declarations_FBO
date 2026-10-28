@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 from aiogram.enums import ChatType
 
+import planner_ai
 import planner_sheets as ps
 import planner_ui as ui
 import telegram_bot as app
@@ -71,11 +72,15 @@ class UiBase(unittest.IsolatedAsyncioTestCase):
         self.sheets = FakeSheets()
         self.make()
 
+    def ai(self, text, rules, snapshot, lines=()):  # never the real Codex in tests
+        raise planner_ai.AIUnavailable("Codex недоступен (тест)")
+
     def make(self):
         d = self.tmp.name
         self.ctl = ui.PlannerController(store=DraftStore(os.path.join(d, "drafts.sqlite3")), sheets=self.sheets,
                                         memory=MemoryStore(os.path.join(d, "mem.sqlite3")),
-                                        is_owner=lambda uid, ct: self.owner_ok and uid == OWNER)
+                                        is_owner=lambda uid, ct: self.owner_ok and uid == OWNER,
+                                        ai=lambda *a, **k: self.ai(*a, **k))
 
     async def plan(self, cap="33"):
         m = msg("Новый план")
@@ -271,6 +276,125 @@ class PreliminaryPlanTests(UiBase):
         self.assertFalse(await self.ctl.handle_message(m))
 
 
+def araw(actions=(), scope="this_plan", questions=(), understood="Исключить W1 и поставить машину 20"):
+    base = dict(type=None, key=None, value=None, wild=None, article=None, cabinet=None, quantity=None, reason=None)
+    return dict(understood=understood, scope=scope, actions=[dict(base, **a) for a in actions], questions=list(questions))
+
+
+class AssistantTests(UiBase):
+    def setUp(self):
+        super().setUp()
+        self.calls, self.answers = [], []
+
+    def ai(self, text, rules, snapshot, lines=()):
+        def call(prompt):
+            self.calls.append(prompt)
+            return self.answers.pop(0)
+        return planner_ai.interpret(text, rules, snapshot, lines, call=call)
+
+    async def settings(self):
+        m, b = await self.plan()
+        c, _ = cb(b["Настройки"], m)
+        await self.ctl.handle_callback(c)
+        return m
+
+    def versions(self):
+        return self.ctl.store.list(OWNER)[0]["latest_version"]
+
+    async def test_free_text_is_proposed_then_applied_only_after_confirmation(self):
+        self.answers = [araw([dict(type="set_capacity", value=20), dict(type="exclude_wild", wild="w1")])]
+        m = await self.settings()
+        m.text = "Пожалуйста, возьми машину поменьше и не бери первый товар"
+        self.assertTrue(await self.ctl.handle_message(m))
+        out = said(m)
+        self.assertIn("Понял так", out)
+        self.assertIn("Машина (паллет): 33 → 20", out)
+        self.assertIn("Исключённые wild:", out)
+        self.assertEqual((len(self.calls), self.versions()), (1, 1))  # nothing applied by the model answer
+        c, m2 = cb(buttons(m)["Применить"])
+        await self.ctl.handle_callback(c)
+        d = self.ctl.store.list(OWNER)[0]
+        self.assertEqual((d["latest_version"], d["plan"]["rules"]["capacity"], d["plan"]["rules"]["excluded_wild"]),
+                         (2, 20, ["W1"]))
+        self.assertNotIn("W1", [ln["wild"] for ln in d["plan"]["lines"]])  # recalculated by Python
+        self.assertEqual(self.sheets.published, [])
+
+    async def test_fixed_commands_never_call_the_model(self):
+        m = await self.settings()
+        m.text = "Машина 20"
+        await self.ctl.handle_message(m)
+        self.assertEqual(self.calls, [])
+        self.assertIn("Машина (паллет): 33 → 20", said(m))
+
+    async def test_unclear_request_asks_and_keeps_context(self):
+        self.answers = [araw(questions=["Какой именно товар исключить?"], understood="Исключить какой-то товар"),
+                        araw([dict(type="exclude_wild", wild="W2")])]
+        m = await self.settings()
+        m.text = "исключи мыло"
+        await self.ctl.handle_message(m)
+        self.assertIn("Какой именно товар", said(m))
+        self.assertNotIn("Применить", buttons(m))  # nothing to confirm while questions are open
+        self.assertEqual(self.versions(), 1)
+        m.text = "второй"
+        await self.ctl.handle_message(m)
+        self.assertIn("исключи мыло", self.calls[1])  # the earlier request and the question travel with the answer
+        self.assertIn("Какой именно товар", self.calls[1])
+        self.assertIn("Применить", buttons(m))
+
+    async def test_invented_item_is_asked_not_applied(self):
+        self.answers = [araw([dict(type="exclude_wild", wild="W404")])]
+        m = await self.settings()
+        m.text = "убери товар который плохо продаётся"
+        await self.ctl.handle_message(m)
+        self.assertIn("Не нашёл wild", said(m))
+        self.assertNotIn("Применить", buttons(m))
+        self.assertEqual(self.versions(), 1)
+
+    async def test_model_failure_reports_exact_reason_and_changes_nothing(self):
+        def down(*a, **k):
+            raise planner_ai.AIUnavailable("Codex недоступен: лимит подписки ChatGPT исчерпан. Платный API не используется.")
+        self.ai = down
+        m = await self.settings()
+        m.text = "исключи мыло"
+        self.assertTrue(await self.ctl.handle_message(m))
+        self.assertIn("лимит подписки", said(m))
+        self.assertEqual(self.versions(), 1)
+        m.text = "Машина 20"  # the fixed commands still work
+        await self.ctl.handle_message(m)
+        self.assertIn("Применить", buttons(m))
+
+    async def test_garbage_model_output_changes_nothing(self):
+        self.answers = [{"hello": "world"}]
+        m = await self.settings()
+        m.text = "сделай что-нибудь"
+        await self.ctl.handle_message(m)
+        self.assertIn("не прошёл проверку", said(m))
+        self.assertEqual(self.versions(), 1)
+
+    async def test_no_change_and_long_text_and_non_owner(self):
+        self.answers = [araw()]
+        m = await self.settings()
+        m.text = "ничего не меняй"
+        await self.ctl.handle_message(m)
+        self.assertIn("Изменений в условиях нет", said(m))
+        m.text = "x" * 601
+        await self.ctl.handle_message(m)
+        self.assertIn("Слишком длинное", said(m))
+        self.assertEqual(len(self.calls), 1)
+        self.owner_ok = False
+        m.text = "исключи мыло"
+        self.assertFalse(await self.ctl.handle_message(m))
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_other_scope_is_shown_and_not_saved_to_memory_yet(self):
+        self.answers = [araw([dict(type="exclude_wild", wild="W2")], scope="permanent_rule")]
+        m = await self.settings()
+        m.text = "всегда не бери мыло"
+        await self.ctl.handle_message(m)
+        self.assertIn("постоянное правило", said(m))
+        self.assertIn("в память это пока не сохраняется", said(m).lower())
+
+
 class EditPublishTests(UiBase):
     async def test_settings_require_apply_and_stale_rejected(self):
         m, b = await self.plan()
@@ -300,7 +424,7 @@ class EditPublishTests(UiBase):
         await self.ctl.handle_callback(c)
         m.text = "сделай красиво"
         await self.ctl.handle_message(m)
-        self.assertIn("Не понял", said(m))
+        self.assertIn("Codex недоступен", said(m))  # unknown text goes to the AI path, which is down here
         m.text = "Машина 20"
         await self.ctl.handle_message(m)
         apply_data = buttons(m)["Применить"]
