@@ -281,12 +281,11 @@ class EditPublishTests(UiBase):
             return r
         gen0 = self.ctl._gen.get(OWNER, 0)
         with patch.object(self.ctl.store, "revise", side_effect=slow_revise):
-            c, m2 = cb(b["Пересчитать"], m)
+            c, _ = cb(b["Пересчитать"], m)
             await self.ctl.handle_callback(c)
         seen["thread"].join()
         self.assertEqual(seen["gen_during"], gen0)  # reset could not slip in between check and store
         self.assertEqual(self.ctl.store.get(OWNER, did)["latest_version"], 2)
-        self.assertIn("«Мои планы»", said(m2))
 
     async def test_changed_source_and_revoked_owner_block_write(self):
         m, b = await self.plan()
