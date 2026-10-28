@@ -89,7 +89,7 @@ class FakeSession:
                     rr = rows[g["startRowIndex"] + k]
                     rr.extend([""] * (c + 1 - len(rr)))
                     v = row["values"][0].get("userEnteredValue", {})
-                    rr[c] = v.get("stringValue", v.get("numberValue", ""))
+                    rr[c] = v.get("stringValue", v.get("numberValue", v.get("formulaValue", "")))
 
 
 class GatewayTest(unittest.TestCase):
@@ -132,11 +132,10 @@ class GatewayTest(unittest.TestCase):
         for r in reqs:
             (_, b), = r.items()
             self.assertEqual((b.get("destination") or b.get("range") or b)["sheetId"], 777)
-        src = sorted(r["copyPaste"]["source"]["startColumnIndex"] for r in reqs
-                     if "copyPaste" in r and r["copyPaste"]["source"]["sheetId"] == 100)
-        self.assertEqual(src, [13, 36])
+        self.assertEqual([r["copyPaste"]["source"]["sheetId"] for r in reqs if "copyPaste" in r], [777, 777])
         self.assertEqual(self.s.grid, ["'Отгрузка FBO'!2:2"])
         t = self.s.tabs[ps.T_TARGET]
+        self.assertEqual([t[2][13], t[3][13], t[2][36], t[3][36]], ["=M3", "=M4", "=T3", "=T4"])  # verified text, shifted
         self.assertEqual(t[1][:3], ["ручная", "", "=1+1"])
         self.assertEqual([t[2][COL("Артикул")], t[3][COL("Артикул")]], ["A1", "12345"])
         self.assertEqual(t[2][COL("Тип поставки")], "Монопаллета")
@@ -207,7 +206,7 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(kinds, {"insertDimension", "copyPaste", "updateCells"})
         out = [{"updateCells": {"range": {"sheetId": 777, "startRowIndex": 1, "endRowIndex": 2}}}]
         with self.assertRaises(ps.PlannerSheetsError):
-            ps._guard(out, 777, 100, 2, 4)
+            ps._guard(out, 777, 2, 4)
 
     def test_grid_extended_before_insert(self):
         self.s.rc = 2
@@ -264,9 +263,28 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(self.s.posts, [])
         self.s.tpl[13] = {"userEnteredValue": {"formulaValue": "=SEQUENCE(9)"}}
         self.gw.publish(self.draft)
-        src = [r["copyPaste"]["source"]["startColumnIndex"] for r in self.s.posts[0]["requests"]
-               if "copyPaste" in r and r["copyPaste"]["source"]["sheetId"] == 100]
-        self.assertEqual(src, [36])
+        t = self.s.tabs[ps.T_TARGET]
+        self.assertEqual((t[2][13], t[2][36]), ("", "=T3"))  # unverifiable formula skipped, not copied
+        self.s.tabs[ps.T_TARGET].clear()
+        for bad_src in ({"sheetId": 100}, {"sheetId": 100, "startColumnIndex": 3}):
+            req = [{"copyPaste": {"source": bad_src, "destination": {"sheetId": 777, "startRowIndex": 2, "endRowIndex": 3},
+                                  "pasteType": "PASTE_FORMULA"}}]
+            with self.assertRaises(ps.PlannerSheetsError):
+                ps._guard(req, 777, 2, 4)
+
+    def test_shift_relative_refs_only(self):
+        self.assertEqual(ps._shift("=S2/X2", 3, 1), "=T5/Y5")
+        self.assertEqual(ps._shift("=$A$1*B$2+$C3", 2, 1), "=$A$1*C$2+$C5")
+        self.assertEqual(ps._shift("=1E5+A2", 1, 0), "=1E5+A3")
+        self.assertIsNone(ps._shift("=A1", -1, 0))
+        self.assertIsNone(ps._shift("=B2", 0, -2))
+
+    def test_formula_changed_after_check_cannot_be_copied(self):
+        """Source formula is read once; only that verified text is written, never a server-side copy of the source."""
+        self.gw.publish(self.draft)
+        dump = json.dumps(self.s.posts[0]["requests"])
+        self.assertNotIn('"sheetId": 100', dump)
+        self.assertNotIn("PASTE_FORMULA", dump)
 
 
 class StoreTest(unittest.TestCase):

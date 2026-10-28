@@ -27,6 +27,7 @@ MSK = timezone(timedelta(hours=3), "MSK")  # Moscow: fixed UTC+3, no DST
 _EPOCH = date(1899, 12, 30)
 _DF = {"numberFormat": {"type": "DATE", "pattern": "dd.mm.yyyy"}}
 _TOK = re.compile(r"\s*(?:(\$?[A-Za-z]{1,3}\$?[1-9][0-9]*|[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)|([-+*/^%()]))")
+_REF = re.compile(r"(?<![A-Za-z0-9.])(\$?)([A-Za-z]{1,3})(\$?)([1-9][0-9]*)")
 _NUMRE = re.compile(r"[+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 _HEX12 = re.compile(r"[0-9a-f]{12}")
 _UNSURE = ("Связь с Google Sheets прервалась во время записи, результат неизвестен. Повторите публикацию "
@@ -122,6 +123,29 @@ def _scalar(f):
     return opnd and depth == 0
 
 
+def _shift(f, dr, dc):
+    """Verified scalar formula text with relative cell refs moved by (rows, columns), as a paste would do; None if a ref
+    leaves the sheet. Absolute ($) parts stay put."""
+    bad = []
+
+    def one(m):
+        ca, col, ra, row = m.groups()
+        n = 0
+        for ch in col.upper():
+            n = n * 26 + ord(ch) - 64
+        n, r = n + (0 if ca else dc), int(row) + (0 if ra else dr)
+        if not 1 <= n <= 18278 or r < 1:
+            bad.append(1)
+            return m.group(0)
+        out = ""
+        while n:
+            n, k = divmod(n - 1, 26)
+            out = chr(65 + k) + out
+        return f"{ca}{out}{ra}{r}"
+    res = _REF.sub(one, f)
+    return None if bad or not _scalar(res) else res
+
+
 def _sid(x):
     v = x.get("spreadsheet_id") or x.get("id") if isinstance(x, dict) else x
     if not isinstance(v, str) or not v.strip():
@@ -182,16 +206,15 @@ def _draft(d):
     return did, ver, plan
 
 
-def _guard(reqs, tid, oid, r0, r1):
-    """Every write destination must be the test sheet, cells only inside the rows inserted at [r0, r1);
-    only formula copy may read the original."""
+def _guard(reqs, tid, r0, r1):
+    """Every write destination and copy source must be the test sheet, cells only inside the rows inserted at [r0, r1).
+    The original sheet is never a source or destination of a write (formulas are written as verified text)."""
     for r in reqs:
         (kind, b), = r.items()
         dst = {"appendDimension": b, "insertDimension": b.get("range"), "copyPaste": b.get("destination"),
                "updateCells": b.get("range")}.get(kind)
         src = b["source"]["sheetId"] if kind == "copyPaste" else tid
-        if (not dst or dst.get("sheetId") != tid or src not in (tid, oid)
-                or (src == oid and b.get("pasteType") != "PASTE_FORMULA")
+        if (not dst or dst.get("sheetId") != tid or src != tid
                 or (kind == "insertDimension"
                     and (dst.get("dimension"), dst.get("startIndex"), dst.get("endIndex")) != ("ROWS", r0, r1))
                 or (kind in ("copyPaste", "updateCells")
@@ -301,7 +324,7 @@ class PlannerSheets:
     def publish(self, draft):
         did, ver, plan = _draft(draft)
         ids = self._meta()
-        tid, oid = ids[T_TARGET]["sheetId"], ids[T_ORIG]["sheetId"]
+        tid = ids[T_TARGET]["sheetId"]
         rows = self._values((T_TARGET,), "FORMULA")[0]
         if not rows:
             raise PlannerSheetsError("В тестовом листе нет заголовков")
@@ -380,7 +403,8 @@ class PlannerSheets:
             reqs += [{"copyPaste": {"source": area(0, width, r0=fr, r1=fr + 1), "destination": area(0, width),
                                     "pasteType": t, "pasteOrientation": "NORMAL"}}
                      for t in ("PASTE_FORMAT", "PASTE_DATA_VALIDATION")]
-        if tpl is not None:  # formula cells only, from the latest actual original row
+        fcells = {}  # formula cells: verified scalar text from the latest actual original row, shifted per new row
+        if tpl is not None:
             d = self._api("GET", "", {"ranges": f"{_rng(T_ORIG)}!{tpl + 1}:{tpl + 1}",
                                       "fields": "sheets(data(rowData(values(userEnteredValue))))"})
             try:
@@ -389,15 +413,19 @@ class PlannerSheets:
                 vals = []
             for key, ocol in oc.items():
                 f = ((vals[ocol] if ocol < len(vals) else {}).get("userEnteredValue") or {}).get("formulaValue")
-                if f and key not in per[0] and _scalar(f):  # unverifiable formulas are skipped, never copied
-                    reqs.append({"copyPaste": {"source": area(ocol, ocol + 1, oid, tpl, tpl + 1),
-                                               "destination": area(cols[key], cols[key] + 1),
-                                               "pasteType": "PASTE_FORMULA", "pasteOrientation": "NORMAL"}})
+                if f and key not in per[0] and _scalar(f):  # unverifiable formulas are skipped, never written
+                    texts = [_shift(f, start + i - tpl, cols[key] - ocol) for i in range(n)]
+                    if None not in texts:
+                        fcells[key] = texts
+        for key, texts in fcells.items():
+            c = cols[key]
+            reqs.append({"updateCells": {"range": area(c, c + 1), "fields": "userEnteredValue",
+                                         "rows": [{"values": [{"userEnteredValue": {"formulaValue": t}}]} for t in texts]}})
         for key in per[0]:
             c = cols[key]
             dated = "userEnteredFormat" in per[0][key]
             reqs.append({"updateCells": {"range": area(c, c + 1), "rows": [{"values": [p[key]]} for p in per],
                                          "fields": "userEnteredValue" + ",userEnteredFormat.numberFormat" * dated}})
-        _guard(reqs, tid, oid, start, end)
+        _guard(reqs, tid, start, end)
         self._api("POST", ":batchUpdate", body={"requests": reqs})
         return self._link(tid, start + 1)
