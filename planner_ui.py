@@ -1,8 +1,5 @@
-"""Owner-only Telegram controller for the TEST-only FBO planner.
-
-Plans are saved as immutable draft versions; the only external write is an explicit, separately confirmed publish
-into «Планирование FBO — ТЕСТ» (see planner_sheets). Storage, memory and Google clients are created lazily: nothing
-touches disk or network at import or in the constructor. Settings are a fixed deterministic command set (no AI)."""
+"""Owner-only Telegram controller for the TEST-only FBO planner: immutable draft versions, one explicitly confirmed
+publish into «Планирование FBO — ТЕСТ». Storage, memory and Google clients are lazy; settings are fixed commands."""
 import asyncio
 import copy
 import os
@@ -22,13 +19,12 @@ LEAVE = ("Декларации", "Главное меню")  # reset the planner
 OLD_BUTTONS = ("Ближайшая отгрузка", "Обновить базу", "База файлов", "Выбрать дату", "Проверить отметки",
                "Файлы по кабинету", "По номеру поставки")
 GENERIC = "Операция не выполнена. Повторите позже."
-MEM_DOWN = ("Память помощника недоступна — создание и запись планов заблокированы, пока её не восстановят. "
-            "Известные правила молча не игнорируются.")
+MEM_DOWN = "Память помощника недоступна — создание и запись планов заблокированы, пока её не восстановят."
 HELP = ("Команды настроек (по одной в сообщении):\n"
         "Продажи от 8 · Запас до 10 · Остаток wild от 30 · Цель 10 · Максимум 13 · Машина 20\n"
         "Исключить wild wild123 · Исключить кабинет Название\n"
         "Добавить АРТИКУЛ | КАБИНЕТ | КОЛИЧЕСТВО | ПРИЧИНА · Убрать АРТИКУЛ | КАБИНЕТ\n"
-        "Свободные формулировки пока недоступны. Сначала покажу сводку, применю только после «Применить».")
+        "Свободный текст не поддерживается. Изменения применяются только после «Применить».")
 _NUMCMD = (("остаток wild от", "min_wild_days"), ("продажи от", "min_sales"), ("запас до", "max_current_days"),
            ("цель", "target_days"), ("максимум", "max_days"))
 _LABEL = {"min_sales": "Продажи от", "max_current_days": "Запас до", "min_wild_days": "Остаток wild от",
@@ -137,13 +133,12 @@ def preview_text(d):
              f"исключений wild {len(r['excluded_wild'])}, кабинетов {len(r['excluded_cabinets'])}, "
              f"обязательных строк {len(r['fixed'])}"]
     if p["remaining_pallets"] and p["remaining_pallets"] > 0:
-        lines.append(f"Недобор: {p['remaining_pallets']} паллет не заполнено (правила не ослабляются самостоятельно; "
-                     "можно сменить машину или условия в «Настройках»).")
+        lines.append(f"Недобор: {p['remaining_pallets']} паллет (правила сами не ослабляются; смените машину или условия).")
     if not p["lines"]:
         lines.append("Подходящих строк нет.")
     if p["warnings"]:
         cats, ex = warning_summary(p["warnings"])
-        lines.append(f"Предупреждений: {len(p['warnings'])} (полный список — в сохранённой версии). По видам:")
+        lines.append(f"Предупреждений: {len(p['warnings'])} (полный список сохранён в версии). По видам:")
         lines += cats + ["Примеры:"] + ["– " + e for e in ex]
     if d.get("exported_version") == d["version"]:
         lines.append("Выгружено в тестовый лист: " + d["export_url"])
@@ -419,8 +414,7 @@ class PlannerController:
             raise _Blocked("Эта версия устарела или уже выгружена. Откройте актуальный план в «Моих планах».")
         return d
 
-    async def _c_list(self, uid, ct, msg):
-        await self._list(uid, ct, msg)
+    _c_list = _list
 
     async def _c_cn(self, uid, ct, msg):
         st = self._st.get(uid)
