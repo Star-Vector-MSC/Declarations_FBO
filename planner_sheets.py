@@ -28,7 +28,6 @@ _EPOCH = date(1899, 12, 30)
 _DF = {"numberFormat": {"type": "DATE", "pattern": "dd.mm.yyyy"}}
 _TOK = re.compile(r"\s*(?:(\$?[A-Za-z]{1,3}\$?[1-9][0-9]*|[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)|([-+*/^%()]))")
 _REF = re.compile(r"(?<![A-Za-z0-9.])(\$?)([A-Za-z]{1,3})(\$?)([1-9][0-9]*)")
-_NUMRE = re.compile(r"[+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 _HEX12 = re.compile(r"[0-9a-f]{12}")
 _UNSURE = ("Связь с Google Sheets прервалась во время записи, результат неизвестен. Повторите публикацию "
            "той же версии: повтор проверит маркеры и не создаст дубликатов.")
@@ -87,12 +86,16 @@ def _serial(iso):
 
 
 def _cmp(v):
-    """Comparable cell value (sheet value or our CellData): numbers -> Fraction (48 == 48.0 == "48"), blank -> None."""
+    """Comparable cell value (sheet value or our CellData): text stays exact text ("12345" != "012345"), numbers compare
+    exactly as numbers (48 == 48.0), blank -> None. A text/number type change counts as a difference."""
     if isinstance(v, dict):
         u = v.get("userEnteredValue") or {}
-        v = u.get("stringValue", u.get("numberValue"))
-    s = "" if v is None else str(v).strip()
-    return Fraction(s) if _NUMRE.fullmatch(s) else (s or None)
+        v = u["stringValue"] if "stringValue" in u else u.get("numberValue")
+    if isinstance(v, bool):
+        return ("b", v)
+    if isinstance(v, (int, float)):
+        return ("n", Fraction(repr(v)))
+    return ("s", v.strip()) if isinstance(v, str) and v.strip() else None
 
 
 def _scalar(f):

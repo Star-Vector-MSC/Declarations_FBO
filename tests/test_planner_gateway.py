@@ -233,7 +233,7 @@ class GatewayTest(unittest.TestCase):
     def test_replay_compares_all_owned_cells(self):
         self.gw.publish(self.draft)
         t, hdr = self.s.tabs[ps.T_TARGET], list(ps.ORIGINAL + ps.META)
-        for name, v in (("wild", "W9"), ("Плановая дата прибытия авто на вб", 46001), ("Правила плана", "{}"),
+        for name, v in (("Артикул", "012345"), ("Название магазина", "Каб2"), ("wild", "W9"), ("Плановая дата прибытия авто на вб", 46001), ("Правила плана", "{}"),
                         ("Шт в коробе", ""), ("Прогноз после", 12345.5), ("Склад Wildberries", "Казань")):
             c = hdr.index(name)
             old, t[3][c] = t[3][c], v
