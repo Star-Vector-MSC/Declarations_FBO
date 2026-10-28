@@ -264,9 +264,13 @@ class PlannerController:
             raise _Blocked("Такого склада сейчас нет в таблице. Начните новый план.")
         wilds = set(planner_ai.catalog(snap)["wilds"].values())
         selected = exp.select(self.memory.entries(), plan_id=draft["id"] if draft else None, on_date=day, wilds=wilds)
-        effective, experience = exp.merge(rules, selected)
+        norm = planner.validate_rules(rules)
+        prev = base_rules(draft) if draft else None
+        explicit = set(draft["plan"].get("explicit_keys") or ()) if draft else {"capacity"}  # the wizard asks for it
+        explicit |= {k for k in exp.NUMERIC + ("capacity",) if prev is not None and norm[k] != prev[k]}
+        effective, experience = exp.merge(rules, selected, explicit)
         plan = planner.build_plan(snap, effective, day, wh, arrival)
-        plan["base_rules"], plan["experience"] = planner.validate_rules(rules), experience
+        plan["base_rules"], plan["experience"], plan["explicit_keys"] = norm, experience, sorted(explicit)
         with self._commit:  # owner/menu re-check after the slow read, atomically with the store
             if alive is not None and not alive():
                 raise _Blocked("Действие отменено.")

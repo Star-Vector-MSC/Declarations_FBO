@@ -19,7 +19,7 @@ CATEGORIES = {  # category -> (memory scope, label)
 }
 PREFERENCE_DAYS = 60
 _LINE = re.compile(r"\n" + re.escape(PREFIX) + r"(\{.*\})\s*$", re.S)
-_NUM = ("min_sales", "max_current_days", "min_wild_days", "target_days", "max_days")
+_NUM = NUMERIC = ("min_sales", "max_current_days", "min_wild_days", "target_days", "max_days")
 _EFFECT_KEYS = {"excluded_wild", "excluded_cabinets", "set", "fixed"}
 
 
@@ -56,6 +56,8 @@ def persistable(category, effect, removed):
         return True, ""
     if "fixed" in effect:
         return False, "обязательные строки не могут быть постоянным правилом"
+    if "capacity" in effect.get("set", {}):
+        return False, "машину вы выбираете при создании каждого плана, в память она не записывается"
     return True, ""
 
 
@@ -137,9 +139,12 @@ def select(entries, *, plan_id, on_date, wilds):
     return sorted(out, key=lambda x: x[0]["created_at"])
 
 
-def merge(base, selected):
-    """Effective rules = owner's base rules + remembered effects. -> (rules, experience list for display/storage)."""
+def merge(base, selected, explicit=()):
+    """Effective rules = owner's base rules + remembered effects. -> (rules, experience list for display/storage).
+    `explicit` = keys the owner set in THIS plan (even to a value equal to the default): remembered numbers never
+    override them."""
     base = planner.validate_rules(base)
+    explicit = set(explicit)
     rules, notes, defaults = base, [], planner.default_rules()
     for r, d in selected:
         eff = d["effect"]
@@ -150,7 +155,7 @@ def merge(base, selected):
             cand[k] = cand[k] + [x for x in eff.get(k, ()) if x not in cand[k]]
         kept = {}
         for k, v in (eff.get("set") or {}).items():
-            if base[k] != defaults[k]:  # the owner's explicit value for this plan wins over a remembered one
+            if k in explicit or base[k] != defaults[k]:  # the owner's explicit value for this plan wins
                 kept[k] = base[k]
             else:
                 cand[k] = v

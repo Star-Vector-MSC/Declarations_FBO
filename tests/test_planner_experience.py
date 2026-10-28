@@ -37,7 +37,9 @@ class UnitTests(unittest.TestCase):
         new = dict(old, excluded_wild=["W1"], capacity=20)
         eff, removed = exp.effect_between(old, new)
         self.assertEqual((eff, removed), ({"excluded_wild": ["W1"], "set": {"capacity": 20}}, False))
-        self.assertEqual(exp.persistable("permanent_rule", eff, removed)[0], True)
+        self.assertFalse(exp.persistable("permanent_rule", eff, removed)[0])  # a machine is chosen per plan, never remembered
+        self.assertTrue(exp.persistable("once_exception", eff, removed)[0])
+        self.assertTrue(exp.persistable("permanent_rule", {"excluded_wild": ["W1"], "set": {"min_sales": 9}}, False)[0])
         self.assertFalse(exp.persistable("product_preference", eff, removed)[0])  # only «не брать wild»
         self.assertTrue(exp.persistable("product_preference", {"excluded_wild": ["W1"]}, False)[0])
         fx = [dict(article="A", cabinet="C", quantity=6, reason="r")]
@@ -87,17 +89,22 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(self.sel(plan_id="a" * 12), [])
 
     def test_merge_unions_exclusions_and_owner_settings_win(self):
-        self.add("permanent_rule", {"excluded_wild": ["W1"], "set": {"min_sales": 12, "capacity": 20}})
+        self.add("permanent_rule", {"excluded_wild": ["W1"], "set": {"min_sales": 12, "max_current_days": 9}})
         self.add("permanent_rule", {"excluded_cabinets": ["Каб"]})
         base = planner.validate_rules({"excluded_wild": ["W9"]})
         rules, notes = exp.merge(base, self.sel())
-        self.assertEqual((rules["excluded_wild"], rules["excluded_cabinets"], rules["min_sales"], rules["capacity"]),
-                         (["W9", "W1"], ["Каб"], 12, 20))
+        self.assertEqual((rules["excluded_wild"], rules["excluded_cabinets"], rules["min_sales"],
+                          rules["max_current_days"]), (["W9", "W1"], ["Каб"], 12, 9))
         self.assertEqual([n["applied"] for n in notes], [True, True])
         own = planner.validate_rules({"min_sales": 9})  # explicit value of this plan beats the remembered 12
         rules, notes = exp.merge(own, self.sel())
-        self.assertEqual((rules["min_sales"], rules["capacity"]), (9, 20))
+        self.assertEqual((rules["min_sales"], rules["max_current_days"]), (9, 9))
         self.assertIn("min_sales", notes[0]["note"])
+        same = planner.validate_rules({"max_current_days": 10})  # explicitly chosen value EQUAL to the default still wins
+        rules, _ = exp.merge(same, self.sel(), explicit={"max_current_days"})
+        self.assertEqual(rules["max_current_days"], 10)
+        rules, _ = exp.merge(same, self.sel())
+        self.assertEqual(rules["max_current_days"], 9)  # not explicit -> the remembered rule applies
         self.assertEqual(base["excluded_wild"], ["W9"])  # inputs untouched
 
     def test_conflicting_memory_is_skipped_visibly(self):
@@ -184,6 +191,29 @@ class ExperienceFlowTests(UiBase):
         self.assertIn("W1", [ln["wild"] for ln in self.latest()["plan"]["lines"]])
         self.assertEqual(self.latest()["plan"]["experience"], [])
         self.assertEqual(self.sheets.published, [])
+
+    async def test_owner_settings_beat_remembered_numbers_through_recalculations(self):
+        self.ctl.memory.confirm(self.ctl.memory.propose(**exp.memory_entries(
+            "permanent_rule", {"set": {"max_current_days": 6}}, reason="", plan_id="a" * 12, plan_date="2026-10-30",
+            today=date(2026, 10, 28))[0]))
+        m, b = await self.plan()
+        self.assertEqual(self.latest()["plan"]["rules"]["max_current_days"], 6)  # remembered, not explicit
+        self.assertEqual(self.latest()["plan"]["rules"]["capacity"], 33)
+        self.answers = [araw([dict(type="set_number", key="max_current_days", value=8)])]
+        c, _ = cb(b["Настройки"], m)
+        await self.ctl.handle_callback(c)
+        m.text = "сделай окно запаса короче"
+        await self.ctl.handle_message(m)
+        await self.tap(m, "Применить")
+        self.assertEqual(self.latest()["plan"]["rules"]["max_current_days"], 8)  # the owner's value
+        c, m2 = cb(buttons(m)["Пересчитать"] if "Пересчитать" in buttons(m) else self.latest_keys(m))
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.latest()["plan"]["rules"]["max_current_days"], 8)
+        self.assertIn("max_current_days", self.latest()["plan"]["explicit_keys"])
+
+    def latest_keys(self, m):
+        d = self.latest()
+        return f"pl:rc:{d['id']}:{d['latest_version']}"
 
     async def test_apply_without_remembering_stores_nothing(self):
         m = await self.propose(araw([dict(type="exclude_wild", wild="W1")], scope="permanent_rule"))
