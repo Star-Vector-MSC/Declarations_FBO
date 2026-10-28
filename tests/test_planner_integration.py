@@ -72,7 +72,7 @@ class UiBase(unittest.IsolatedAsyncioTestCase):
         self.sheets = FakeSheets()
         self.make()
 
-    def ai(self, text, rules, snapshot, lines=()):  # never the real Codex in tests
+    def ai(self, text, rules, snapshot, lines=(), **kw):  # never the real Codex in tests
         raise planner_ai.AIUnavailable("Codex недоступен (тест)")
 
     def make(self):
@@ -276,9 +276,11 @@ class PreliminaryPlanTests(UiBase):
         self.assertFalse(await self.ctl.handle_message(m))
 
 
-def araw(actions=(), scope="this_plan", questions=(), understood="Исключить W1 и поставить машину 20"):
+def araw(actions=(), scope="this_plan", questions=(), understood="Исключить W1 и поставить машину 20", reason=None,
+         expires_on=None):
     base = dict(type=None, key=None, value=None, wild=None, article=None, cabinet=None, quantity=None, reason=None)
-    return dict(understood=understood, scope=scope, actions=[dict(base, **a) for a in actions], questions=list(questions))
+    return dict(understood=understood, scope=scope, actions=[dict(base, **a) for a in actions], questions=list(questions),
+                reason=reason, expires_on=expires_on)
 
 
 class AssistantTests(UiBase):
@@ -286,11 +288,11 @@ class AssistantTests(UiBase):
         super().setUp()
         self.calls, self.answers = [], []
 
-    def ai(self, text, rules, snapshot, lines=()):
+    def ai(self, text, rules, snapshot, lines=(), **kw):
         def call(prompt):
             self.calls.append(prompt)
             return self.answers.pop(0)
-        return planner_ai.interpret(text, rules, snapshot, lines, call=call)
+        return planner_ai.interpret(text, rules, snapshot, lines, call=call, **kw)
 
     async def settings(self):
         m, b = await self.plan()
@@ -406,7 +408,8 @@ class AssistantTests(UiBase):
         m.text = "всегда не бери мыло"
         await self.ctl.handle_message(m)
         self.assertIn("постоянное правило", said(m))
-        self.assertIn("в память это пока не сохраняется", said(m).lower())
+        self.assertIn("Применить и запомнить", buttons(m))
+        self.assertEqual(len(self.ctl.memory.entries()), 0)  # nothing is remembered before the owner taps
 
 
 class EditPublishTests(UiBase):

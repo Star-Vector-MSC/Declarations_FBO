@@ -13,6 +13,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardBu
 
 import planner
 import planner_ai
+import planner_experience as exp
 from planner_sheets import MSK, PlannerSheets, PlannerSheetsError, SourceChangedError
 from planner_storage import DraftError, DraftStore
 
@@ -144,6 +145,7 @@ def preview_text(d):
              f"{r['min_wild_days']}, цель {r['target_days']}, максимум {r['max_days']}; "
              f"исключений wild {len(r['excluded_wild'])}, кабинетов {len(r['excluded_cabinets'])}, "
              f"обязательных строк {len(r['fixed'])}"]
+    lines += exp.experience_lines(p.get("experience"))
     if p["warehouse"] is None:
         lines.append(NO_WH_NOTE)
     if p["remaining_pallets"] and p["remaining_pallets"] > 0:
@@ -161,6 +163,11 @@ def preview_text(d):
     elif d.get("exported_version") is not None:
         lines.append(f"Версия {d['exported_version']} уже выгружена; изменения запрещены.")
     return "\n".join(lines)
+
+
+def base_rules(d):
+    """The owner's own rules of a draft (remembered effects are merged in on every calculation, never frozen in)."""
+    return d["plan"].get("base_rules") or d["plan"]["rules"]
 
 
 def lines_text(d, page):
@@ -255,7 +262,11 @@ class PlannerController:
         snap = self.sheets.snapshot()
         if wh is not None and wh not in snap["warehouses"]:
             raise _Blocked("Такого склада сейчас нет в таблице. Начните новый план.")
-        plan = planner.build_plan(snap, rules, day, wh, arrival)
+        wilds = set(planner_ai.catalog(snap)["wilds"].values())
+        selected = exp.select(self.memory.entries(), plan_id=draft["id"] if draft else None, on_date=day, wilds=wilds)
+        effective, experience = exp.merge(rules, selected)
+        plan = planner.build_plan(snap, effective, day, wh, arrival)
+        plan["base_rules"], plan["experience"] = planner.validate_rules(rules), experience
         with self._commit:  # owner/menu re-check after the slow read, atomically with the store
             if alive is not None and not alive():
                 raise _Blocked("Действие отменено.")
@@ -406,7 +417,7 @@ class PlannerController:
             d = await asyncio.to_thread(self.store.get, uid, st["id"])
             if d["version"] != st["ver"] or d.get("exported_version") is not None:
                 raise _Blocked("План изменился; откройте актуальную версию в «Моих планах».")
-            rules, summary = parse_command(text, d["plan"]["rules"])
+            rules, summary = parse_command(text, base_rules(d))
         except UnknownCommand:
             return await self._t_ai(uid, ct, msg, text, st)
         except (ValueError, _Blocked, DraftError) as e:
@@ -435,7 +446,7 @@ class PlannerController:
             d = self.store.get(uid, did)
             if d["version"] != ver or d.get("exported_version") is not None:
                 raise _Blocked("План изменился; откройте актуальную версию в «Моих планах».")
-            return self.ai(full, d["plan"]["rules"], self.sheets.snapshot(), d["plan"]["lines"])
+            return self.ai(full, base_rules(d), self.sheets.snapshot(), d["plan"]["lines"], locked=self._locked(d))
         ok, p = await self._guarded(uid, ct, msg, work)
         if not ok or self._st.get(uid) is not st:  # failed, or the menu/another action replaced the state meanwhile
             return True
@@ -446,16 +457,40 @@ class PlannerController:
             await msg.answer(head + "\nНужно уточнить (ничего не изменено):\n" + "\n".join("• " + q for q in p.questions))
             return True
         st.pop("ai_prev", None)
+        nonce = secrets.token_hex(3)
+        if p.scope == "example":  # a past shipment is only ever remembered as a non-policy example, on request
+            st.update(example=text if not prev else orig, nonce=nonce)
+            st.pop("proposal", None)
+            await msg.answer(head + "\nПример прошлой поставки я могу сохранить в память только как пример: "
+                             "правилом он не станет и расчёт не меняет.",
+                             reply_markup=_kb([[_btn("Сохранить как пример", "ex", did, ver, nonce),
+                                                _btn("Отмена", "cn")]]))
+            return True
         if not p.summary:
             await msg.answer(head + "\nИзменений в условиях нет.")
             return True
-        nonce = secrets.token_hex(3)
         st.update(proposal=p.rules, nonce=nonce)
+        st.pop("memo", None)
+        st.pop("perm_ok", None)
+        buttons, extra = [], ""
+        if p.scope != "this_plan":
+            effect, removed = exp.effect_between(base_rules(await asyncio.to_thread(self.store.get, uid, did)), p.rules)
+            ok_mem, why = exp.persistable(p.scope, effect, removed)
+            if ok_mem:
+                st["memo"] = dict(category=p.scope, effect=effect, reason=p.reason, expires_on=p.expires_on)
+                label = exp.CATEGORIES[p.scope][1]
+                extra = ("\nМожно применить только к этому плану или запомнить как " + label
+                         + {"once_exception": " (действует для этого плана)",
+                            "product_preference": f" (на {exp.PREFERENCE_DAYS} дней, если срок не назван)",
+                            "permanent_rule": " (для всех будущих планов, пока вы не отзовёте)"}[p.scope]
+                         + (f"; срок до {p.expires_on}" if p.expires_on else "") + ".")
+                buttons.append(_btn("Применить и запомнить", "ar", did, ver, nonce))
+            else:
+                extra = f"\nВ память это записать нельзя: {why}. Можно применить только к этому плану."
         await msg.answer(head + "\nПредлагаемые изменения (пока не применены; количества, остатки, короба и вместимость "
-                         "проверит расчёт после «Применить»):\n" + "\n".join(p.summary)
-                         + ("\nВ память это пока не сохраняется: изменение действует только в этом плане."
-                            if p.scope != "this_plan" else ""),
-                         reply_markup=_kb([[_btn("Применить", "ap", did, ver, nonce), _btn("Отмена", "cn")]]))
+                         "проверит расчёт после «Применить»):\n" + "\n".join(p.summary) + extra,
+                         reply_markup=_kb([[_btn("Применить к этому плану" if buttons else "Применить", "ap", did, ver,
+                                                 nonce)] + buttons + [_btn("Отмена", "cn")]]))
         return True
 
     # callbacks -----------------------------------------------------------------------------------------------
@@ -471,11 +506,11 @@ class PlannerController:
             if len(cb.data.encode()) > 64 or parts[0] != "pl":
                 raise ValueError
             act, a = parts[1], parts[2:]
-            if act in ("op", "ln", "mem", "rc", "set", "cap", "pub", "ok", "ap", "sw"):
+            if act in ("op", "ln", "mem", "rc", "set", "cap", "pub", "ok", "ap", "ar", "ex", "sw"):
                 if not (len(a) >= 2 and _ID.fullmatch(a[0]) and a[1].isdigit()):
                     raise ValueError
                 a = [a[0], int(a[1])] + a[2:]
-            elif act not in ("list", "cn", "wh", "wc", "wn", "sp"):
+            elif act not in ("list", "cn", "wh", "wc", "wn", "sp", "rv"):
                 raise ValueError
         except (ValueError, IndexError, AttributeError):
             await msg.answer("Кнопка устарела. Откройте «Мои планы».")
@@ -499,8 +534,8 @@ class PlannerController:
     async def _c_cn(self, uid, ct, msg):
         st = self._st.get(uid)
         if st:
-            st.pop("proposal", None)
-            st.pop("confirm", None)
+            for k in ("proposal", "confirm", "memo", "perm_ok", "example"):
+                st.pop(k, None)
             if st["step"] in ("settings", "pickwh"):
                 self._st.pop(uid)
         await msg.answer("Отменено, ничего не изменено.")
@@ -548,19 +583,39 @@ class PlannerController:
         ok, recs = await self._guarded(uid, ct, msg, lambda: (self._mem_ok(), work())[1])
         if not ok:
             return
-        out = ["Память помощника для этого плана (подтверждённые, не истёкшие):"]
+        out = ["Опыт, учтённый в этой версии плана:"] + (exp.experience_lines(p.get("experience"), limit=15)[1:]
+                                                         or ["• ничего не применялось"])
+        out.append("\nПамять помощника для этого плана (подтверждённые, не истёкшие):")
+        revoke = []
         for r in recs[:15]:
-            tag = "пример (не политика)" if r["kind"] == "case" else "правило"
+            live = exp.decode(r)
+            tag = ("пример (не правило, расчёт не меняет)" if r["kind"] == "case"
+                   else "действует в расчёте" if live else "справочное правило (расчёт не меняет)")
             out.append(f"• {tag}, {r['scope']}{' ' + r['target'] if r['target'] else ''}"
-                       f"{', до ' + r['expires_on'] if r['expires_on'] else ''}: {r['text'][:150]}")
+                       f"{', до ' + r['expires_on'] if r['expires_on'] else ''}: {r['text'].split(chr(10))[0][:150]}")
+            if live and len(revoke) < 5:
+                revoke.append([_btn("Отозвать: " + exp._summary(live["effect"])[:36], "rv", r["id"])])
         if not recs:
             out.append("Подходящих записей нет.")
-        out.append("Текст памяти сам расчёт не меняет: действуют жёсткие правила расчёта и ваши настройки.")
-        await msg.answer("\n".join(out))
+        out.append("Правило с пометкой «действует в расчёте» меняет следующие расчёты; ваши настройки конкретного плана "
+                   "важнее запомненных числовых значений.")
+        await msg.answer("\n".join(out), reply_markup=_kb(revoke) if revoke else None)
 
     async def _c_rc(self, uid, ct, msg, did, ver):
         d = await self._draft(uid, did, ver)
-        await self._revise(uid, ct, msg, d, d["plan"]["rules"])
+        await self._revise(uid, ct, msg, d, base_rules(d))
+
+    @staticmethod
+    def _locked(d):
+        """Exclusions that come from remembered rules only (they can be lifted only by revoking the memory entry)."""
+        base, out = base_rules(d), {"wilds": set(), "cabinets": set()}
+        for e in d["plan"].get("experience") or ():
+            if e["applied"]:
+                out["wilds"] |= {planner._norm(x) for x in e["effect"].get("excluded_wild", ())} - {
+                    planner._norm(x) for x in base["excluded_wild"]}
+                out["cabinets"] |= {planner._norm(x) for x in e["effect"].get("excluded_cabinets", ())} - {
+                    planner._norm(x) for x in base["excluded_cabinets"]}
+        return out
 
     async def _revise(self, uid, ct, msg, d, rules, warehouse=...):
         p = d["plan"]
@@ -570,6 +625,7 @@ class PlannerController:
         if ok:
             await msg.answer("Пересчитано: сохранена новая неизменяемая версия (в таблицу ничего не записано).")
             await self._show(msg, new)
+        return new if ok else None
 
     async def _c_set(self, uid, ct, msg, did, ver):
         await self._draft(uid, did, ver)
@@ -604,13 +660,13 @@ class PlannerController:
             return
         self._st.pop(uid)
         d = await self._draft(uid, st["id"], st["ver"])
-        await self._revise(uid, ct, msg, d, d["plan"]["rules"], st["whs"][int(idx)])
+        await self._revise(uid, ct, msg, d, base_rules(d), st["whs"][int(idx)])
 
     async def _c_cap(self, uid, ct, msg, did, ver, n):
         d = await self._draft(uid, did, ver)
         if n not in ("20", "33"):
             raise ValueError("Кнопка устарела.")
-        rules, summary = parse_command(f"Машина {n}", d["plan"]["rules"])
+        rules, summary = parse_command(f"Машина {n}", base_rules(d))
         nonce = secrets.token_hex(3)
         self._st[uid] = {"step": "proposal", "id": did, "ver": ver, "proposal": rules, "nonce": nonce}
         await msg.answer("Предлагаемые изменения (пока не применены):\n" + summary, reply_markup=_kb(
@@ -624,6 +680,99 @@ class PlannerController:
         rules, _ = st.pop("proposal"), st.pop("nonce")
         self._st.pop(uid, None)
         await self._revise(uid, ct, msg, await self._draft(uid, did, ver), rules)
+
+    async def _c_ar(self, uid, ct, msg, did, ver, nonce=""):
+        """Apply to this plan AND remember (memory entries are written confirmed: this tap is the owner's confirmation)."""
+        st = self._st.get(uid)
+        if (not st or st.get("nonce") != nonce or (st["id"], st["ver"]) != (did, ver) or "proposal" not in st
+                or not st.get("memo")):
+            await msg.answer("Предложение устарело или отменено. Ничего не изменено.")
+            return
+        memo = st["memo"]
+        if memo["category"] == "permanent_rule" and not st.get("perm_ok"):
+            st["perm_ok"] = True  # a permanent rule needs a second, explicit tap
+            await msg.answer("Постоянное правило будет действовать во ВСЕХ будущих планах, пока вы не отзовёте его в "
+                             "разделе «Память»: " + exp._summary(memo["effect"]) + ". Сохранить навсегда?",
+                             reply_markup=_kb([[_btn("Да, сохранить навсегда", "ar", did, ver, nonce),
+                                                _btn("Отмена", "cn")]]))
+            return
+        rules = st.pop("proposal")
+        for k in ("nonce", "memo", "perm_ok"):
+            st.pop(k, None)
+        self._st.pop(uid, None)
+        d = await self._draft(uid, did, ver)
+        entries = exp.memory_entries(memo["category"], memo["effect"], reason=memo["reason"], plan_id=did,
+                                     plan_date=d["plan"]["date"], today=datetime.now(MSK).date(),
+                                     expires_on=memo["expires_on"])
+
+        made = []
+
+        def withdraw():
+            for i in made:  # never leave a decision active that the owner did not see applied
+                try:
+                    self.memory.revoke(i)
+                except Exception:
+                    pass
+            made.clear()
+
+        def remember(alive):
+            self._mem_ok()
+            with self._commit:  # owner/menu re-check atomically with the write
+                if not alive():
+                    raise _Blocked("Действие отменено.")
+                try:
+                    for e in entries:
+                        i = self.memory.propose(**e)
+                        made.append(i)
+                        self.memory.confirm(i)
+                except Exception:
+                    withdraw()
+                    raise
+            return list(made)
+        ok, ids = await self._guarded(uid, ct, msg, remember, live=True)
+        if not ok:
+            await asyncio.to_thread(withdraw)
+            return
+        new = await self._revise(uid, ct, msg, d, rules)
+        if new is None:
+            await asyncio.to_thread(withdraw)  # the plan could not be rebuilt: the remembered decision is withdrawn again
+            await msg.answer("Запомнить не получилось: план с этим правилом не рассчитан, запись отозвана.")
+            return
+        label = exp.CATEGORIES[memo["category"]][1]
+        await msg.answer(f"Запомнил ({label}): {exp._summary(memo['effect'])}. Записей: {len(ids)}"
+                         + (f"; действует до {entries[0]['expires_on']}" if entries[0]["expires_on"] else "; без срока")
+                         + ". Отозвать можно в разделе «Память».")
+
+    async def _c_ex(self, uid, ct, msg, did, ver, nonce=""):
+        st = self._st.get(uid)
+        if (not st or st.get("nonce") != nonce or (st["id"], st["ver"]) != (did, ver) or "example" not in st):
+            await msg.answer("Предложение устарело или отменено. Ничего не сохранено.")
+            return
+        text = st.pop("example")
+        st.pop("nonce", None)
+        self._st.pop(uid, None)
+        d = await self._draft(uid, did, ver, latest=False)
+        e = exp.example_entry(text, did, d["plan"]["date"])
+
+        def work():
+            self._mem_ok()
+            i = self.memory.propose(**e)
+            self.memory.confirm(i)
+        ok, _ = await self._guarded(uid, ct, msg, work)
+        if ok:
+            await msg.answer("Сохранил как пример прошлой поставки (не правило): расчёт он не меняет и сам правилом не станет.")
+
+    async def _c_rv(self, uid, ct, msg, rid):
+        def work():
+            self._mem_ok()
+            rec = next((r for r in self.memory.entries() if r["id"] == rid), None)
+            if rec is None or rec["status"] != "confirmed" or exp.decode(rec) is None:
+                raise _Blocked("Эта запись уже отозвана или не найдена.")
+            self.memory.revoke(rid)
+        ok, _ = await self._guarded(uid, ct, msg, work)
+        if ok:
+            await msg.answer("Запись отозвана. В уже сохранённых версиях планов ничего не меняется; новые расчёты и "
+                             "«Пересчитать» её больше не учитывают.")
 
     async def _c_pub(self, uid, ct, msg, did, ver):
         d = await self._draft(uid, did, ver)

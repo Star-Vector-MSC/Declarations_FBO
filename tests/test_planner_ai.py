@@ -21,8 +21,9 @@ def act(type_, **kw):
     return dict(base, **kw)
 
 
-def raw(actions=(), scope="this_plan", questions=(), understood="Понял"):
-    return dict(understood=understood, scope=scope, actions=list(actions), questions=list(questions))
+def raw(actions=(), scope="this_plan", questions=(), understood="Понял", reason=None, expires_on=None):
+    return dict(understood=understood, scope=scope, actions=list(actions), questions=list(questions), reason=reason,
+                expires_on=expires_on)
 
 
 def prop(r, rules=None):
@@ -83,6 +84,24 @@ class ValidateTests(unittest.TestCase):
         for r in bad:
             with self.subTest(r=r), self.assertRaises(ai.AIRejected):
                 prop(r)
+
+    def test_reason_expiry_example_and_locked_exclusions(self):
+        p = prop(raw([act("exclude_wild", wild="W1")], scope="product_preference", reason=" качество ",
+                      expires_on="2026-12-31"))
+        self.assertEqual((p.reason, p.expires_on, p.questions), ("качество", "2026-12-31", []))
+        for bad in ("31.12.2026", "2026-13-40", "завтра"):  # an unparsable term is asked about, never guessed
+            q = prop(raw([act("exclude_wild", wild="W1")], scope="permanent_rule", expires_on=bad))
+            self.assertIsNone(q.expires_on)
+            self.assertTrue(any("срок" in x for x in q.questions), bad)
+        ex = prop(raw(scope="example", understood="В прошлый раз 100 шт"))
+        self.assertEqual((ex.scope, ex.summary, ex.questions), ("example", [], []))
+        mixed = prop(raw([act("exclude_wild", wild="W1")], scope="example"))
+        self.assertTrue(mixed.questions)  # an example never smuggles in a rule change
+        rules = planner.default_rules()
+        lifted = ai.validate_proposal(raw([act("include_wild", wild="W1"), act("include_cabinet", cabinet="Каб2")]),
+                                      rules, ai.catalog(SNAP), locked={"wilds": {"w1"}, "cabinets": {"каб2"}})
+        self.assertEqual(len(lifted.questions), 2)
+        self.assertTrue(all("Память" in x for x in lifted.questions))
 
     def test_nothing_is_applied_by_validation_alone(self):
         rules = planner.default_rules()
