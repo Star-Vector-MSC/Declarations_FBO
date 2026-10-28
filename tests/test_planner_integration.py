@@ -1,5 +1,7 @@
 import os
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -263,6 +265,28 @@ class EditPublishTests(UiBase):
         c, _ = cb(buttons(m2)["33 паллет"], m2)
         await self.ctl.handle_callback(c)
         self.assertEqual(len(self.ctl.store.list(OWNER, 10)), 1)
+
+    async def test_reset_waits_for_inflight_store(self):
+        m, b = await self.plan()
+        did = b["Состав"].split(":")[2]
+        real, seen = self.ctl.store.revise, {}
+
+        def slow_revise(*a, **k):
+            t = threading.Thread(target=self.ctl.reset, args=(OWNER,))
+            t.start()  # menu pressed while the store is in flight
+            time.sleep(0.2)
+            seen["gen_during"] = self.ctl._gen.get(OWNER, 0)
+            r = real(*a, **k)
+            seen["thread"] = t
+            return r
+        gen0 = self.ctl._gen.get(OWNER, 0)
+        with patch.object(self.ctl.store, "revise", side_effect=slow_revise):
+            c, m2 = cb(b["Пересчитать"], m)
+            await self.ctl.handle_callback(c)
+        seen["thread"].join()
+        self.assertEqual(seen["gen_during"], gen0)  # reset could not slip in between check and store
+        self.assertEqual(self.ctl.store.get(OWNER, did)["latest_version"], 2)
+        self.assertIn("«Мои планы»", said(m2))
 
     async def test_changed_source_and_revoked_owner_block_write(self):
         m, b = await self.plan()

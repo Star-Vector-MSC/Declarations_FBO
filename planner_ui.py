@@ -5,6 +5,7 @@ import copy
 import os
 import re
 import secrets
+import threading
 from collections import Counter
 from datetime import date, datetime, timedelta
 
@@ -166,6 +167,7 @@ class PlannerController:
         self._store, self._sheets, self._memory = store, sheets, memory
         self._is_owner, self._data_dir = is_owner, data_dir
         self._lock, self._st, self._gen = asyncio.Lock(), {}, {}
+        self._commit = threading.Lock()  # serialises "check still wanted + store" with reset()
 
     # lazy collaborators -------------------------------------------------------------------------------------
     def _dir(self):
@@ -202,7 +204,8 @@ class PlannerController:
         return bool(telegram_bot.is_owner(uid, chat_type))
 
     def reset(self, owner):
-        self._gen[owner] = self._gen.get(owner, 0) + 1
+        with self._commit:  # waits for an in-flight store; later stores see the new generation
+            self._gen[owner] = self._gen.get(owner, 0) + 1
         self._st.pop(owner, None)
 
     def _mem_ok(self):
@@ -235,9 +238,10 @@ class PlannerController:
         if wh not in snap["warehouses"]:
             raise _Blocked("Такого склада сейчас нет в таблице. Начните новый план.")
         plan = planner.build_plan(snap, rules, day, wh, arrival)
-        if alive is not None and not alive():  # owner/menu re-check after the slow read, before anything is stored
-            raise _Blocked("Действие отменено.")
-        return self.store.revise(uid, draft["id"], draft["version"], plan) if draft else self.store.create(uid, plan)
+        with self._commit:  # owner/menu re-check after the slow read, atomically with the store
+            if alive is not None and not alive():
+                raise _Blocked("Действие отменено.")
+            return self.store.revise(uid, draft["id"], draft["version"], plan) if draft else self.store.create(uid, plan)
 
     async def _guarded(self, uid, chat_type, msg, work, *args, live=False):
         """Owner re-check around a long operation + menu race guard. Returns (ok, result).
@@ -253,7 +257,7 @@ class PlannerController:
         if not self._owner(uid, chat_type):
             return False, None
         if self._gen.get(uid, 0) != g:
-            await msg.answer("Действие отменено: вы вернулись в меню.")
+            await msg.answer("Вы вернулись в меню. Если расчёт успел сохраниться, он в «Мои планы».")
             return False, None
         return True, res
 
