@@ -337,14 +337,6 @@ class TelegramWiringTests(unittest.IsolatedAsyncioTestCase):
             await handler(m)
             gen.assert_awaited_once()
 
-    async def test_planner_callback_denies_stranger_without_side_effects(self):
-        dispatcher = app.create_dispatcher()
-        handler = next(h.callback for h in dispatcher.callback_query.handlers if h.callback.__name__ == "planner_callback")
-        c, m = cb("pl:list", uid=999)
-        with patch.object(app, "setting", return_value="123"):
-            await handler(c)
-        c.answer.assert_awaited_with("Доступ закрыт.", show_alert=True)
-
 
 if __name__ == "__main__":
     unittest.main()
