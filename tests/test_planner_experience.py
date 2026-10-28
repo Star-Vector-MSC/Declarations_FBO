@@ -215,6 +215,28 @@ class ExperienceFlowTests(UiBase):
         d = self.latest()
         return f"pl:rc:{d['id']}:{d['latest_version']}"
 
+    async def test_explicit_value_equal_to_default_still_beats_memory(self):
+        self.ctl.memory.confirm(self.ctl.memory.propose(**exp.memory_entries(
+            "permanent_rule", {"set": {"max_current_days": 6}}, reason="", plan_id="a" * 12, plan_date="2026-10-30",
+            today=date(2026, 10, 28))[0]))
+        for via_ai in (False, True):
+            self.answers = [araw([dict(type="set_number", key="max_current_days", value=10)])]
+            m, b = await self.plan()
+            self.assertEqual(self.latest()["plan"]["rules"]["max_current_days"], 6)  # remembered, not explicit
+            c, _ = cb(b["Настройки"], m)
+            await self.ctl.handle_callback(c)
+            m.text = "Запас до 10" if not via_ai else "поставь запас как раньше"
+            await self.ctl.handle_message(m)
+            await self.tap(m, "Применить")
+            plan = self.latest()["plan"]
+            self.assertEqual(plan["rules"]["max_current_days"], 10)  # the owner's own 10 == default, memory says 6
+            self.assertIn("max_current_days", plan["explicit_keys"])
+            c, _ = cb(self.latest_keys(m))  # a plain recalculation keeps the owner's choice
+            await self.ctl.handle_callback(c)
+            self.assertEqual(self.latest()["plan"]["rules"]["max_current_days"], 10)
+            self.assertEqual([e["applied"] and e["note"] != "" for e in self.latest()["plan"]["experience"]], [True])
+            self.ctl._st.clear()
+
     async def test_apply_without_remembering_stores_nothing(self):
         m = await self.propose(araw([dict(type="exclude_wild", wild="W1")], scope="permanent_rule"))
         await self.tap(m, "Применить к этому плану")

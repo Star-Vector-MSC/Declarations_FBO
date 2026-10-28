@@ -54,7 +54,7 @@ _SCOPE_TEXT = {"this_plan": "только этот план", "once_exception": 
 # Built-in capabilities switched off: the model must be a pure text-in/JSON-out function (no shell, plugins, apps, browser).
 _NO_TOOLS = tuple(x for f in ("shell_tool", "unified_exec", "apps", "plugins", "browser_use", "computer_use")
                   for x in ("--disable", f))
-Proposal = namedtuple("Proposal", "understood scope rules summary questions reason expires_on")
+Proposal = namedtuple("Proposal", "understood scope rules summary questions reason expires_on touched")
 
 
 class AIUnavailable(Exception):
@@ -192,7 +192,7 @@ def _s(v, n=200):
     return isinstance(v, str) and 0 < len(v.strip()) <= n
 
 
-def validate_proposal(raw, rules, cat, locked=None):
+def validate_proposal(raw, rules, cat, locked=None, explicit=()):
     """Raw model JSON -> Proposal (new validated rules, readable diff, clarifying questions). Raises AIRejected.
     `locked` = {"wilds": set, "cabinets": set} of normalized names excluded by remembered rules (not by `rules`)."""
     if (not isinstance(raw, dict)
@@ -227,6 +227,12 @@ def validate_proposal(raw, rules, cat, locked=None):
     except ValueError as e:
         raise AIRejected("Недопустимые настройки: " + str(e)[:200]) from None
     diff = [f"{_LABEL[k]}: {_show(rules[k])} → {_show(new[k])}" for k in new if new[k] != rules[k]]
+    touched = {"capacity" if a["type"] == "set_capacity" else a["key"] for a in raw["actions"]
+               if a["type"] in ("set_number", "set_capacity")}
+    diff += [f"{_LABEL[k]}: {new[k]} (задано вами явно — память это не перекроет)" for k in sorted(touched)
+             if new[k] == rules[k] and k not in set(explicit)]
+    if not diff:
+        touched = set()
     if raw["scope"] == "unclear" and not questions:
         questions.append("На что распространить это указание: только на этот план, как разовое исключение, "
                          "как предпочтение по товару или как постоянное правило?")
@@ -234,7 +240,7 @@ def validate_proposal(raw, rules, cat, locked=None):
         questions.append("Это пример прошлой поставки — я его только запомню, правила он не меняет. "
                          "Если нужно изменить условия, сформулируйте это отдельным указанием.")
     return Proposal(raw["understood"].strip(), raw["scope"], new, diff, questions,
-                    (raw["reason"] or "").strip(), expires)
+                    (raw["reason"] or "").strip(), expires, touched)
 
 
 def _show(v):
@@ -307,13 +313,13 @@ def _apply(t, a, new, cat, questions, locked):
         new["fixed"] = keep + [dict(article=key[0], cabinet=key[1], quantity=q, reason=a["reason"].strip())]
 
 
-def interpret(text, rules, snapshot, plan_lines=(), call=run_codex, locked=None):
+def interpret(text, rules, snapshot, plan_lines=(), call=run_codex, locked=None, explicit=()):
     """Free text -> Proposal. `call(prompt) -> raw dict` is injectable for tests."""
     text = " ".join(str(text).split())
     if not text or len(text) > MAX_TEXT:
         raise AIRejected(f"Указание должно быть от 1 до {MAX_TEXT} символов.")
     cat = catalog(snapshot)
-    return validate_proposal(call(build_prompt(text, rules, cat, list(plan_lines))), rules, cat, locked)
+    return validate_proposal(call(build_prompt(text, rules, cat, list(plan_lines))), rules, cat, locked, explicit)
 
 
 def scope_text(scope):

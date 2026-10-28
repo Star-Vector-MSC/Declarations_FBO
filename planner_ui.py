@@ -77,8 +77,11 @@ def _num(s):
     return int(v) if v == int(v) else v
 
 
-def parse_command(text, rules):
-    """One settings command -> (new validated rules, summary). ValueError carries a user-facing message."""
+def parse_command(text, rules, touched=None, explicit=()):
+    """One settings command -> (new validated rules, summary). ValueError carries a user-facing message.
+    `touched` (a set) receives the numeric/capacity key the owner set explicitly, even to an unchanged value;
+    `explicit` = keys already explicit in this plan."""
+    hit = None
     t = " ".join(text.split())
     if not t:
         raise ValueError(HELP)
@@ -90,12 +93,12 @@ def parse_command(text, rules):
             rest = low[len(prefix):].strip()
             if not re.fullmatch(r"\d{1,4}(?:[.,]\d{1,2})?", rest) or _num(rest) > 1000:
                 raise ValueError("Нужно число от 0 до 1000, например: " + prefix + " 8")
-            new[key] = _num(rest)
+            new[key], hit = _num(rest), key
             break
     else:
         m = re.fullmatch(r"(?i)машина\s+(20|33)", t)
         if m:
-            new["capacity"] = int(m.group(1))
+            new["capacity"], hit = int(m.group(1)), "capacity"
         elif re.fullmatch(r"(?i)исключить wild\s+\S.{0,80}", t):
             new["excluded_wild"] = list(new["excluded_wild"]) + [t[len("исключить wild"):].strip()]
         elif re.fullmatch(r"(?i)исключить кабинет\s+\S.{0,120}", t):
@@ -120,8 +123,12 @@ def parse_command(text, rules):
     except ValueError as e:
         raise ValueError("Недопустимые настройки: " + str(e)[:200]) from None
     diff = [f"{_LABEL[k]}: {rules[k]} → {new[k]}" for k in new if new[k] != rules[k]]
+    if touched is not None and hit and not diff and hit not in set(explicit):  # same value, but now the owner's own choice (beats memory)
+        diff = [f"{_LABEL[hit]}: {new[hit]} (задано вами явно — память это не перекроет)"]
     if not diff:
         raise ValueError("Это уже так настроено, изменений нет.")
+    if touched is not None and hit:
+        touched.add(hit)
     return new, "\n".join(diff)
 
 
@@ -257,7 +264,7 @@ class PlannerController:
     async def _show(self, msg, d):
         await msg.answer(preview_text(d), reply_markup=self._keys(d))
 
-    def _build(self, uid, rules, day, wh, arrival=None, draft=None, alive=None):  # runs in a worker thread
+    def _build(self, uid, rules, day, wh, arrival=None, draft=None, touched=(), alive=None):  # worker thread
         self._mem_ok()
         snap = self.sheets.snapshot()
         if wh is not None and wh not in snap["warehouses"]:
@@ -268,6 +275,7 @@ class PlannerController:
         prev = base_rules(draft) if draft else None
         explicit = set(draft["plan"].get("explicit_keys") or ()) if draft else {"capacity"}  # the wizard asks for it
         explicit |= {k for k in exp.NUMERIC + ("capacity",) if prev is not None and norm[k] != prev[k]}
+        explicit |= set(touched)
         effective, experience = exp.merge(rules, selected, explicit)
         plan = planner.build_plan(snap, effective, day, wh, arrival)
         plan["base_rules"], plan["experience"], plan["explicit_keys"] = norm, experience, sorted(explicit)
@@ -421,14 +429,15 @@ class PlannerController:
             d = await asyncio.to_thread(self.store.get, uid, st["id"])
             if d["version"] != st["ver"] or d.get("exported_version") is not None:
                 raise _Blocked("План изменился; откройте актуальную версию в «Моих планах».")
-            rules, summary = parse_command(text, base_rules(d))
+            touched = set()
+            rules, summary = parse_command(text, base_rules(d), touched, d["plan"].get("explicit_keys") or ())
         except UnknownCommand:
             return await self._t_ai(uid, ct, msg, text, st)
         except (ValueError, _Blocked, DraftError) as e:
             await msg.answer(_err(e) if not isinstance(e, ValueError) else str(e))
             return True
         nonce = secrets.token_hex(3)
-        st.update(proposal=rules, nonce=nonce)
+        st.update(proposal=rules, nonce=nonce, touched=sorted(touched))
         await msg.answer("Предлагаемые изменения (пока не применены):\n" + summary, reply_markup=_kb(
             [[_btn("Применить", "ap", st["id"], st["ver"], nonce), _btn("Отмена", "cn")]]))
         return True
@@ -450,7 +459,8 @@ class PlannerController:
             d = self.store.get(uid, did)
             if d["version"] != ver or d.get("exported_version") is not None:
                 raise _Blocked("План изменился; откройте актуальную версию в «Моих планах».")
-            return self.ai(full, base_rules(d), self.sheets.snapshot(), d["plan"]["lines"], locked=self._locked(d))
+            return self.ai(full, base_rules(d), self.sheets.snapshot(), d["plan"]["lines"], locked=self._locked(d),
+                           explicit=d["plan"].get("explicit_keys") or ())
         ok, p = await self._guarded(uid, ct, msg, work)
         if not ok or self._st.get(uid) is not st:  # failed, or the menu/another action replaced the state meanwhile
             return True
@@ -473,7 +483,7 @@ class PlannerController:
         if not p.summary:
             await msg.answer(head + "\nИзменений в условиях нет.")
             return True
-        st.update(proposal=p.rules, nonce=nonce)
+        st.update(proposal=p.rules, nonce=nonce, touched=sorted(p.touched))
         st.pop("memo", None)
         st.pop("perm_ok", None)
         buttons, extra = [], ""
@@ -538,7 +548,7 @@ class PlannerController:
     async def _c_cn(self, uid, ct, msg):
         st = self._st.get(uid)
         if st:
-            for k in ("proposal", "confirm", "memo", "perm_ok", "example"):
+            for k in ("proposal", "confirm", "memo", "perm_ok", "example", "touched"):
                 st.pop(k, None)
             if st["step"] in ("settings", "pickwh"):
                 self._st.pop(uid)
@@ -621,11 +631,11 @@ class PlannerController:
                     planner._norm(x) for x in base["excluded_cabinets"]}
         return out
 
-    async def _revise(self, uid, ct, msg, d, rules, warehouse=...):
+    async def _revise(self, uid, ct, msg, d, rules, warehouse=..., touched=()):
         p = d["plan"]
         ok, new = await self._guarded(uid, ct, msg, self._build, uid, rules, p["date"],
                                       p["warehouse"] if warehouse is ... else warehouse,
-                                      p.get("arrival_date"), d, live=True)
+                                      p.get("arrival_date"), d, tuple(touched), live=True)
         if ok:
             await msg.answer("Пересчитано: сохранена новая неизменяемая версия (в таблицу ничего не записано).")
             await self._show(msg, new)
@@ -682,8 +692,9 @@ class PlannerController:
             await msg.answer("Предложение устарело или отменено. Ничего не изменено.")
             return
         rules, _ = st.pop("proposal"), st.pop("nonce")
+        touched = st.get("touched") or ()
         self._st.pop(uid, None)
-        await self._revise(uid, ct, msg, await self._draft(uid, did, ver), rules)
+        await self._revise(uid, ct, msg, await self._draft(uid, did, ver), rules, touched=touched)
 
     async def _c_ar(self, uid, ct, msg, did, ver, nonce=""):
         """Apply to this plan AND remember (memory entries are written confirmed: this tap is the owner's confirmation)."""
@@ -700,7 +711,7 @@ class PlannerController:
                              reply_markup=_kb([[_btn("Да, сохранить навсегда", "ar", did, ver, nonce),
                                                 _btn("Отмена", "cn")]]))
             return
-        rules = st.pop("proposal")
+        rules, touched = st.pop("proposal"), st.get("touched") or ()
         for k in ("nonce", "memo", "perm_ok"):
             st.pop(k, None)
         self._st.pop(uid, None)
@@ -737,7 +748,7 @@ class PlannerController:
         if not ok:
             await asyncio.to_thread(withdraw)
             return
-        new = await self._revise(uid, ct, msg, d, rules)
+        new = await self._revise(uid, ct, msg, d, rules, touched=touched)
         if new is None:
             await asyncio.to_thread(withdraw)  # the plan could not be rebuilt: the remembered decision is withdrawn again
             await msg.answer("Запомнить не получилось: план с этим правилом не рассчитан, запись отозвана.")
