@@ -536,14 +536,16 @@ class PlannerController:
         if not whs:
             await msg.answer("В таблице нет складов Wildberries.")
             return
-        self._st[uid] = {"step": "pickwh", "id": did, "ver": ver, "whs": whs[:40]}
+        nonce = secrets.token_hex(3)
+        self._st[uid] = {"step": "pickwh", "id": did, "ver": ver, "whs": whs[:40], "nonce": nonce}
         await msg.answer("Выберите склад для плана (будет сохранена новая версия, в таблицу ничего не записывается):",
-                         reply_markup=_kb([[_btn(w[:40], "sp", i)] for i, w in enumerate(self._st[uid]["whs"])]
+                         reply_markup=_kb([[_btn(w[:40], "sp", nonce, i)] for i, w in enumerate(self._st[uid]["whs"])]
                                           + [[_btn("Отмена", "cn")]]))
 
-    async def _c_sp(self, uid, ct, msg, idx):
-        st = self._st.get(uid)
-        if not st or st["step"] != "pickwh" or not idx.isdigit() or int(idx) >= len(st["whs"]):
+    async def _c_sp(self, uid, ct, msg, nonce="", idx=""):
+        st = self._st.get(uid)  # the buttons belong to ONE selection session (nonce), never to "whatever is open now"
+        if (not st or st["step"] != "pickwh" or st["nonce"] != nonce or not idx.isdigit()
+                or int(idx) >= len(st["whs"])):
             await msg.answer("Кнопка устарела. Откройте план в «Моих планах».")
             return
         self._st.pop(uid)

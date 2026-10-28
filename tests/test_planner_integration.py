@@ -225,7 +225,7 @@ class PreliminaryPlanTests(UiBase):
     async def test_stale_or_foreign_warehouse_buttons_change_nothing(self):
         m, b = await self.prelim()
         did = self.ctl.store.list(OWNER, 1)[0]["id"]
-        for data in ("pl:sp:0", "pl:sp:99", "pl:wn"):
+        for data in ("pl:sp:0", "pl:sp:abc123:0", "pl:wn"):
             c, m2 = cb(data, m)
             await self.ctl.handle_callback(c)
             self.assertIn("устарела", said(m2))
@@ -234,10 +234,30 @@ class PreliminaryPlanTests(UiBase):
         await self.ctl.handle_callback(c)
         c, _ = cb("pl:cn", m3)
         await self.ctl.handle_callback(c)
-        c, m4 = cb("pl:sp:0", m3)
+        c, m4 = cb(next(v for v in buttons(m3).values() if v.startswith("pl:sp:")))
         await self.ctl.handle_callback(c)
         self.assertIn("устарела", said(m4))
         self.assertEqual(self.ctl.store.get(OWNER, did)["version"], 1)
+
+    async def test_buttons_of_an_earlier_selection_cannot_change_another_draft(self):
+        m, b = await self.prelim()
+        ma, _ = await self.prelim()
+        da, db = self.ctl.store.list(OWNER, 2)[1], self.ctl.store.list(OWNER, 2)[0]
+        self.assertNotEqual(da["id"], db["id"])
+        c, m_a = cb(f"pl:sw:{da['id']}:{da['version']}")  # selection session for A ...
+        await self.ctl.handle_callback(c)
+        old = next(v for v in buttons(m_a).values() if v.startswith("pl:sp:"))
+        c, m_b = cb(f"pl:sw:{db['id']}:{db['version']}")  # ... then for B
+        await self.ctl.handle_callback(c)
+        c, m_x = cb(old)  # A's old button
+        await self.ctl.handle_callback(c)
+        self.assertIn("устарела", said(m_x))
+        for d in (da, db):
+            self.assertEqual(self.ctl.store.get(OWNER, d["id"])["version"], 1)
+        c, _ = cb(next(v for v in buttons(m_b).values() if v.startswith("pl:sp:")))
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.store.get(OWNER, db["id"])["version"], 2)
+        self.assertEqual(self.ctl.store.get(OWNER, da["id"])["version"], 1)
 
     async def test_listing_and_lines_work_without_warehouse(self):
         await self.prelim()
