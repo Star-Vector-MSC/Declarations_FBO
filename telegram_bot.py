@@ -23,6 +23,7 @@ from dotenv import dotenv_values
 from wb_declarations import PROJECT, KEY, SHIPMENTS, Sheets, parse_date, normalize
 from completion import save_batch, load_batch, Checklist, BATCHES
 from file_cache import CacheService, cleanup_delivery
+from planner_ui import PlannerController, ENTRY as PLANNER_ENTRY
 
 _cache = None
 
@@ -114,12 +115,19 @@ async def generate_files(selected_date=None, cabinet=None, supply_id=None):
 
 def keyboard():
     return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text='Новый план'), KeyboardButton(text='Мои планы')],
+        [KeyboardButton(text='Декларации')]], resize_keyboard=True)
+
+
+def declarations_keyboard():
+    return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text='Ближайшая отгрузка')],
         [KeyboardButton(text='Обновить базу'), KeyboardButton(text='База файлов')],
         [KeyboardButton(text='Сегодня'), KeyboardButton(text='Завтра')],
         [KeyboardButton(text='Выбрать дату')],
         [KeyboardButton(text='Проверить отметки')],
-        [KeyboardButton(text='Файлы по кабинету'), KeyboardButton(text='По номеру поставки')]], resize_keyboard=True)
+        [KeyboardButton(text='Файлы по кабинету'), KeyboardButton(text='По номеру поставки')],
+        [KeyboardButton(text='Главное меню')]], resize_keyboard=True)
 
 
 def navigation_records():
@@ -205,6 +213,7 @@ def create_dispatcher():
     delivery_slots = asyncio.Semaphore(3)
     checklist_lock = asyncio.Lock()
     navigation = {}
+    planner_ui = PlannerController()  # lazy: no storage, memory or Google access until the first planner action
 
     async def show_navigation(message, mode, records, stage, cabinet=None, selected=None, page=0):
         filtered = [r for r in records if (mode == 'status' or not r.get('navigation_only'))
@@ -225,7 +234,7 @@ def create_dispatcher():
         if not items:
             navigation.pop(message.from_user.id, None)
             await message.answer('Подходящих одобренных отгрузок нет. Выберите другой способ.',
-                                 reply_markup=keyboard())
+                                 reply_markup=declarations_keyboard())
             return
         page = max(0, min(page, (len(items)-1)//20))
         buttons = []
@@ -255,7 +264,7 @@ def create_dispatcher():
         cabinet, selected = state['cabinet'], state['selected']
         if kind == 'manual':
             navigation.pop(message.from_user.id, None)
-            await message.answer('Напишите только номер поставки, без команды.', reply_markup=keyboard())
+            await message.answer('Напишите только номер поставки, без команды.', reply_markup=declarations_keyboard())
         elif kind == 'page':
             await show_navigation(message, mode, records, state['stage'], cabinet, selected, value)
         elif kind == 'back':
@@ -276,11 +285,11 @@ def create_dispatcher():
                         await message.answer('Не удалось проверить отметки. Повторите позже.')
                 else:
                     await deliver(message, value, cabinet=cabinet)
-                await message.answer('Выберите следующее действие.', reply_markup=keyboard())
+                await message.answer('Выберите следующее действие.', reply_markup=declarations_keyboard())
         elif kind == 'supply':
             navigation.pop(message.from_user.id, None)
             await deliver(message, selected, cabinet=cabinet, supply_id=value)
-            await message.answer('Выберите следующее действие.', reply_markup=keyboard())
+            await message.answer('Выберите следующее действие.', reply_markup=declarations_keyboard())
 
     async def authorized(message):
         if not message.from_user or not is_owner(message.from_user.id, message.chat.type):
@@ -300,6 +309,7 @@ def create_dispatcher():
         if not await authorized(message):
             return
         await message.answer(
+            'Главное меню: «Новый план» (тестовое планирование отгрузок ФБО), «Мои планы» и «Декларации».\n\n'
             'Пришлите просто номер поставки — например, 12345678. Выдам готовый Excel из локальной базы.\n'
             'База обновляется каждые 6 часов. «Обновить базу» запускает обновление вручную.\n'
             'После галочек файл удаляется из базы.\n\n'
@@ -513,11 +523,23 @@ def create_dispatcher():
             await callback.message.answer('Операция не завершена. Нажмите «Проверить отметки» '
                                           'перед повторным подтверждением.')
 
+    @dispatcher.callback_query(F.data.startswith('pl:'))
+    async def planner_callback(callback: CallbackQuery):
+        await planner_ui.handle_callback(callback)
+
     @dispatcher.message(F.text)
     async def text_message(message: Message):
         if not await authorized(message):
             return
         text = (message.text or '').strip()
+        if text in PLANNER_ENTRY:
+            navigation.pop(message.from_user.id, None)
+        if await planner_ui.handle_message(message):
+            return
+        if text == 'Декларации':
+            navigation.pop(message.from_user.id, None)
+            await message.answer('Выберите действие с декларациями.', reply_markup=declarations_keyboard())
+            return
         today = datetime.now(ZoneInfo('Europe/Moscow')).date()
         if text in ('Обновить базу', 'База файлов'):
             if text == 'Обновить базу':
@@ -537,7 +559,7 @@ def create_dispatcher():
                 f'Последнее обновление: {updated}\nАвтообновление: каждые 6 часов.\n'
                 'Очистка по галочкам: каждые 5 минут и после «Готово».\n'
                 + ('Последнее обновление не удалось; выдаются сохранённые файлы.' if info.get('last_error') else ''),
-                reply_markup=keyboard())
+                reply_markup=declarations_keyboard())
             return
         if text == 'Главное меню':
             navigation.pop(message.from_user.id, None)
@@ -558,7 +580,7 @@ def create_dispatcher():
             except Exception:
                 await message.answer('Не удалось прочитать локальную базу. Нажмите «Обновить базу».')
         elif text == 'Назад':
-            await message.answer('Выберите способ получения файлов.', reply_markup=keyboard())
+            await message.answer('Выберите способ получения файлов.', reply_markup=declarations_keyboard())
         elif text.startswith('Кабинет: '):
             await deliver(message, cabinet=text.removeprefix('Кабинет: ').strip())
         elif re.fullmatch(r'\d{1,20}', text):
