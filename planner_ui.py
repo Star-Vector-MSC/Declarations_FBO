@@ -229,19 +229,23 @@ class PlannerController:
     async def _show(self, msg, d):
         await msg.answer(preview_text(d), reply_markup=self._keys(d))
 
-    def _build(self, uid, rules, day, wh, arrival=None, draft=None):  # runs in a worker thread
+    def _build(self, uid, rules, day, wh, arrival=None, draft=None, alive=None):  # runs in a worker thread
         self._mem_ok()
         snap = self.sheets.snapshot()
         if wh not in snap["warehouses"]:
             raise _Blocked("Такого склада сейчас нет в таблице. Начните новый план.")
         plan = planner.build_plan(snap, rules, day, wh, arrival)
+        if alive is not None and not alive():  # owner/menu re-check after the slow read, before anything is stored
+            raise _Blocked("Действие отменено.")
         return self.store.revise(uid, draft["id"], draft["version"], plan) if draft else self.store.create(uid, plan)
 
-    async def _guarded(self, uid, chat_type, msg, work, *args):
-        """Owner re-check around a long operation + menu race guard. Returns (ok, result)."""
+    async def _guarded(self, uid, chat_type, msg, work, *args, live=False):
+        """Owner re-check around a long operation + menu race guard. Returns (ok, result).
+        live=True passes work an `alive()` check to run right before it stores anything."""
         g = self._gen.get(uid, 0)
+        kw = {"alive": lambda: self._owner(uid, chat_type) and self._gen.get(uid, 0) == g} if live else {}
         try:
-            res = await asyncio.to_thread(work, *args)
+            res = await asyncio.to_thread(lambda: work(*args, **kw))
         except Exception as e:
             if self._owner(uid, chat_type):
                 await msg.answer(_err(e))
@@ -347,7 +351,7 @@ class PlannerController:
         return True
 
     async def _t_cap(self, uid, ct, msg, text, st):
-        m = re.fullmatch(r"(?i)(20|33)(?: паллет)?", text)
+        m = re.fullmatch(r"(?i)(20|33) паллет", text)  # bare numbers belong to the supply-number handler
         return await self._make(uid, ct, msg, int(m.group(1))) if m else False
 
     async def _make(self, uid, ct, msg, cap):
@@ -355,7 +359,8 @@ class PlannerController:
         if not st or st.get("step") != "cap":
             await msg.answer("Начните заново: «Новый план».")
             return True
-        ok, d = await self._guarded(uid, ct, msg, self._build, uid, {"capacity": cap}, st["date"], st["wh"])
+        ok, d = await self._guarded(uid, ct, msg, self._build, uid, {"capacity": cap}, st["date"], st["wh"],
+                                    live=True)
         if ok:
             self._st.pop(uid, None)
             await msg.answer("План рассчитан и сохранён как черновик (в таблицу ничего не записано).",
@@ -478,7 +483,7 @@ class PlannerController:
     async def _revise(self, uid, ct, msg, d, rules):
         p = d["plan"]
         ok, new = await self._guarded(uid, ct, msg, self._build, uid, rules, p["date"], p["warehouse"],
-                                      p.get("arrival_date"), d)
+                                      p.get("arrival_date"), d, live=True)
         if ok:
             await msg.answer("Пересчитано: сохранена новая неизменяемая версия (в таблицу ничего не записано).")
             await self._show(msg, new)
@@ -515,6 +520,7 @@ class PlannerController:
                          reply_markup=_kb([[_btn("Подтвердить запись", "ok", did, ver), _btn("Отмена", "cn")]]))
 
     async def _c_ok(self, uid, ct, msg, did, ver):
+        g = self._gen.get(uid, 0)  # taken before any await: a menu exit during the awaits below must cancel the write
         d = await asyncio.to_thread(self.store.get, uid, did, ver)
         if d.get("exported_version") == ver:  # double click / repeat: never write twice
             await msg.answer("Уже записано в тестовый лист: " + d["export_url"])
@@ -524,7 +530,6 @@ class PlannerController:
             return
         self._st.pop(uid, None)
         await msg.answer("Перепроверяю источники и записываю в тестовый лист…")
-        g = self._gen.get(uid, 0)
 
         def work():
             self._mem_ok()

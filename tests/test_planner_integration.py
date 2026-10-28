@@ -118,8 +118,9 @@ class WizardTests(UiBase):
         await self.ctl.handle_message(m)
         c, _ = cb(buttons(m)["Казань"], m)
         await self.ctl.handle_callback(c)
-        m.text = "12345678"
-        self.assertFalse(await self.ctl.handle_message(m))
+        for bare in ("12345678", "20", "33"):  # bare numbers stay with the supply-number handler
+            m.text = bare
+            self.assertFalse(await self.ctl.handle_message(m), bare)
         m.text = "20 паллет"
         self.assertTrue(await self.ctl.handle_message(m))
         self.assertIn("20 паллет", said(m))
@@ -228,6 +229,40 @@ class EditPublishTests(UiBase):
         c, m3 = cb(b["Пересчитать"], m)
         await self.ctl.handle_callback(c)
         self.assertIn("устарела", said(m3))
+
+    async def test_menu_exit_during_start_message_cancels_write(self):
+        m, b = await self.plan()
+        c, _ = cb(b["Записать в тестовый лист"], m)
+        await self.ctl.handle_callback(c)
+
+        async def leave(*a, **k):
+            if a and "Перепроверяю" in str(a[0]):
+                self.ctl.reset(OWNER)  # «Главное меню» pressed while the message is being sent
+        c, m2 = cb(buttons(m)["Подтвердить запись"], m)
+        m2.answer = AsyncMock(side_effect=leave)
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.sheets.published, [])
+
+    async def test_cancel_or_revoke_during_snapshot_stores_nothing(self):
+        m, b = await self.plan()
+        did = b["Состав"].split(":")[2]
+        before = self.ctl.store.get(OWNER, did)["latest_version"]
+        for act in (lambda: self.ctl.reset(OWNER), lambda: setattr(self, "owner_ok", False)):
+            self.sheets.hook = act
+            c, _ = cb(b["Пересчитать"], m)
+            await self.ctl.handle_callback(c)
+            self.owner_ok, self.sheets.hook = True, None
+            self.assertEqual(self.ctl.store.get(OWNER, did)["latest_version"], before)
+        m2 = msg("Новый план")
+        await self.ctl.handle_message(m2)
+        m2.text = "Завтра"
+        await self.ctl.handle_message(m2)
+        c, _ = cb(buttons(m2)["Коледино"], m2)
+        await self.ctl.handle_callback(c)
+        self.sheets.hook = lambda: self.ctl.reset(OWNER)
+        c, _ = cb(buttons(m2)["33 паллет"], m2)
+        await self.ctl.handle_callback(c)
+        self.assertEqual(len(self.ctl.store.list(OWNER, 10)), 1)
 
     async def test_changed_source_and_revoked_owner_block_write(self):
         m, b = await self.plan()
