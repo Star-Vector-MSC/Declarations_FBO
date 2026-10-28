@@ -136,7 +136,10 @@ class ExperienceFlowTests(UiBase):
         self.calls, self.answers = [], []
 
     def ai(self, text, rules, snapshot, lines=(), **kw):
-        return planner_ai.interpret(text, rules, snapshot, lines, call=lambda p: self.answers.pop(0), **kw)
+        def call(prompt):
+            self.calls.append(prompt)
+            return self.answers.pop(0)
+        return planner_ai.interpret(text, rules, snapshot, lines, call=call, **kw)
 
     async def propose(self, answer, text="запомни"):
         self.answers = [answer]
@@ -269,6 +272,39 @@ class ExperienceFlowTests(UiBase):
         self.assertEqual(sorted(e["target"] for e in es), ["W1", "W2"])
         want = (datetime.now(planner_ui.MSK).date() + timedelta(days=30)).isoformat()
         self.assertTrue(all(e["scope"] == "product" and e["expires_on"] == want for e in es))
+
+    async def test_excluding_product_preference_stays_revocable_from_next_plan_memory_view(self):
+        m = await self.propose(araw([dict(type="exclude_wild", wild="W1")], scope="product_preference"))
+        await self.tap(m, "Запомнить на 30 дн.")
+        m2, b = await self.plan()
+        self.assertNotIn("W1", [ln["wild"] for ln in self.latest()["plan"]["lines"]])
+        c, mm = cb(b["Память"])
+        await self.ctl.handle_callback(c)
+        c, _ = cb(next(v for v in buttons(mm).values() if v.startswith("pl:rv:")))
+        await self.ctl.handle_callback(c)
+        self.assertEqual([e["status"] for e in self.ctl.memory.entries()], ["revoked"])
+
+    async def test_permanent_rule_first_button_cannot_double_tap_into_saving(self):
+        m = await self.propose(araw([dict(type="exclude_wild", wild="W1")], scope="permanent_rule"))
+        first = buttons(m)["Применить и запомнить"]
+        m2 = await self.tap(m, "Применить и запомнить")
+        self.assertNotEqual(first, buttons(m2)["Да, сохранить навсегда"])
+        c, _ = cb(first, m2)  # impatient second tap on the SAME first button
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.memory.entries(), [])
+        await self.tap(m2, "Да, сохранить навсегда")
+        self.assertEqual(self.ids(), [("global", "confirmed")])
+
+    async def test_typed_date_continues_the_open_product_preference(self):
+        m = await self.propose(araw([dict(type="exclude_wild", wild="W1")], scope="product_preference"),
+                               "не бери W1 пока")
+        self.answers = [araw([dict(type="exclude_wild", wild="W1")], scope="product_preference", expires_on="2026-12-01")]
+        m.text = "до 01.12.2026"
+        await self.ctl.handle_message(m)
+        self.assertIn("не бери W1 пока", self.calls[-1])  # the original request travels with the date
+        self.assertIn("до 01.12.2026", self.calls[-1])
+        await self.tap(m, "Применить и запомнить")
+        self.assertEqual(self.ctl.memory.entries()[0]["expires_on"], "2026-12-01")
 
     async def test_product_preference_without_a_term_is_refused(self):
         m = await self.propose(araw([dict(type="exclude_wild", wild="W1")], scope="product_preference"))

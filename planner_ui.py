@@ -505,6 +505,7 @@ class PlannerController:
                               f"{exp.PREFERENCE_DAYS} дней (до {today + timedelta(days=exp.PREFERENCE_DAYS)}); "
                               "выберите срок кнопкой или напишите нужную дату.")
                     buttons += [_btn(f"Запомнить на {n} дн.", "ar", did, ver, nonce, str(n)) for n in exp.TERM_CHOICES]
+                    st["ai_prev"] = (orig, log, ["Срок не назван: напишите дату окончания или выберите кнопкой."])
                 else:
                     buttons.append(_btn("Применить и запомнить", "ar", did, ver, nonce))
             else:
@@ -599,7 +600,9 @@ class PlannerController:
 
         def work():
             seen = {r["id"]: r for r in self.memory.applicable(plan_id=d["id"], on_date=p["date"])}
-            for key in sorted({ln[k] for ln in p["lines"] for k in ("wild", "article", "product") if ln.get(k)}):
+            keys = {ln[k] for ln in p["lines"] for k in ("wild", "article", "product") if ln.get(k)}
+            keys |= {e["target"] for e in p.get("experience") or () if e.get("scope") == "product"}  # excluded wilds
+            for key in sorted(keys):
                 seen.update({r["id"]: r for r in self.memory.applicable(product=key, plan_id=d["id"], on_date=p["date"])})
             return list(seen.values())
         ok, recs = await self._guarded(uid, ct, msg, lambda: (self._mem_ok(), work())[1])
@@ -719,7 +722,8 @@ class PlannerController:
             memo = dict(memo, expires_on=(datetime.now(MSK).date() + timedelta(days=int(days))).isoformat())
             st["memo"] = memo
         if memo["category"] == "permanent_rule" and not st.get("perm_ok"):
-            st["perm_ok"] = True  # a permanent rule needs a second, explicit tap
+            st["perm_ok"] = True  # a permanent rule needs a second, explicit tap on a DIFFERENT button:
+            st["nonce"] = nonce = secrets.token_hex(3)  # the first button's data is now stale (no double-tap save)
             await msg.answer("Постоянное правило будет действовать во ВСЕХ будущих планах, пока вы не отзовёте его в "
                              "разделе «Память»: " + exp._summary(memo["effect"]) + ". Сохранить навсегда?",
                              reply_markup=_kb([[_btn("Да, сохранить навсегда", "ar", did, ver, nonce),
