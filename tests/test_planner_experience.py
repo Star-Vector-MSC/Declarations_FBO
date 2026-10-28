@@ -1,11 +1,12 @@
 import os
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import planner
 import planner_ai
 import planner_experience as exp
+import planner_ui
 from planner_memory import MemoryStore
 from test_planner_integration import OWNER, SNAP, UiBase, araw, buttons, cb, msg, said
 
@@ -65,7 +66,7 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(self.sel(on_date="2026-10-31"), [])
 
     def test_scopes(self):
-        self.add("product_preference", {"excluded_wild": ["W1", "W2"]})
+        self.add("product_preference", {"excluded_wild": ["W1", "W2"]}, expires="2026-12-27")
         self.add("once_exception", {"excluded_cabinets": ["Каб"]})
         got = self.sel(wilds={"W1"}, plan_id=None)
         self.assertEqual([d["effect"] for _, d in got], [{"excluded_wild": ["W1"]}])
@@ -118,11 +119,11 @@ class UnitTests(unittest.TestCase):
         self.assertIn("не применено", notes[0]["note"])
         self.assertIn("не применено", "\n".join(exp.experience_lines(notes)))
 
-    def test_product_preference_has_default_expiry_and_one_entry_per_wild(self):
+    def test_product_preference_has_owner_given_expiry_and_one_entry_per_wild(self):
         es = exp.memory_entries("product_preference", {"excluded_wild": ["W1", "W2"]}, reason="", plan_id="a" * 12,
-                                plan_date="2026-10-30", today=date(2026, 10, 28))
+                                plan_date="2026-10-30", today=date(2026, 10, 28), expires_on="2026-12-27")
         self.assertEqual([(e["scope"], e["target"], e["expires_on"]) for e in es],
-                         [("product", w, (date(2026, 10, 28) + timedelta(days=60)).isoformat()) for w in ("W1", "W2")])
+                         [("product", w, "2026-12-27") for w in ("W1", "W2")])
         self.assertTrue(all(e["kind"] == "rule" for e in es))
         perm = exp.memory_entries("permanent_rule", {"excluded_wild": ["W1"]}, reason="", plan_id="a" * 12,
                                   plan_date="2026-10-30", today=date(2026, 10, 28))
@@ -254,14 +255,36 @@ class ExperienceFlowTests(UiBase):
         self.assertIn("W2", [ln["wild"] for ln in self.latest()["plan"]["lines"]])
         self.assertEqual(self.latest()["plan"]["experience"], [])
 
-    async def test_product_preference_expires_by_default_and_is_per_product(self):
+    async def test_product_preference_term_is_a_visible_proposal_chosen_by_owner(self):
         m = await self.propose(araw([dict(type="exclude_wild", wild="W1"), dict(type="exclude_wild", wild="W2")],
                                     scope="product_preference"))
+        self.assertIn("Срок вы не называли", said(m))
         self.assertIn("60 дней", said(m))
-        await self.tap(m, "Применить и запомнить")
+        self.assertNotIn("Применить и запомнить", buttons(m))
+        self.assertEqual([b for b in buttons(m) if b.startswith("Запомнить на")],
+                         [f"Запомнить на {n} дн." for n in exp.TERM_CHOICES])
+        self.assertEqual(self.ctl.memory.entries(), [])  # nothing stored until a term is chosen
+        await self.tap(m, "Запомнить на 30 дн.")
         es = self.ctl.memory.entries()
         self.assertEqual(sorted(e["target"] for e in es), ["W1", "W2"])
-        self.assertTrue(all(e["scope"] == "product" and e["expires_on"] for e in es))
+        want = (datetime.now(planner_ui.MSK).date() + timedelta(days=30)).isoformat()
+        self.assertTrue(all(e["scope"] == "product" and e["expires_on"] == want for e in es))
+
+    async def test_product_preference_without_a_term_is_refused(self):
+        m = await self.propose(araw([dict(type="exclude_wild", wild="W1")], scope="product_preference"))
+        c, _ = cb(buttons(m)["Запомнить на 30 дн."].rsplit(":", 1)[0])  # a forged tap without a term
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.memory.entries(), [])
+        with self.assertRaises(ValueError):
+            exp.memory_entries("product_preference", {"excluded_wild": ["W1"]}, reason="", plan_id="a" * 12,
+                               plan_date="2026-10-30", today=date(2026, 10, 28))
+
+    async def test_product_preference_with_owner_named_date_is_stored_as_named(self):
+        m = await self.propose(araw([dict(type="exclude_wild", wild="W1")], scope="product_preference",
+                                    expires_on="2026-12-01"))
+        self.assertNotIn("Срок вы не называли", said(m))
+        await self.tap(m, "Применить и запомнить")
+        self.assertEqual(self.ctl.memory.entries()[0]["expires_on"], "2026-12-01")
 
     async def test_memory_that_cannot_be_remembered_is_explained(self):
         fx = dict(type="add_fixed", article="A1", cabinet="Каб", quantity=6, reason="акция")

@@ -493,12 +493,20 @@ class PlannerController:
             if ok_mem:
                 st["memo"] = dict(category=p.scope, effect=effect, reason=p.reason, expires_on=p.expires_on)
                 label = exp.CATEGORIES[p.scope][1]
+                pick = p.scope == "product_preference" and not p.expires_on
                 extra = ("\nМожно применить только к этому плану или запомнить как " + label
                          + {"once_exception": " (действует для этого плана)",
-                            "product_preference": f" (на {exp.PREFERENCE_DAYS} дней, если срок не назван)",
+                            "product_preference": "",
                             "permanent_rule": " (для всех будущих планов, пока вы не отзовёте)"}[p.scope]
                          + (f"; срок до {p.expires_on}" if p.expires_on else "") + ".")
-                buttons.append(_btn("Применить и запомнить", "ar", did, ver, nonce))
+                if pick:  # the owner never named a term: it is only a proposal, chosen explicitly by button
+                    today = datetime.now(MSK).date()
+                    extra += ("\nСрок вы не называли. Моё предложение — "
+                              f"{exp.PREFERENCE_DAYS} дней (до {today + timedelta(days=exp.PREFERENCE_DAYS)}); "
+                              "выберите срок кнопкой или напишите нужную дату.")
+                    buttons += [_btn(f"Запомнить на {n} дн.", "ar", did, ver, nonce, str(n)) for n in exp.TERM_CHOICES]
+                else:
+                    buttons.append(_btn("Применить и запомнить", "ar", did, ver, nonce))
             else:
                 extra = f"\nВ память это записать нельзя: {why}. Можно применить только к этому плану."
         await msg.answer(head + "\nПредлагаемые изменения (пока не применены; количества, остатки, короба и вместимость "
@@ -696,7 +704,7 @@ class PlannerController:
         self._st.pop(uid, None)
         await self._revise(uid, ct, msg, await self._draft(uid, did, ver), rules, touched=touched)
 
-    async def _c_ar(self, uid, ct, msg, did, ver, nonce=""):
+    async def _c_ar(self, uid, ct, msg, did, ver, nonce="", days=""):
         """Apply to this plan AND remember (memory entries are written confirmed: this tap is the owner's confirmation)."""
         st = self._st.get(uid)
         if (not st or st.get("nonce") != nonce or (st["id"], st["ver"]) != (did, ver) or "proposal" not in st
@@ -704,6 +712,12 @@ class PlannerController:
             await msg.answer("Предложение устарело или отменено. Ничего не изменено.")
             return
         memo = st["memo"]
+        if memo["category"] == "product_preference" and not memo["expires_on"]:
+            if days not in map(str, exp.TERM_CHOICES):
+                await msg.answer("Выберите срок кнопкой или напишите дату окончания — без срока не сохраняю.")
+                return
+            memo = dict(memo, expires_on=(datetime.now(MSK).date() + timedelta(days=int(days))).isoformat())
+            st["memo"] = memo
         if memo["category"] == "permanent_rule" and not st.get("perm_ok"):
             st["perm_ok"] = True  # a permanent rule needs a second, explicit tap
             await msg.answer("Постоянное правило будет действовать во ВСЕХ будущих планах, пока вы не отзовёте его в "

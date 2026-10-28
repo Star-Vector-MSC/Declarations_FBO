@@ -17,7 +17,8 @@ CATEGORIES = {  # category -> (memory scope, label)
     "product_preference": ("product", "предпочтение по товару"),
     "permanent_rule": ("global", "постоянное правило"),
 }
-PREFERENCE_DAYS = 60
+PREFERENCE_DAYS = 60  # only a proposal shown to the owner, never stored unseen
+TERM_CHOICES = (30, 60, 90)
 _LINE = re.compile(r"\n" + re.escape(PREFIX) + r"(\{.*\})\s*$", re.S)
 _NUM = NUMERIC = ("min_sales", "max_current_days", "min_wild_days", "target_days", "max_days")
 _EFFECT_KEYS = {"excluded_wild", "excluded_cabinets", "set", "fixed"}
@@ -81,7 +82,9 @@ def memory_entries(category, effect, *, reason, plan_id, plan_date, today, expir
     if category == "once_exception":
         return [dict(base, scope="plan", target=plan_id, expires_on=plan_date, text=_text(category, effect))]
     if category == "product_preference":
-        exp = expires_on or (today + timedelta(days=PREFERENCE_DAYS)).isoformat()
+        exp = expires_on
+        if not exp:
+            raise ValueError("Для предпочтения по товару нужен срок, выбранный владельцем.")
         return [dict(base, scope="product", target=w, expires_on=exp,
                      text=_text(category, {"excluded_wild": [w]})) for w in effect["excluded_wild"]]
     return [dict(base, scope="global", target="", expires_on=expires_on, text=_text(category, effect))]
