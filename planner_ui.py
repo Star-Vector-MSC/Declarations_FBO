@@ -468,10 +468,10 @@ class PlannerController:
         if not ok:
             return
         out = ["Память помощника для этого плана (подтверждённые, не истёкшие):"]
-        for r in recs[:20]:
+        for r in recs[:15]:
             tag = "пример (не политика)" if r["kind"] == "case" else "правило"
             out.append(f"• {tag}, {r['scope']}{' ' + r['target'] if r['target'] else ''}"
-                       f"{', до ' + r['expires_on'] if r['expires_on'] else ''}: {r['text'][:200]}")
+                       f"{', до ' + r['expires_on'] if r['expires_on'] else ''}: {r['text'][:150]}")
         if not recs:
             out.append("Подходящих записей нет.")
         out.append("Текст памяти сам расчёт не меняет: действуют жёсткие правила расчёта и ваши настройки.")
