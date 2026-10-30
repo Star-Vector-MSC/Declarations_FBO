@@ -64,6 +64,9 @@ def _cb(*parts):
     return data
 
 
+MEM_PAGE = 8  # memory records per screen: message and keyboard stay far below Telegram limits
+
+
 def _btn(text, *parts):
     return InlineKeyboardButton(text=text, callback_data=_cb("pl", *parts))
 
@@ -594,7 +597,7 @@ class PlannerController:
                                                                            if page + 1 < n else [])
         await msg.answer(text, reply_markup=_kb([nav]) if nav else None)
 
-    async def _c_mem(self, uid, ct, msg, did, ver):
+    async def _c_mem(self, uid, ct, msg, did, ver, page="0"):
         d = await self._draft(uid, did, ver, latest=False)
         p = d["plan"]
 
@@ -611,17 +614,24 @@ class PlannerController:
         out = ["Опыт, учтённый в этой версии плана:"] + (exp.experience_lines(p.get("experience"), limit=15)[1:]
                                                          or ["• ничего не применялось"])
         out.append("\nПамять помощника для этого плана (подтверждённые, не истёкшие):")
+        recs.sort(key=lambda r: r["id"])
+        n = max(1, -(-len(recs) // MEM_PAGE))
+        page = min(int(page) if str(page).isdigit() else 0, n - 1)
         revoke = []
-        for r in recs[:15]:
+        for r in recs[page * MEM_PAGE:(page + 1) * MEM_PAGE]:
             live = exp.decode(r)
             tag = ("пример (не правило, расчёт не меняет)" if r["kind"] == "case"
                    else "действует в расчёте" if live else "справочное правило (расчёт не меняет)")
             out.append(f"• {tag}, {r['scope']}{' ' + r['target'] if r['target'] else ''}"
                        f"{', до ' + r['expires_on'] if r['expires_on'] else ''}: {r['text'].split(chr(10))[0][:150]}")
-            if live and len(revoke) < 5:
+            if live:
                 revoke.append([_btn("Отозвать: " + exp._summary(live["effect"])[:36], "rv", r["id"])])
         if not recs:
             out.append("Подходящих записей нет.")
+        elif n > 1:
+            out.append(f"Страница {page + 1} из {n}.")
+            revoke.append(([_btn("◀", "mem", did, ver, page - 1)] if page else [])
+                          + ([_btn("▶", "mem", did, ver, page + 1)] if page + 1 < n else []))
         out.append("Правило с пометкой «действует в расчёте» меняет следующие расчёты; ваши настройки конкретного плана "
                    "важнее запомненных числовых значений.")
         await msg.answer("\n".join(out), reply_markup=_kb(revoke) if revoke else None)

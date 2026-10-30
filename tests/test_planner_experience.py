@@ -284,6 +284,42 @@ class ExperienceFlowTests(UiBase):
         await self.ctl.handle_callback(c)
         self.assertEqual([e["status"] for e in self.ctl.memory.entries()], ["revoked"])
 
+    async def test_once_exception_keeps_the_term_the_owner_saw_and_chose(self):
+        kw = dict(reason="", plan_id="a" * 12, plan_date="2026-11-02", today=date(2026, 10, 28))
+        e = exp.memory_entries("once_exception", {"excluded_wild": ["W1"]}, expires_on="2026-10-31", **kw)[0]
+        self.assertEqual(e["expires_on"], "2026-10-31")  # not replaced by the plan date
+        e = exp.memory_entries("once_exception", {"excluded_wild": ["W1"]}, **kw)[0]
+        self.assertEqual(e["expires_on"], "2026-11-02")  # no named term: valid for the plan's own date
+        m = await self.propose(araw([dict(type="exclude_wild", wild="W1")], scope="once_exception",
+                                    expires_on="2026-12-01"))
+        self.assertIn("до 2026-12-01", said(m))
+        await self.tap(m, "Применить и запомнить")
+        self.assertEqual(self.ctl.memory.entries()[0]["expires_on"], "2026-12-01")
+
+    async def test_every_memory_record_is_listed_and_revocable_across_pages(self):
+        m, b = await self.plan()
+        for i in range(20):  # more than one screen, more than the old 5 buttons / 15 lines
+            self.ctl.memory.confirm(self.ctl.memory.propose(**exp.memory_entries(
+                "permanent_rule", {"excluded_wild": [f"W9{i:02d}"]}, reason="", plan_id="a" * 12,
+                plan_date="2026-10-30", today=date(2026, 10, 28))[0]))
+        c, mm = cb(b["Память"])
+        await self.ctl.handle_callback(c)
+        revoke_ids, shown = [], ""
+        for _ in range(10):
+            shown += said(mm)
+            revoke_ids += [v for v in buttons(mm).values() if v.startswith("pl:rv:")]
+            nxt = buttons(mm).get("▶")
+            if not nxt:
+                break
+            c, mm = cb(nxt)
+            await self.ctl.handle_callback(c)
+        self.assertEqual(len(set(revoke_ids)), 20)
+        for i in range(20):
+            self.assertIn(f"W9{i:02d}", shown)
+        c, _ = cb(revoke_ids[-1])  # the very last record can be revoked on its own
+        await self.ctl.handle_callback(c)
+        self.assertEqual(sorted(r["status"] for r in self.ctl.memory.entries()).count("revoked"), 1)
+
     async def test_permanent_rule_first_button_cannot_double_tap_into_saving(self):
         m = await self.propose(araw([dict(type="exclude_wild", wild="W1")], scope="permanent_rule"))
         first = buttons(m)["Применить и запомнить"]

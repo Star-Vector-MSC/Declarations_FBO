@@ -80,7 +80,7 @@ def memory_entries(category, effect, *, reason, plan_id, plan_date, today, expir
     scope = CATEGORIES[category][0]
     base = dict(reason=(reason or "").strip()[:1000], kind="rule")
     if category == "once_exception":
-        return [dict(base, scope="plan", target=plan_id, expires_on=plan_date, text=_text(category, effect))]
+        return [dict(base, scope="plan", target=plan_id, expires_on=expires_on or plan_date, text=_text(category, effect))]
     if category == "product_preference":
         exp = expires_on
         if not exp:
