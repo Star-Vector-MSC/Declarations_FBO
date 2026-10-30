@@ -197,20 +197,14 @@ def check_in_context(new, context, touched=(), explicit=()):
     rules the plan will really run with: `new` over the remembered numbers the owner did not set (`context` = the
     effective rules of the plan). The limit itself is never switched off. Raises ValueError."""
     norm = planner.validate_rules(new, cross=False)
-    try:
+    if context is None:
         return planner.validate_rules(norm)
-    except ValueError as alone:
-        if context is None:
-            raise
-        keep, defaults, over = set(touched) | set(explicit), planner.default_rules(), dict(norm)
-        for k in (*_NUMBERS, "capacity"):
-            if k not in keep and norm[k] == defaults[k]:
-                over[k] = context[k]
-        try:
-            planner.validate_rules(over)
-        except ValueError:
-            raise alone from None
-        return norm
+    keep, defaults, over = set(touched) | set(explicit), planner.default_rules(), dict(norm)
+    for k in (*_NUMBERS, "capacity"):
+        if k not in keep and norm[k] == defaults[k]:
+            over[k] = context[k]  # a remembered number the owner did not set: the plan will run with it
+    planner.validate_rules(over)  # judged on the rules the plan will run with, in both directions
+    return norm
 
 
 def validate_proposal(raw, rules, cat, locked=None, explicit=(), context=None):

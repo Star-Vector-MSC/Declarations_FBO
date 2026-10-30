@@ -611,17 +611,27 @@ class PlannerController:
         p = d["plan"]
 
         def work():
-            seen = {r["id"]: r for r in self.memory.applicable(plan_id=d["id"], on_date=p["date"])}
+            seen = {}
+            for day in (p["date"], None):  # alive on the plan's date or alive today: viewing/revoking never hinges on the date
+                seen.update({r["id"]: r for r in self.memory.applicable(plan_id=d["id"], on_date=day)})
             keys = {ln[k] for ln in p["lines"] for k in ("wild", "article", "product") if ln.get(k)}
             keys |= {e["target"] for e in p.get("experience") or () if e.get("scope") == "product"}  # excluded wilds
             keys |= {r["target"] for r in self.memory.entries()  # any active product record stays revocable here
                      if r["status"] == "confirmed" and r["scope"] == "product"}
             for key in sorted(keys):
-                seen.update({r["id"]: r for r in self.memory.applicable(product=key, plan_id=d["id"], on_date=p["date"])})
-            return list(seen.values())
-        ok, recs = await self._guarded(uid, ct, msg, lambda: (self._mem_ok(), work())[1])
+                for day in (p["date"], None):
+                    seen.update({r["id"]: r for r in self.memory.applicable(product=key, plan_id=d["id"], on_date=day)})
+            try:  # what a recalculation would do with the records (for those the saved snapshot knows nothing about)
+                chosen = exp.select(self.memory.entries(), plan_id=d["id"], on_date=p["date"],
+                                    wilds={r["target"] for r in seen.values() if r["scope"] == "product"})
+                notes = exp.merge(base_rules(d), chosen, p.get("explicit_keys") or ())[1]
+            except ValueError:
+                notes = []
+            return list(seen.values()), {x["id"]: x for x in notes}
+        ok, got = await self._guarded(uid, ct, msg, lambda: (self._mem_ok(), work())[1])
         if not ok:
             return
+        recs, sim = got
         info = exp.experience_lines(p.get("experience"), limit=5)[1:]  # bounded: pages stay under 4096
         applied = {e["id"]: e for e in p.get("experience") or ()}
         out = ["Опыт, учтённый в этой версии плана:"] + (info or ["• ничего не применялось"])
@@ -633,12 +643,23 @@ class PlannerController:
         for r in recs[page * MEM_PAGE:(page + 1) * MEM_PAGE]:
             live = exp.decode(r)
             e = applied.get(r["id"])
-            tag = ("пример (не правило, расчёт не меняет)" if r["kind"] == "case"
-                   else "справочное правило (расчёт не меняет)" if not live
-                   else "не применено в этом плане (" + exp.short(e["note"].split(": ", 1)[-1], 100) + ")"
-                   if e is not None and not e["applied"] else "действует в расчёте")
-            out.append(f"• {tag}, {r['scope']}{' ' + r['target'] if r['target'] else ''}"
-                       f"{', до ' + r['expires_on'] if r['expires_on'] else ''}: {r['text'].split(chr(10))[0][:150]}")
+            why = lambda x: exp.short(x["note"].split(": ", 1)[-1], 100)  # noqa: E731
+            if r["kind"] == "case":
+                tag = "пример (не правило, расчёт не меняет)"
+            elif not live:
+                tag = "справочное правило (расчёт не меняет)"
+            elif e is not None:
+                tag = "действует в расчёте" if e["applied"] else f"не применено в этом плане ({why(e)})"
+            elif r["expires_on"] and r["expires_on"] < p["date"]:
+                tag = f"не действует на дату этого плана (срок до {r['expires_on']})"
+            elif r["id"] in sim:  # saved after this version was built: say what «Пересчитать» would do, not what it did
+                x = sim[r["id"]]
+                tag = ("не входила в эту версию, учтётся после «Пересчитать»" if x["applied"]
+                       else f"не применится после «Пересчитать» ({why(x)})")
+            else:
+                tag = "не входила в эту версию (подойдёт ли плану, покажет «Пересчитать»)"
+            out.append(f"• {tag}, {r['scope']}{' ' + exp.short(r['target'], 40) if r['target'] else ''}"
+                       f"{', до ' + r['expires_on'] if r['expires_on'] else ''}: {exp.short(r['text'].split(chr(10))[0], 80)}")
             if live:
                 revoke.append([_btn("Отозвать: " + exp._summary(live["effect"])[:36], "rv", r["id"])])
         if not recs:

@@ -724,6 +724,107 @@ class ExperienceFlowTests(UiBase):
         self.assertEqual(self.ctl.memory.entries()[0]["status"], "revoked")
         self.assertIn("отозван", said(rm).lower())
 
+    # --- the four findings of the review of 33ec8c4 ------------------------------------------------------------------
+    async def test_goal_that_conflicts_with_the_remembered_max_days_is_refused_up_front_and_the_record_stays_whole(self):
+        self.remember_global({"set": {"max_days": 11}, "excluded_wild": ["W1"]})
+        m, _ = await self.plan()
+        d0 = self.latest()
+        self.assertEqual(d0["plan"]["rules"]["max_days"], 11)
+        self.assertNotIn("W1", [ln["wild"] for ln in d0["plan"]["lines"]])
+        self.assertEqual(d0["plan"]["base_rules"]["max_days"], planner.default_rules()["max_days"])
+        # the owner's typed command: base target 12 <= base max 13 is fine alone, but the plan runs with max 11
+        c, _ = cb(buttons(m)["Настройки"], m)
+        await self.ctl.handle_callback(c)
+        m.text = "цель 12"
+        before = len(m.answer.call_args_list)
+        await self.ctl.handle_message(m)
+        said_now = "\n".join(str(x.args[0]) for x in m.answer.call_args_list[before:] if x.args)
+        self.assertIn("Недопустимые настройки", said_now)
+        self.assertNotIn("Применить", [b for x in m.answer.call_args_list[before:]
+                                       for row in getattr(x.kwargs.get("reply_markup"), "inline_keyboard", []) for b in [bt.text for bt in row]])
+        # the same through the model proposal
+        self.answers = [araw([dict(type="set_number", key="target_days", value=12)])]
+        m.text = "хочу чтобы цель была двенадцать дней"
+        before = len(m.answer.call_args_list)
+        await self.ctl.handle_message(m)
+        said_now = "\n".join(str(x.args[0]) for x in m.answer.call_args_list[before:] if x.args)
+        self.assertIn("Недопустимые настройки", said_now)
+        d1 = self.latest()
+        self.assertEqual((d1["id"], d1["version"]), (d0["id"], d0["version"]))  # nothing saved
+        self.assertTrue(d1["plan"]["experience"][0]["applied"])  # the record is still applied as a whole, W1 included
+        self.assertNotIn("W1", [ln["wild"] for ln in d1["plan"]["lines"]])
+        # the limit is judged both ways: an owner's own explicit maximum is still the owner's call
+        self.answers = [araw([dict(type="set_number", key="target_days", value=12), dict(type="set_number", key="max_days", value=14)])]
+        m.text = "хочу цель 12 и максимум 14"
+        await self.ctl.handle_message(m)
+        self.assertIn("Применить", buttons(m))
+
+    async def test_confirmed_record_expiring_before_the_plan_date_stays_visible_and_revocable_after_a_double_failure(self):
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        m, _ = await self.plan()
+        d0 = self.latest()
+        day = date.fromisoformat(d0["plan"]["date"])
+        soon = (day - timedelta(days=1)).isoformat()  # still alive today, ends before the shipment date
+        self.answers = [araw([dict(type="exclude_wild", wild="W2")], scope="product_preference", expires_on=soon)]
+        c, _ = cb(buttons(m)["Настройки"], m)
+        await self.ctl.handle_callback(c)
+        m.text = "запомни"
+        await self.ctl.handle_message(m)
+        c, m2 = cb(buttons(m)["Применить и запомнить"])
+        with ExitStack() as st:
+            st.enter_context(patch.object(self.ctl, "_revise", AsyncMock(return_value=None)))
+            st.enter_context(patch.object(self.ctl.memory, "revoke", side_effect=RuntimeError("db down")))
+            await self.ctl.handle_callback(c)
+        rec = self.ctl.memory.entries()[0]
+        self.assertEqual((rec["status"], rec["expires_on"]), ("confirmed", soon))
+        self.assertIn("НЕ удался", said(m2))
+        for _ in range(2):
+            c, mm = cb(buttons(m)["Память"], m)
+            await self.ctl.handle_callback(c)
+            self.assertIn(f"pl:rv:{rec['id']}", buttons(mm).values(), msg=said(mm))
+            self.assertNotIn("действует в расчёте", [x for x in said(mm).splitlines() if "W2" in x][0])  # not for this date
+        c, rm = cb(f"pl:rv:{rec['id']}")
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.memory.entries()[0]["status"], "revoked")
+
+    async def test_record_missing_from_the_saved_experience_is_not_called_working_without_a_check(self):
+        m, _ = await self.plan()  # a saved plan with max_days 13 and nothing remembered
+        self.assertEqual(self.latest()["plan"]["experience"], [])
+        self.remember_global({"set": {"target_days": 20}, "excluded_wild": ["W2"]})  # saved later, e.g. from another plan
+        c, mm = cb(buttons(m)["Память"], m)
+        await self.ctl.handle_callback(c)
+        row = [x for x in said(mm).splitlines() if x.startswith("• ") and "W2" in x]
+        self.assertEqual(len(row), 1, msg=said(mm))
+        self.assertNotIn("действует в расчёте", row[0])  # the recalculation would refuse it (20 > 13)
+        self.assertIn("не применится", row[0])
+        self.assertIn("target_days must not exceed max_days", row[0])
+        # and a record that really would apply is described as such, apart from the saved snapshot
+        self.remember_global({"excluded_wild": ["W1"]})
+        c, mm = cb(buttons(m)["Память"], m)
+        await self.ctl.handle_callback(c)
+        ok = [x for x in said(mm).splitlines() if x.startswith("• ") and "W1" in x]
+        self.assertEqual(len(ok), 1, msg=said(mm))
+        self.assertIn("после «Пересчитать»", ok[0])
+
+    async def test_memory_page_stays_under_the_telegram_limit_at_the_largest_allowed_data(self):
+        n = 8  # MEM_PAGE records, each with the longest wild memory allows (MAX_TARGET = 200)
+        wilds = [f"W{i}" + "x" * 197 for i in range(n)]
+        self.sheets.snap["test"] = list(SNAP["test"]) + [[w, f"A{i + 9}", "Каб", "Товар" + "я" * 60, 1000, 5, 10, 10, 10, 10, 4, 4, 60]
+                                                         for i, w in enumerate(wilds)]
+        self.sheets.snap["packing"] = list(SNAP["packing"]) + [[w, 1, 1, 6, 48] for w in wilds]
+        for w in wilds:
+            self.ctl.memory.confirm(self.ctl.memory.propose(**exp.memory_entries(
+                "product_preference", {"excluded_wild": [w]}, reason="", plan_id="a" * 12, plan_date="2026-10-30",
+                today=date(2026, 10, 28), expires_on="2099-01-01")[0]))
+        m, _ = await self.plan()
+        self.assertGreaterEqual(len(self.latest()["plan"]["experience"]), 5)  # the plan shows the full five experience lines
+        c, mm = cb(buttons(m)["Память"], m)
+        await self.ctl.handle_callback(c)
+        page = mm.answer.call_args_list[-1].args[0]  # the one message Telegram would have to accept
+        self.assertLessEqual(len(page), 3900, msg=len(page))  # the hard limit is 4096; keep a margin for the worst tags
+        self.assertEqual(sum(1 for v in buttons(mm).values() if v.startswith("pl:rv:")), n)  # every record keeps its button
+
     def test_not_applied_is_shown_apart_from_the_shortened_description_and_never_marked_as_working(self):
         eff = {"set": {"target_days": 20}, "excluded_wild": [f"Длинное название товара {i:02d}" for i in range(11)]}
         note = {"id": "x", "category": "permanent_rule", "scope": "global", "target": "", "summary": exp._summary(eff),
