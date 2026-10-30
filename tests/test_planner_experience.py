@@ -556,6 +556,47 @@ class ExperienceFlowTests(UiBase):
         self.assertIn("«Память»", text)
         self.assertNotIn("Запись отозвана", text)
 
+    async def failing_write(self, revoke_fails):
+        """Two product records; the second confirm fails inside remember(), before any recalculation."""
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        m = await self.propose(araw([dict(type="exclude_wild", wild="W1"), dict(type="exclude_wild", wild="W2")],
+                                    scope="product_preference"))
+        versions = len(self.ctl.store.list(OWNER))
+        c, m2 = cb(buttons(m)["Запомнить на 30 дн."])
+        real, calls = self.ctl.memory.confirm, []
+
+        def confirm(i):
+            calls.append(i)
+            if len(calls) == 2:
+                raise RuntimeError("db down")
+            return real(i)
+        with ExitStack() as st:
+            st.enter_context(patch.object(self.ctl.memory, "confirm", side_effect=confirm))
+            if revoke_fails:
+                st.enter_context(patch.object(self.ctl.memory, "revoke", side_effect=RuntimeError("db down")))
+            await self.ctl.handle_callback(c)
+        by = {r["target"]: r["status"] for r in self.ctl.memory.entries()}
+        return said(m2), by, versions
+
+    async def test_write_failure_before_recalc_withdraws_both_records_and_keeps_the_plan(self):
+        text, by, versions = await self.failing_write(revoke_fails=False)
+        self.assertNotIn("confirmed", by.values())  # the first (confirmed) one is revoked, the second never confirmed
+        self.assertEqual(by["W1"], "revoked")
+        self.assertEqual(len(self.ctl.store.list(OWNER)), versions)  # no recalculation, plan untouched
+        self.assertNotIn("Запомнил", text)
+        self.assertNotIn("НЕ удался", text)
+
+    async def test_write_failure_before_recalc_with_failed_revoke_tells_the_owner_what_is_still_active(self):
+        text, by, versions = await self.failing_write(revoke_fails=True)
+        self.assertEqual(by["W1"], "confirmed")  # really still active...
+        self.assertNotEqual(by["W2"], "confirmed")
+        self.assertIn("НЕ удался", text)  # ...and the owner is told so
+        self.assertIn("«Память»", text)
+        self.assertNotIn("Запомнил", text)
+        self.assertNotIn("Запись отозвана", text)
+        self.assertEqual(len(self.ctl.store.list(OWNER)), versions)
+
     async def test_revoke_button_reports_revoked_only_after_the_status_changed(self):
         from unittest.mock import patch
         self.remember_global({"excluded_wild": ["W1"]})
