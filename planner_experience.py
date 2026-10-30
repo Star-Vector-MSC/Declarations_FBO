@@ -196,9 +196,10 @@ def merge(base, selected, explicit=()):
     """Effective rules = owner's base rules + remembered effects. -> (rules, experience list for display/storage).
     `explicit` = keys the owner set in THIS plan (even to a value equal to the default): remembered numbers never
     override them."""
-    base = planner.validate_rules(base)
+    base = planner.validate_rules(base, cross=False)  # target<=max may wait for a remembered number (checked below)
     explicit = set(explicit)
     rules, notes, defaults = base, [], planner.default_rules()
+    pending = rules["target_days"] > rules["max_days"]
     for r, d in selected:
         eff = d["effect"]
         item = {"id": r["id"], "category": d["category"], "scope": r["scope"], "target": r["target"],
@@ -226,14 +227,16 @@ def merge(base, selected, explicit=()):
         cand["fixed"] = ([swap.get(key(g), g) for g in cand["fixed"]]
                          + [f for f in eff.get("fixed", ()) if key(f) not in have])
         try:
-            rules = planner.validate_rules(cand)
+            cand = planner.validate_rules(cand, cross=not pending)
         except ValueError as e:
             item.update(applied=False, note="не применено: " + str(e)[:120])
         else:
+            rules = cand
+            pending = rules["target_days"] > rules["max_days"]
             if kept:
                 item["note"] = "ваши настройки этого плана важнее: " + ", ".join(kept)
         notes.append(item)
-    return rules, notes
+    return planner.validate_rules(rules), notes  # the effective rules must stand as a whole
 
 
 TG_LIMIT = 4096  # Telegram message size; experience text is auxiliary and is always the part that gets shortened
@@ -243,14 +246,27 @@ def short(text, n):
     return text if len(text) <= n else text[:max(n - 1, 0)] + "…"
 
 
+def _row(e, label, width):
+    """One entry. Status and reason are kept whole (apart from the description that gets shortened)."""
+    desc, note = f"{label}: {e['summary']}", short(e["note"], 100) if e["note"] else ""
+    if not e["applied"]:
+        lead = f"• {note or 'не применено'} — "
+        return lead + short(desc, max(20, width - len(lead)))
+    tail = f" ({note})" if note else ""
+    return "• " + short(desc, max(20, width - 2 - len(tail))) + tail
+
+
 def experience_lines(experience, limit=5, width=160):
-    """Owner-facing lines for the plan preview (each line bounded by `width`)."""
+    """Owner-facing lines for the plan preview (each line bounded by `width`). Not-applied entries come first and are
+    counted in the header, so no cut-off can hide them."""
     if not experience:
         return []
     labels = {c: v[1] for c, v in CATEGORIES.items()}
-    out = [f"Учтён опыт ({sum(1 for e in experience if e['applied'])} из {len(experience)}):"]
-    for e in experience[:limit]:
-        out.append(short(f"• {labels[e['category']]}: {e['summary']}" + (f" ({e['note']})" if e["note"] else ""), width))
+    idle = [e for e in experience if not e["applied"]]
+    out = [f"Учтён опыт ({len(experience) - len(idle)} из {len(experience)}"
+           + (f", не применено: {len(idle)}" if idle else "") + "):"]
+    ordered = idle + [e for e in experience if e["applied"]]
+    out += [_row(e, labels[e["category"]], width) for e in ordered[:limit]]
     if len(experience) > limit:
         out.append(f"… ещё {len(experience) - limit} в «Память»")
     return out

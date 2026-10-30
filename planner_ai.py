@@ -192,7 +192,28 @@ def _s(v, n=200):
     return isinstance(v, str) and 0 < len(v.strip()) <= n
 
 
-def validate_proposal(raw, rules, cat, locked=None, explicit=()):
+def check_in_context(new, context, touched=(), explicit=()):
+    """Normalized owner rules `new`. Structure is always checked; the target_days <= max_days limit is judged on the
+    rules the plan will really run with: `new` over the remembered numbers the owner did not set (`context` = the
+    effective rules of the plan). The limit itself is never switched off. Raises ValueError."""
+    norm = planner.validate_rules(new, cross=False)
+    try:
+        return planner.validate_rules(norm)
+    except ValueError as alone:
+        if context is None:
+            raise
+        keep, defaults, over = set(touched) | set(explicit), planner.default_rules(), dict(norm)
+        for k in (*_NUMBERS, "capacity"):
+            if k not in keep and norm[k] == defaults[k]:
+                over[k] = context[k]
+        try:
+            planner.validate_rules(over)
+        except ValueError:
+            raise alone from None
+        return norm
+
+
+def validate_proposal(raw, rules, cat, locked=None, explicit=(), context=None):
     """Raw model JSON -> Proposal (new validated rules, readable diff, clarifying questions). Raises AIRejected.
     `locked` = {"wilds": set, "cabinets": set} of normalized names excluded by remembered rules (not by `rules`)."""
     if (not isinstance(raw, dict)
@@ -222,15 +243,18 @@ def validate_proposal(raw, rules, cat, locked=None, explicit=()):
             _apply(t, a, new, cat, questions, locked or {})
         except (TypeError, ValueError, KeyError) as e:
             raise AIRejected(f"Действие «{t}» не прошло проверку ({str(e)[:120]}); ничего не изменено.") from None
+    touched = {"capacity" if a["type"] == "set_capacity" else a["key"] for a in raw["actions"]
+               if a["type"] in ("set_number", "set_capacity")}
     try:
-        new = planner.validate_rules(new)
+        new = check_in_context(new, context, touched, explicit)
     except ValueError as e:
         raise AIRejected("Недопустимые настройки: " + str(e)[:200]) from None
     diff = [f"{_LABEL[k]}: {_show(rules[k])} → {_show(new[k])}" for k in new if new[k] != rules[k]]
-    touched = {"capacity" if a["type"] == "set_capacity" else a["key"] for a in raw["actions"]
-               if a["type"] in ("set_number", "set_capacity")}
+    remember = raw["scope"] in ("once_exception", "product_preference", "permanent_rule")
     diff += [f"{_LABEL[k]}: {new[k]} (задано вами явно — память это не перекроет)" for k in sorted(touched)
              if new[k] == rules[k] and k not in set(explicit)]
+    diff += [f"{_LABEL[k]}: {new[k]} (значение не меняется; будет запомнено как ваше явное)" for k in sorted(touched)
+             if remember and new[k] == rules[k] and k in set(explicit)]  # the intent to remember is itself a change
     if not diff:
         touched = set()
     if raw["scope"] == "unclear" and not questions:
@@ -313,13 +337,13 @@ def _apply(t, a, new, cat, questions, locked):
         new["fixed"] = keep + [dict(article=key[0], cabinet=key[1], quantity=q, reason=a["reason"].strip())]
 
 
-def interpret(text, rules, snapshot, plan_lines=(), call=run_codex, locked=None, explicit=()):
+def interpret(text, rules, snapshot, plan_lines=(), call=run_codex, locked=None, explicit=(), context=None):
     """Free text -> Proposal. `call(prompt) -> raw dict` is injectable for tests."""
     text = " ".join(str(text).split())
     if not text or len(text) > MAX_TEXT:
         raise AIRejected(f"Указание должно быть от 1 до {MAX_TEXT} символов.")
     cat = catalog(snapshot)
-    return validate_proposal(call(build_prompt(text, rules, cat, list(plan_lines))), rules, cat, locked, explicit)
+    return validate_proposal(call(build_prompt(text, rules, cat, list(plan_lines))), rules, cat, locked, explicit, context)
 
 
 def scope_text(scope):

@@ -86,8 +86,10 @@ def _f(x):
     return None if x is None else round(float(x), 6)
 
 
-def validate_rules(rules=None):
-    """Return a normalized independent copy of rules merged over defaults; raise ValueError if invalid."""
+def validate_rules(rules=None, cross=True):
+    """Return a normalized independent copy of rules merged over defaults; raise ValueError if invalid.
+    cross=False skips only the target_days <= max_days limit: the owner's own rules may wait for a remembered
+    number; that limit is then checked on the effective rules (cross=True)."""
     if rules is None:
         rules = {}
     if not isinstance(rules, dict):
@@ -106,7 +108,7 @@ def validate_rules(rules=None):
     cap = out["capacity"]
     if isinstance(cap, bool) or not isinstance(cap, int) or cap not in (20, 33):
         raise ValueError("capacity must be integer 20 or 33")
-    if out["target_days"] > out["max_days"]:
+    if cross and out["target_days"] > out["max_days"]:
         raise ValueError("target_days must not exceed max_days")
     for k in ("excluded_wild", "excluded_cabinets"):
         v = out[k]

@@ -80,10 +80,10 @@ def _num(s):
     return int(v) if v == int(v) else v
 
 
-def parse_command(text, rules, touched=None, explicit=()):
+def parse_command(text, rules, touched=None, explicit=(), context=None):
     """One settings command -> (new validated rules, summary). ValueError carries a user-facing message.
     `touched` (a set) receives the numeric/capacity key the owner set explicitly, even to an unchanged value;
-    `explicit` = keys already explicit in this plan."""
+    `explicit` = keys already explicit in this plan; `context` = the plan's effective rules (limits are judged there)."""
     hit = None
     t = " ".join(text.split())
     if not t:
@@ -122,7 +122,7 @@ def parse_command(text, rules, touched=None, explicit=()):
         else:
             raise UnknownCommand("Не понял указание, ничего не изменено.\n" + HELP)
     try:
-        new = planner.validate_rules(new)
+        new = planner_ai.check_in_context(new, context, (hit,) if hit else (), explicit)
     except ValueError as e:
         raise ValueError("Недопустимые настройки: " + str(e)[:200]) from None
     diff = [f"{_LABEL[k]}: {rules[k]} → {new[k]}" for k in new if new[k] != rules[k]]
@@ -278,7 +278,7 @@ class PlannerController:
             raise _Blocked("Такого склада сейчас нет в таблице. Начните новый план.")
         wilds = set(planner_ai.catalog(snap)["wilds"].values())
         selected = exp.select(self.memory.entries(), plan_id=draft["id"] if draft else None, on_date=day, wilds=wilds)
-        norm = planner.validate_rules(rules)
+        norm = planner.validate_rules(rules, cross=False)  # the target<=max limit is checked on the merged rules
         prev = base_rules(draft) if draft else None
         explicit = set(draft["plan"].get("explicit_keys") or ()) if draft else {"capacity"}  # the wizard asks for it
         explicit |= {k for k in exp.NUMERIC + ("capacity",) if prev is not None and norm[k] != prev[k]}
@@ -440,7 +440,8 @@ class PlannerController:
             if d["version"] != st["ver"] or d.get("exported_version") is not None:
                 raise _Blocked("План изменился; откройте актуальную версию в «Моих планах».")
             touched = set()
-            rules, summary = parse_command(text, base_rules(d), touched, d["plan"].get("explicit_keys") or ())
+            rules, summary = parse_command(text, base_rules(d), touched, d["plan"].get("explicit_keys") or (),
+                                            d["plan"]["rules"])
         except UnknownCommand:
             return await self._t_ai(uid, ct, msg, text, st)
         except (ValueError, _Blocked, DraftError) as e:
@@ -470,7 +471,7 @@ class PlannerController:
             if d["version"] != ver or d.get("exported_version") is not None:
                 raise _Blocked("План изменился; откройте актуальную версию в «Моих планах».")
             return self.ai(full, base_rules(d), self.sheets.snapshot(), d["plan"]["lines"], locked=self._locked(d),
-                           explicit=d["plan"].get("explicit_keys") or ())
+                           explicit=d["plan"].get("explicit_keys") or (), context=d["plan"]["rules"])
         ok, p = await self._guarded(uid, ct, msg, work)
         if not ok or self._st.get(uid) is not st:  # failed, or the menu/another action replaced the state meanwhile
             return True
@@ -613,6 +614,8 @@ class PlannerController:
             seen = {r["id"]: r for r in self.memory.applicable(plan_id=d["id"], on_date=p["date"])}
             keys = {ln[k] for ln in p["lines"] for k in ("wild", "article", "product") if ln.get(k)}
             keys |= {e["target"] for e in p.get("experience") or () if e.get("scope") == "product"}  # excluded wilds
+            keys |= {r["target"] for r in self.memory.entries()  # any active product record stays revocable here
+                     if r["status"] == "confirmed" and r["scope"] == "product"}
             for key in sorted(keys):
                 seen.update({r["id"]: r for r in self.memory.applicable(product=key, plan_id=d["id"], on_date=p["date"])})
             return list(seen.values())
@@ -620,6 +623,7 @@ class PlannerController:
         if not ok:
             return
         info = exp.experience_lines(p.get("experience"), limit=5)[1:]  # bounded: pages stay under 4096
+        applied = {e["id"]: e for e in p.get("experience") or ()}
         out = ["Опыт, учтённый в этой версии плана:"] + (info or ["• ничего не применялось"])
         out.append("\nПамять помощника для этого плана (подтверждённые, не истёкшие):")
         recs.sort(key=lambda r: r["id"])
@@ -628,8 +632,11 @@ class PlannerController:
         revoke = []
         for r in recs[page * MEM_PAGE:(page + 1) * MEM_PAGE]:
             live = exp.decode(r)
+            e = applied.get(r["id"])
             tag = ("пример (не правило, расчёт не меняет)" if r["kind"] == "case"
-                   else "действует в расчёте" if live else "справочное правило (расчёт не меняет)")
+                   else "справочное правило (расчёт не меняет)" if not live
+                   else "не применено в этом плане (" + exp.short(e["note"].split(": ", 1)[-1], 100) + ")"
+                   if e is not None and not e["applied"] else "действует в расчёте")
             out.append(f"• {tag}, {r['scope']}{' ' + r['target'] if r['target'] else ''}"
                        f"{', до ' + r['expires_on'] if r['expires_on'] else ''}: {r['text'].split(chr(10))[0][:150]}")
             if live:
@@ -713,7 +720,7 @@ class PlannerController:
         d = await self._draft(uid, did, ver)
         if n not in ("20", "33"):
             raise ValueError("Кнопка устарела.")
-        rules, summary = parse_command(f"Машина {n}", base_rules(d))
+        rules, summary = parse_command(f"Машина {n}", base_rules(d), context=d["plan"]["rules"])
         nonce = secrets.token_hex(3)
         self._st[uid] = {"step": "proposal", "id": did, "ver": ver, "proposal": rules, "nonce": nonce}
         await msg.answer("Предлагаемые изменения (пока не применены):\n" + summary, reply_markup=_kb(

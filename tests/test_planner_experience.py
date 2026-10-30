@@ -597,6 +597,166 @@ class ExperienceFlowTests(UiBase):
         self.assertNotIn("Запись отозвана", text)
         self.assertEqual(len(self.ctl.store.list(OWNER)), versions)
 
+    # --- the four MAJOR of the review of 039795d ---------------------------------------------------------------------
+    async def test_remember_a_number_the_owner_already_applied_in_this_plan(self):
+        self.remember_global({"set": {"max_current_days": 6}})
+        m, _ = await self.plan()
+        self.assertEqual(self.latest()["plan"]["rules"]["max_current_days"], 6)
+        m2 = await self.step(m, araw([dict(type="set_number", key="max_current_days", value=10)]), "Применить")
+        self.assertEqual(self.latest()["plan"]["rules"]["max_current_days"], 10)
+        self.assertIn("max_current_days", self.latest()["plan"]["explicit_keys"])
+        self.answers = [araw([dict(type="set_number", key="max_current_days", value=10)], scope="permanent_rule")]
+        c, _ = cb(buttons(m2)["Настройки"], m2)
+        await self.ctl.handle_callback(c)
+        m2.text = "10 дней, запомни"
+        await self.ctl.handle_message(m2)
+        self.assertNotIn("Изменений в условиях нет", said(m2))
+        self.assertIn("Применить и запомнить", buttons(m2), msg=said(m2))
+        m3 = await self.tap(m2, "Применить и запомнить")
+        await self.tap(m3, "Да, сохранить навсегда")
+        mine = [exp.decode(r)["effect"] for r in self.ctl.memory.entries() if r["status"] == "confirmed"][-1]
+        self.assertEqual(mine, {"set": {"max_current_days": 10}})
+        self.assertEqual(self.latest()["plan"]["rules"]["max_current_days"], 10)
+        await self.plan()
+        self.assertEqual(self.latest()["plan"]["rules"]["max_current_days"], 10)  # the newer record, not the old 6
+
+    def test_a_repeat_of_the_same_value_without_remembering_is_still_no_change(self):
+        rules = planner.default_rules()
+        raw = araw([dict(type="set_number", key="max_current_days", value=rules["max_current_days"])])
+        p = planner_ai.validate_proposal(raw, rules, planner_ai.catalog(SNAP), explicit=("max_current_days",))
+        self.assertEqual(list(p.summary), [])
+
+    async def test_target_days_is_accepted_when_max_days_comes_from_memory(self):
+        self.remember_global({"set": {"max_days": 30}})
+        m, _ = await self.plan()
+        d = self.latest()
+        self.assertEqual(d["plan"]["rules"]["max_days"], 30)
+        self.assertEqual(d["plan"]["base_rules"]["max_days"], planner.default_rules()["max_days"])  # memory not absorbed
+        m2 = await self.step(m, araw([dict(type="set_number", key="target_days", value=20)]), "Применить")
+        self.assertNotIn("Недопустимые", said(m2))
+        d = self.latest()
+        self.assertEqual((d["plan"]["rules"]["target_days"], d["plan"]["rules"]["max_days"]), (20, 30))
+        self.assertEqual(d["plan"]["base_rules"]["max_days"], planner.default_rules()["max_days"])  # still not absorbed
+        self.assertTrue(d["plan"]["experience"][0]["applied"])
+
+    def test_a_typed_command_is_judged_in_the_context_of_the_effective_rules(self):
+        base = planner.default_rules()
+        ctx = dict(base, max_days=30)
+        with self.assertRaises(ValueError):
+            planner_ui.parse_command("цель 20", base)
+        new, _ = planner_ui.parse_command("цель 20", base, context=ctx)
+        self.assertEqual((new["target_days"], new["max_days"]), (20, base["max_days"]))
+        with self.assertRaises(ValueError):  # the context does not switch the limits off
+            planner_ui.parse_command("цель 40", base, context=ctx)
+        with self.assertRaises(ValueError):  # ...and the owner's own explicit maximum is never replaced by memory
+            planner_ui.parse_command("цель 20", base, explicit=("max_days",), context=ctx)
+
+    async def test_leftover_confirmed_records_stay_revocable_even_when_the_wild_is_not_in_the_plan(self):
+        m, _ = await self.plan()
+        i = self.ctl.memory.propose(**exp.memory_entries("product_preference", {"excluded_wild": ["W9"]}, reason="",
+                                                         plan_id="a" * 12, plan_date="2026-10-30",
+                                                         today=date(2026, 10, 28), expires_on="2099-01-01")[0])
+        self.ctl.memory.confirm(i)
+        c, mm = cb(buttons(m)["Память"], m)
+        await self.ctl.handle_callback(c)
+        self.assertIn(f"pl:rv:{i}", buttons(mm).values())
+        c, rm = cb(f"pl:rv:{i}")
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.memory.entries()[0]["status"], "revoked")
+
+    async def test_after_failed_recalc_and_failed_revoke_the_record_can_be_revoked_from_memory(self):
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        m, _ = await self.plan()
+        self.answers = [araw([dict(type="exclude_wild", wild="W1")], scope="product_preference", expires_on="2099-01-01")]
+        c, _ = cb(buttons(m)["Настройки"], m)
+        await self.ctl.handle_callback(c)
+        m.text = "запомни"
+        await self.ctl.handle_message(m)
+        c, m2 = cb(buttons(m)["Применить и запомнить"])
+        with ExitStack() as st:
+            st.enter_context(patch.object(self.ctl, "_revise", AsyncMock(return_value=None)))
+            st.enter_context(patch.object(self.ctl.memory, "revoke", side_effect=RuntimeError("db down")))
+            await self.ctl.handle_callback(c)
+        rec = self.ctl.memory.entries()[0]
+        self.assertEqual(rec["status"], "confirmed")
+        self.assertIn("НЕ удался", said(m2))
+        c, mm = cb(buttons(m)["Память"], m)
+        await self.ctl.handle_callback(c)
+        self.assertIn(f"pl:rv:{rec['id']}", buttons(mm).values())
+        c, rm = cb(f"pl:rv:{rec['id']}")
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.memory.entries()[0]["status"], "revoked")
+
+    def test_not_applied_is_shown_apart_from_the_shortened_description_and_never_marked_as_working(self):
+        eff = {"set": {"target_days": 20}, "excluded_wild": [f"Длинное название товара {i:02d}" for i in range(11)]}
+        note = {"id": "x", "category": "permanent_rule", "scope": "global", "target": "", "summary": exp._summary(eff),
+                "applied": False, "note": "не применено: target_days must not exceed max_days", "effect": eff}
+        ok = dict(note, id="y", applied=True, note="", summary="Не брать wild: W1")
+        lines = exp.experience_lines([ok, note], limit=5)
+        self.assertIn("не применено: 1", lines[0])  # the header alone already says it
+        bad = [x for x in lines[1:] if "не применено" in x]
+        self.assertEqual(len(bad), 1)
+        self.assertIn("target_days must not exceed max_days", bad[0])
+        self.assertTrue(all(len(x) <= 160 for x in lines))
+        self.assertEqual(lines.index(bad[0]), 1)  # the not-applied entry comes first, so a cut-off list keeps it
+        only = exp.experience_lines([ok, note], limit=0)
+        self.assertIn("не применено: 1", only[0])
+
+    async def test_memory_view_marks_a_record_not_applied_in_this_plan_instead_of_working(self):
+        self.remember_global({"set": {"target_days": 20}, "excluded_wild": ["W1"]})
+        self.remember_global({"set": {"max_days": 11}})
+        m, _ = await self.plan()
+        d = self.latest()
+        self.assertEqual([e["applied"] for e in d["plan"]["experience"]], [False, True])
+        c, mm = cb(buttons(m)["Память"], m)
+        await self.ctl.handle_callback(c)
+        rows = [x for x in said(mm).splitlines() if x.startswith("• ") and "Постоянное правило" in x]
+        self.assertEqual(len(rows), 2, msg=said(mm))
+        working = [x for x in rows if x.startswith("• действует в расчёте")]
+        idle = [x for x in rows if x.startswith("• не применено")]
+        self.assertEqual((len(working), len(idle)), (1, 1), msg=said(mm))
+        self.assertIn("max_days", working[0].replace("Максимум", "max_days"))
+        self.assertIn("pl:rv:" + [r["id"] for r in self.ctl.memory.entries()][0], buttons(mm).values())  # still revocable
+
+    async def test_not_applied_is_visible_on_the_plan_screen_itself(self):
+        self.remember_global({"set": {"target_days": 20}})
+        self.remember_global({"set": {"max_days": 11}})
+        m, _ = await self.plan()
+        self.assertIn("не применено: 1", said(m))
+
+    async def test_revoking_the_number_a_proposal_depended_on_fails_visibly_and_changes_nothing(self):
+        self.remember_global({"set": {"max_days": 30}})
+        m, _ = await self.plan()
+        m2 = await self.step(m, araw([dict(type="set_number", key="target_days", value=20)]), "Применить")
+        before = self.latest()
+        rid = self.ctl.memory.entries()[0]["id"]
+        c, _ = cb(f"pl:rv:{rid}")
+        await self.ctl.handle_callback(c)
+        c, m3 = cb(self.latest_keys(m2))
+        await self.ctl.handle_callback(c)
+        self.assertIn("Не удалось построить план", said(m3))  # the limit is not switched off; the owner is told
+        self.assertEqual((self.latest()["id"], self.latest()["version"]), (before["id"], before["version"]))
+
+    def test_equal_created_at_keeps_the_store_order_so_the_newer_record_wins(self):
+        from unittest.mock import patch
+        import planner_memory
+        for order in ((6, 10), (10, 6)):
+            mem = MemoryStore(os.path.join(tempfile.mkdtemp(), "m.db"))
+            with patch.object(planner_memory, "_now", return_value="2026-10-30T10:00:00.000000Z"):
+                for v in order:
+                    e = exp.memory_entries("permanent_rule", {"set": {"max_current_days": v}}, reason="", plan_id="a" * 12,
+                                           plan_date="2026-10-30", today=date(2026, 10, 28))[0]
+                    mem.confirm(mem.propose(**e))
+            recs = mem.entries()
+            self.assertEqual(len({r["created_at"] for r in recs}), 1)
+            sel = exp.select(recs, plan_id=None, on_date="2026-10-30", wilds=set())
+            rules, _ = exp.merge(planner.validate_rules({}), sel)
+            self.assertEqual(rules["max_current_days"], order[-1])  # the later-created record, every time
+            rules2, _ = exp.merge(planner.validate_rules({}), exp.select(list(recs), plan_id=None, on_date="2026-10-30",
+                                                                         wilds=set()))
+            self.assertEqual(rules, rules2)
+
     async def test_revoke_button_reports_revoked_only_after_the_status_changed(self):
         from unittest.mock import patch
         self.remember_global({"excluded_wild": ["W1"]})
