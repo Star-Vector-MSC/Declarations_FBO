@@ -688,6 +688,42 @@ class ExperienceFlowTests(UiBase):
         await self.ctl.handle_callback(c)
         self.assertEqual(self.ctl.memory.entries()[0]["status"], "revoked")
 
+    async def test_wild_in_catalog_but_not_in_plan_lines_stays_revocable_after_failed_recalc_and_failed_revoke(self):
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        w3 = ["W3", "A3", "Каб", "Товар3", 5000, 200, 1, 1, 1, 1, 200, 200, 200]  # plenty of stock: no line in the plan
+        self.sheets.snap["test"] = list(SNAP["test"]) + [w3]
+        self.sheets.snap["packing"] = list(SNAP["packing"]) + [["W3", 1, 1, 6, 48]]
+        m, _ = await self.plan()
+        d0 = self.latest()
+        self.assertIn("W3", planner_ai.catalog(self.sheets.snap)["wilds"].values())
+        self.assertNotIn("W3", [ln["wild"] for ln in d0["plan"]["lines"]])
+        self.assertNotIn("W3", {e["target"] for e in d0["plan"].get("experience") or ()})
+        self.answers = [araw([dict(type="exclude_wild", wild="W3")], scope="product_preference", expires_on="2099-01-01")]
+        c, _ = cb(buttons(m)["Настройки"], m)
+        await self.ctl.handle_callback(c)
+        m.text = "запомни"
+        await self.ctl.handle_message(m)
+        c, m2 = cb(buttons(m)["Применить и запомнить"])
+        with ExitStack() as st:
+            st.enter_context(patch.object(self.ctl, "_revise", AsyncMock(return_value=None)))  # the recalculation fails
+            st.enter_context(patch.object(self.ctl.memory, "revoke", side_effect=RuntimeError("db down")))  # so does the revoke
+            await self.ctl.handle_callback(c)
+        rec = self.ctl.memory.entries()[0]
+        self.assertEqual((rec["status"], rec["target"]), ("confirmed", "W3"))  # still in force
+        text = said(m2)
+        self.assertIn("НЕ удался", text)  # the owner is told the truth, not "cancelled"
+        self.assertNotIn("Запомнил", text)
+        self.assertEqual(self.latest()["latest_version"], d0["latest_version"])  # the plan itself is untouched
+        for _ in range(2):  # reopening "Память" finds it again every time
+            c, mm = cb(buttons(m)["Память"], m)
+            await self.ctl.handle_callback(c)
+            self.assertIn(f"pl:rv:{rec['id']}", buttons(mm).values(), msg=said(mm))
+        c, rm = cb(f"pl:rv:{rec['id']}")
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.memory.entries()[0]["status"], "revoked")
+        self.assertIn("отозван", said(rm).lower())
+
     def test_not_applied_is_shown_apart_from_the_shortened_description_and_never_marked_as_working(self):
         eff = {"set": {"target_days": 20}, "excluded_wild": [f"Длинное название товара {i:02d}" for i in range(11)]}
         note = {"id": "x", "category": "permanent_rule", "scope": "global", "target": "", "summary": exp._summary(eff),
