@@ -155,7 +155,7 @@ def preview_text(d):
              f"{r['min_wild_days']}, цель {r['target_days']}, максимум {r['max_days']}; "
              f"исключений wild {len(r['excluded_wild'])}, кабинетов {len(r['excluded_cabinets'])}, "
              f"обязательных строк {len(r['fixed'])}"]
-    lines += exp.experience_lines(p.get("experience"))
+    at = len(lines)
     if p["warehouse"] is None:
         lines.append(NO_WH_NOTE)
     if p["remaining_pallets"] and p["remaining_pallets"] > 0:
@@ -172,7 +172,11 @@ def preview_text(d):
         lines.append(f"Это старая версия; актуальная — {d['latest_version']}.")
     elif d.get("exported_version") is not None:
         lines.append(f"Версия {d['exported_version']} уже выгружена; изменения запрещены.")
-    return "\n".join(lines)
+    for k in range(5, -1, -1):  # the experience description is auxiliary: it shrinks first so plan data and keys stay
+        text = "\n".join(lines[:at] + exp.experience_lines(p.get("experience"), limit=k) + lines[at:])
+        if len(text) <= exp.TG_LIMIT:
+            break
+    return text
 
 
 def base_rules(d):
@@ -611,7 +615,7 @@ class PlannerController:
         ok, recs = await self._guarded(uid, ct, msg, lambda: (self._mem_ok(), work())[1])
         if not ok:
             return
-        info = [x[:160] for x in exp.experience_lines(p.get("experience"), limit=5)[1:]]  # bounded: pages stay under 4096
+        info = exp.experience_lines(p.get("experience"), limit=5)[1:]  # bounded: pages stay under 4096
         out = ["Опыт, учтённый в этой версии плана:"] + (info or ["• ничего не применялось"])
         out.append("\nПамять помощника для этого плана (подтверждённые, не истёкшие):")
         recs.sort(key=lambda r: r["id"])
@@ -658,8 +662,12 @@ class PlannerController:
                                       p["warehouse"] if warehouse is ... else warehouse,
                                       p.get("arrival_date"), d, tuple(touched), live=True)
         if ok:
-            await msg.answer("Пересчитано: сохранена новая неизменяемая версия (в таблицу ничего не записано).")
-            await self._show(msg, new)
+            try:
+                await msg.answer("Пересчитано: сохранена новая неизменяемая версия (в таблицу ничего не записано).")
+                await self._show(msg, new)
+            except Exception:  # the version and any confirmed memory are already stored: never undo them, say so
+                await msg.answer(f"Версия {new['version']} плана {new['id']} сохранена, но показать её не удалось. "
+                                 "Откройте её в «Мои планы»; запомненные правила видны и отзываются в разделе «Память».")
         return new if ok else None
 
     async def _c_set(self, uid, ct, msg, did, ver):
@@ -735,7 +743,7 @@ class PlannerController:
             st["perm_ok"] = True  # a permanent rule needs a second, explicit tap on a DIFFERENT button:
             st["nonce"] = nonce = secrets.token_hex(3)  # the first button's data is now stale (no double-tap save)
             await msg.answer("Постоянное правило будет действовать во ВСЕХ будущих планах, пока вы не отзовёте его в "
-                             "разделе «Память»: " + exp._summary(memo["effect"]) + ". Сохранить навсегда?",
+                             "разделе «Память»: " + exp.short(exp._summary(memo["effect"]), 800) + ". Сохранить навсегда?",
                              reply_markup=_kb([[_btn("Да, сохранить навсегда", "ar", did, ver, nonce),
                                                 _btn("Отмена", "cn")]]))
             return
@@ -782,7 +790,7 @@ class PlannerController:
             await msg.answer("Запомнить не получилось: план с этим правилом не рассчитан, запись отозвана.")
             return
         label = exp.CATEGORIES[memo["category"]][1]
-        await msg.answer(f"Запомнил ({label}): {exp._summary(memo['effect'])}. Записей: {len(ids)}"
+        await msg.answer(f"Запомнил ({label}): {exp.short(exp._summary(memo['effect']), 800)}. Записей: {len(ids)}"
                          + (f"; действует до {entries[0]['expires_on']}" if entries[0]["expires_on"] else "; без срока")
                          + ". Отозвать можно в разделе «Память».")
 

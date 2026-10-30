@@ -187,14 +187,21 @@ def merge(base, selected, explicit=()):
     return rules, notes
 
 
-def experience_lines(experience, limit=5):
-    """Owner-facing lines for the plan preview."""
+TG_LIMIT = 4096  # Telegram message size; experience text is auxiliary and is always the part that gets shortened
+
+
+def short(text, n):
+    return text if len(text) <= n else text[:max(n - 1, 0)] + "…"
+
+
+def experience_lines(experience, limit=5, width=160):
+    """Owner-facing lines for the plan preview (each line bounded by `width`)."""
     if not experience:
         return []
     labels = {c: v[1] for c, v in CATEGORIES.items()}
     out = [f"Учтён опыт ({sum(1 for e in experience if e['applied'])} из {len(experience)}):"]
     for e in experience[:limit]:
-        out.append(f"• {labels[e['category']]}: {e['summary']}" + (f" ({e['note']})" if e["note"] else ""))
+        out.append(short(f"• {labels[e['category']]}: {e['summary']}" + (f" ({e['note']})" if e["note"] else ""), width))
     if len(experience) > limit:
         out.append(f"… ещё {len(experience) - limit} в «Память»")
     return out

@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import AsyncMock
 from datetime import date, datetime, timedelta
 
 import planner
@@ -367,6 +368,62 @@ class ExperienceFlowTests(UiBase):
             c, mm = cb(nxt)
             await self.ctl.handle_callback(c)
         self.assertEqual(pages, 2)
+
+    def seed_long_rules(self, n=5, wilds=12, width=70):
+        for r in range(n):  # n permanent rules x `wilds` long-named wilds: their summaries alone exceed 4096 chars
+            self.ctl.memory.confirm(self.ctl.memory.propose(**exp.memory_entries(
+                "permanent_rule", {"excluded_wild": [f"LONG{r:02d}{w:02d}".ljust(width, "x") for w in range(wilds)]},
+                reason="", plan_id="a" * 12, plan_date="2026-10-30", today=date(2026, 10, 28))[0]))
+
+    async def test_preview_with_five_long_rules_fits_telegram_and_keeps_the_plan_data(self):
+        self.seed_long_rules()
+        m, b = await self.plan()
+        d = self.latest()
+        self.assertEqual(len(d["plan"]["experience"]), 5)
+        self.assertGreater(sum(len(e["summary"]) for e in d["plan"]["experience"]), 4096)  # the reproduced overflow
+        text = planner_ui.preview_text(d)
+        self.assertLessEqual(len(text), 4096)
+        for must in ("Отгрузка", "Строк:", "Правила:", "Учтён опыт"):
+            self.assertIn(must, text)
+        for c in m.answer.call_args_list:
+            self.assertLessEqual(len(c.args[0]), 4096)
+        self.assertIn("Память", b)
+
+    async def test_confirmation_path_fits_and_a_send_failure_keeps_a_revocable_record(self):
+        self.seed_long_rules(wilds=11)
+        m, b = await self.plan()
+        m2 = await self.propose(araw([dict(type="exclude_wild", wild="W1")], scope="permanent_rule"))
+        c, _ = cb(buttons(m2)["Применить и запомнить"], m2)
+        await self.ctl.handle_callback(c)
+        c, _ = cb(buttons(m2)["Да, сохранить навсегда"], m2)
+        real = m2.answer
+
+        failed = []
+
+        async def flaky(text, *a, **k):
+            if text.startswith("ТЕСТОВЫЙ план"):
+                failed.append(text)
+                raise RuntimeError("telegram: message is too long")
+            return await real(text, *a, **k)
+        m2.answer = AsyncMock(side_effect=flaky)
+        await self.ctl.handle_callback(c)  # the preview send fails AFTER the record is confirmed and the plan stored
+        self.assertEqual(len(failed), 1)  # the send really failed
+        self.assertIn("сохранена, но показать её не удалось", said(m2))  # and the owner is told where to look
+        confirmed = [r for r in self.ctl.memory.entries() if r["status"] == "confirmed"]
+        self.assertEqual(len(confirmed), 6)
+        d = self.latest()
+        self.assertEqual(d["latest_version"], 2)
+        self.assertEqual(len(d["plan"]["experience"]), 6)
+        m2.answer = real
+        c, mm = cb(f"pl:mem:{d['id']}:{d['latest_version']}")
+        await self.ctl.handle_callback(c)
+        for call in mm.answer.call_args_list:
+            self.assertLessEqual(len(call.args[0]), 4096)
+        new_id = max(confirmed, key=lambda r: r["created_at"])["id"]
+        self.assertIn(f"pl:rv:{new_id}", buttons(mm).values())  # revocable after reopening memory
+        c, _ = cb(f"pl:rv:{new_id}")
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.memory.entries()[-1]["status"], "revoked")
 
     async def test_permanent_rule_first_button_cannot_double_tap_into_saving(self):
         m = await self.propose(araw([dict(type="exclude_wild", wild="W1")], scope="permanent_rule"))
