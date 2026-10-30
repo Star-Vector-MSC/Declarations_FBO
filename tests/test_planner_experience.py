@@ -442,6 +442,28 @@ class ExperienceFlowTests(UiBase):
         self.assertEqual(d["plan"]["rules"]["max_current_days"], 8)  # the owner's explicit number stays
         self.assertEqual(d["plan"]["experience"], [])
 
+    async def test_independent_required_line_of_a_third_wild_survives_revoke_of_a_mixed_record(self):
+        snap = self.ctl.sheets.snap
+        snap["test"] = list(snap["test"]) + [["W3", "A3", "Каб", "Товар3", 500, 5, 10, 10, 10, 10, 6, 6, 60]]
+        snap["packing"] = list(snap["packing"]) + [["W3", 1, 1, 10, 40]]
+        m, _ = await self.plan()
+        add = lambda art, q: dict(type="add_fixed", article=art, cabinet="Каб", quantity=q, reason="по поручению")  # noqa: E731
+        m2 = await self.step(m, araw([add("A1", 6), add("A3", 10)]), "Применить")
+        m3 = await self.step(m2, araw([add("A1", 12), dict(type="exclude_wild", wild="W2")], scope="once_exception",
+                                      expires_on="2099-01-01"), "Применить и запомнить")
+        d = self.latest()
+        self.assertEqual((self.qty(d, "A1"), self.qty(d, "A3")), ([12], [10]))
+        self.assertNotIn("W2", [ln["wild"] for ln in d["plan"]["lines"]])
+        self.assertEqual(self.fx(d["plan"]["base_rules"]), [("A1", 6), ("A3", 10)])
+        self.ctl.memory.revoke(self.ctl.memory.entries()[0]["id"])
+        c, _ = cb(self.latest_keys(m3))
+        await self.ctl.handle_callback(c)
+        d = self.latest()
+        self.assertEqual((self.qty(d, "A1"), self.qty(d, "A3")), ([6], [10]))  # only the remembered part went away
+        self.assertIn("W2", [ln["wild"] for ln in d["plan"]["lines"]])
+        self.assertEqual(self.fx(d["plan"]["rules"]), [("A1", 6), ("A3", 10)])
+        self.assertEqual(d["plan"]["experience"], [])
+
     async def test_expired_quantity_change_returns_to_the_owners_value_and_keeps_independent_settings(self):
         await self.mixed(expires_on="2020-01-01")  # term already over: nothing of the exception may remain
         d = self.latest()
