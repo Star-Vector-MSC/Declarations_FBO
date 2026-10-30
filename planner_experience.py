@@ -41,6 +41,18 @@ def effect_between(old, new):
     return eff, removed
 
 
+def without_effect(rules, effect):
+    """`rules` minus the list-type parts of `effect` (excluded wild/cabinets, fixed lines): a remembered decision is
+    carried by memory alone, so expiry or revocation removes it from the base rules too. Numbers stay as the owner's
+    own explicit values."""
+    out = json.loads(json.dumps(rules))
+    out["excluded_wild"] = [x for x in out["excluded_wild"] if x not in effect.get("excluded_wild", ())]
+    out["excluded_cabinets"] = [x for x in out["excluded_cabinets"] if x not in effect.get("excluded_cabinets", ())]
+    drop = {(f["article"], f["cabinet"]) for f in effect.get("fixed", ())}
+    out["fixed"] = [f for f in out["fixed"] if (f["article"], f["cabinet"]) not in drop]
+    return out
+
+
 def persistable(category, effect, removed):
     """Can this change be remembered as `category`? -> (ok, owner-facing reason when not)."""
     if category not in CATEGORIES:

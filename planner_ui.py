@@ -611,8 +611,8 @@ class PlannerController:
         ok, recs = await self._guarded(uid, ct, msg, lambda: (self._mem_ok(), work())[1])
         if not ok:
             return
-        out = ["Опыт, учтённый в этой версии плана:"] + (exp.experience_lines(p.get("experience"), limit=15)[1:]
-                                                         or ["• ничего не применялось"])
+        info = [x[:160] for x in exp.experience_lines(p.get("experience"), limit=5)[1:]]  # bounded: pages stay under 4096
+        out = ["Опыт, учтённый в этой версии плана:"] + (info or ["• ничего не применялось"])
         out.append("\nПамять помощника для этого плана (подтверждённые, не истёкшие):")
         recs.sort(key=lambda r: r["id"])
         n = max(1, -(-len(recs) // MEM_PAGE))
@@ -776,7 +776,7 @@ class PlannerController:
         if not ok:
             await asyncio.to_thread(withdraw)
             return
-        new = await self._revise(uid, ct, msg, d, rules, touched=touched)
+        new = await self._revise(uid, ct, msg, d, exp.without_effect(rules, memo["effect"]), touched=touched)
         if new is None:
             await asyncio.to_thread(withdraw)  # the plan could not be rebuilt: the remembered decision is withdrawn again
             await msg.answer("Запомнить не получилось: план с этим правилом не рассчитан, запись отозвана.")

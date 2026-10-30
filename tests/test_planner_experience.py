@@ -320,6 +320,54 @@ class ExperienceFlowTests(UiBase):
         await self.ctl.handle_callback(c)
         self.assertEqual(sorted(r["status"] for r in self.ctl.memory.entries()).count("revoked"), 1)
 
+    async def test_expired_once_exception_leaves_the_recalculated_plan_entirely(self):
+        m = await self.propose(araw([dict(type="exclude_wild", wild="W1"), dict(type="set_number", key="max_current_days", value=8)],
+                                    scope="once_exception", expires_on="2020-01-01"))  # term before the plan date
+        await self.tap(m, "Применить и запомнить")
+        d = self.latest()
+        self.assertIn("W1", [ln["wild"] for ln in d["plan"]["lines"]])  # expired: the exclusion did not survive in base_rules
+        self.assertEqual(d["plan"]["base_rules"]["excluded_wild"], [])
+        self.assertEqual(d["plan"]["experience"], [])
+        self.assertEqual(d["plan"]["rules"]["max_current_days"], 8)  # the owner's other setting stays
+        c, _ = cb(self.latest_keys(m))  # a later recalculation keeps it gone
+        await self.ctl.handle_callback(c)
+        self.assertIn("W1", [ln["wild"] for ln in self.latest()["plan"]["lines"]])
+
+    async def test_live_once_exception_applies_through_memory_and_goes_when_revoked(self):
+        m = await self.propose(araw([dict(type="exclude_wild", wild="W1")], scope="once_exception",
+                                    expires_on="2099-01-01"))
+        await self.tap(m, "Применить и запомнить")
+        d = self.latest()
+        self.assertNotIn("W1", [ln["wild"] for ln in d["plan"]["lines"]])
+        self.assertEqual(len(d["plan"]["experience"]), 1)
+        self.assertEqual(d["plan"]["base_rules"]["excluded_wild"], [])  # carried by memory only
+        self.ctl.memory.revoke(self.ctl.memory.entries()[0]["id"])
+        c, _ = cb(self.latest_keys(m))
+        await self.ctl.handle_callback(c)
+        self.assertIn("W1", [ln["wild"] for ln in self.latest()["plan"]["lines"]])
+
+    async def test_memory_pages_fit_telegram_with_a_large_experience_block(self):
+        for r in range(15):  # 15 rules x 12 wilds with 20-char names: the plan's experience block alone is >4096 chars
+            self.ctl.memory.confirm(self.ctl.memory.propose(**exp.memory_entries(
+                "permanent_rule", {"excluded_wild": [f"WILD{r:02d}{w:02d}".ljust(20, "x") for w in range(12)]},
+                reason="", plan_id="a" * 12, plan_date="2026-10-30", today=date(2026, 10, 28))[0]))
+        m, b = await self.plan()
+        self.assertEqual(len(self.latest()["plan"]["experience"]), 15)
+        c, mm = cb(b["Память"])
+        await self.ctl.handle_callback(c)
+        pages = 0
+        while True:
+            pages += 1
+            last = mm.answer.call_args_list[-1]
+            self.assertLessEqual(len(last.args[0]), 4096)
+            self.assertTrue([v for v in buttons(mm).values() if v.startswith("pl:rv:")])
+            nxt = buttons(mm).get("▶")
+            if not nxt:
+                break
+            c, mm = cb(nxt)
+            await self.ctl.handle_callback(c)
+        self.assertEqual(pages, 2)
+
     async def test_permanent_rule_first_button_cannot_double_tap_into_saving(self):
         m = await self.propose(araw([dict(type="exclude_wild", wild="W1")], scope="permanent_rule"))
         first = buttons(m)["Применить и запомнить"]
