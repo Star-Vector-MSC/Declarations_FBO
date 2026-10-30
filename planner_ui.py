@@ -498,7 +498,8 @@ class PlannerController:
         st.pop("perm_ok", None)
         buttons, extra = [], ""
         if p.scope != "this_plan":
-            effect, removed = exp.effect_between(base_rules(await asyncio.to_thread(self.store.get, uid, did)), p.rules)
+            effect, removed = exp.effect_between(base_rules(await asyncio.to_thread(self.store.get, uid, did)), p.rules,
+                                               p.touched)
             ok_mem, why = exp.persistable(p.scope, effect, removed)
             if ok_mem:
                 st["memo"] = dict(category=p.scope, effect=effect, reason=p.reason, expires_on=p.expires_on)
@@ -762,12 +763,25 @@ class PlannerController:
         made = []
 
         def withdraw():
+            """Revoke what was written. -> ids that are still active (or whose state cannot be read) afterwards."""
             for i in made:  # never leave a decision active that the owner did not see applied
                 try:
                     self.memory.revoke(i)
                 except Exception:
-                    pass
-            made.clear()
+                    try:
+                        self.memory.reject(i)  # a record that never got confirmed is inert; close it if possible
+                    except Exception:
+                        pass
+            try:
+                state = {r["id"]: r["status"] for r in self.memory.entries()}
+            except Exception:
+                return list(made)
+            made[:] = [i for i in made if state.get(i) == "confirmed"]
+            return list(made)
+
+        def stuck(ids):
+            return ("Отзыв записи НЕ удался: она осталась действующей и влияет на новые расчёты. Отзовите её вручную в "
+                    "разделе «Память».") if ids else ""
 
         def remember(alive):
             self._mem_ok()
@@ -785,13 +799,16 @@ class PlannerController:
             return list(made)
         ok, ids = await self._guarded(uid, ct, msg, remember, live=True)
         if not ok:
-            await asyncio.to_thread(withdraw)
+            left = await asyncio.to_thread(withdraw)
+            if left:
+                await msg.answer(stuck(left))
             return
         new = await self._revise(uid, ct, msg, d, exp.without_effect(rules, memo["effect"], base_rules(d)), touched=touched,
                                  release=[exp.fixed_id(f) for f in memo["effect"].get("fixed", ())])
         if new is None:
-            await asyncio.to_thread(withdraw)  # the plan could not be rebuilt: the remembered decision is withdrawn again
-            await msg.answer("Запомнить не получилось: план с этим правилом не рассчитан, запись отозвана.")
+            left = await asyncio.to_thread(withdraw)  # the plan could not be rebuilt: the remembered decision is withdrawn again
+            await msg.answer("Запомнить не получилось: план с этим правилом не рассчитан. "
+                             + (stuck(left) if left else "Запись отозвана (статус проверен)."))
             return
         label = exp.CATEGORIES[memo["category"]][1]
         await msg.answer(f"Запомнил ({label}): {exp.short(exp._summary(memo['effect']), 800)}. Записей: {len(ids)}"
@@ -824,6 +841,9 @@ class PlannerController:
             if rec is None or rec["status"] != "confirmed" or exp.decode(rec) is None:
                 raise _Blocked("Эта запись уже отозвана или не найдена.")
             self.memory.revoke(rid)
+            now = next((r for r in self.memory.entries() if r["id"] == rid), None)
+            if now is None or now["status"] != "revoked":
+                raise _Blocked("Не удалось подтвердить отзыв записи: она может ещё действовать. Проверьте раздел «Память».")
         ok, _ = await self._guarded(uid, ct, msg, work)
         if ok:
             await msg.answer("Запись отозвана. В уже сохранённых версиях планов ничего не меняется; новые расчёты и "

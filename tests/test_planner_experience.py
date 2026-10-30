@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -125,14 +126,21 @@ class UnitTests(unittest.TestCase):
 
     def test_conflicting_memory_is_skipped_visibly(self):
         self.add("permanent_rule", {"set": {"target_days": 12}})  # fine alone, but this plan's own max_days is 11
-        self.add("permanent_rule", {"set": {"target_days": 20}})  # invalid even alone: never active at all
+        self.add("permanent_rule", {"set": {"target_days": 20}})  # a valid record; it just does not fit THIS plan either
         base = planner.validate_rules({"max_days": 11})
         rules, notes = exp.merge(base, self.sel())
-        self.assertEqual(len(notes), 1)
+        self.assertEqual(len(notes), 2)
         self.assertEqual(rules, base)
-        self.assertFalse(notes[0]["applied"])
-        self.assertIn("не применено", notes[0]["note"])
+        self.assertFalse(any(n["applied"] for n in notes))
+        self.assertTrue(all("не применено" in n["note"] for n in notes))
         self.assertIn("не применено", "\n".join(exp.experience_lines(notes)))
+        roomy = planner.validate_rules({"max_days": 30})  # the same record is applicable where the plan's own limits allow it
+        rules, notes = exp.merge(roomy, self.sel())
+        self.assertEqual((rules["target_days"], notes[-1]["applied"]), (20, True))
+        for bad in ({"set": {"target_days": 0}}, {"set": {"capacity": 25}}, {"set": {"min_sales": True}},
+                    {"fixed": [{"article": "A"}]}):  # a genuinely malformed record is still inert
+            line = exp.PREFIX + json.dumps({"category": "permanent_rule", "effect": bad})
+            self.assertIsNone(exp.decode(dict(kind="rule", scope="global", text="x\n" + line)))
 
     def test_product_preference_has_owner_given_expiry_and_one_entry_per_wild(self):
         es = exp.memory_entries("product_preference", {"excluded_wild": ["W1", "W2"]}, reason="", plan_id="a" * 12,
@@ -463,6 +471,109 @@ class ExperienceFlowTests(UiBase):
         self.assertIn("W2", [ln["wild"] for ln in d["plan"]["lines"]])
         self.assertEqual(self.fx(d["plan"]["rules"]), [("A1", 6), ("A3", 10)])
         self.assertEqual(d["plan"]["experience"], [])
+
+    # --- contract fixes after the external review of 6127d90 --------------------------------------------------------
+    def remember_global(self, effect):
+        self.ctl.memory.confirm(self.ctl.memory.propose(**exp.memory_entries(
+            "permanent_rule", effect, reason="", plan_id="a" * 12, plan_date="2026-10-30", today=date(2026, 10, 28))[0]))
+
+    async def test_explicit_number_equal_to_the_base_is_remembered_alone_and_with_an_exception(self):
+        for extra in ([], [dict(type="exclude_wild", wild="W2")]):
+            for r in self.ctl.memory.entries():
+                if r["status"] == "confirmed":
+                    self.ctl.memory.revoke(r["id"])  # every variant starts from only the old remembered 6
+            self.remember_global({"set": {"max_current_days": 6}})
+            m, _ = await self.plan()
+            self.assertEqual(self.latest()["plan"]["rules"]["max_current_days"], 6)  # memory applies to a fresh plan
+            self.answers = [araw([dict(type="set_number", key="max_current_days", value=10)] + extra, scope="permanent_rule")]
+            c, _ = cb(buttons(m)["Настройки"], m)
+            await self.ctl.handle_callback(c)
+            m.text = "10 дней, запомни"
+            await self.ctl.handle_message(m)
+            self.assertIn("Применить и запомнить", buttons(m), msg=said(m))  # not "nothing to remember"
+            m2 = await self.tap(m, "Применить и запомнить")
+            await self.tap(m2, "Да, сохранить навсегда")
+            mine = [exp.decode(r)["effect"] for r in self.ctl.memory.entries() if r["status"] == "confirmed"][-1]
+            self.assertEqual(mine.get("set"), {"max_current_days": 10})  # only the touched number, no other numbers
+            self.assertEqual("excluded_wild" in mine, bool(extra))
+            self.assertEqual(self.latest()["plan"]["rules"]["max_current_days"], 10)
+            await self.plan()  # a brand-new plan now gets the newer remembered 10, not the old 6
+            self.assertEqual(self.latest()["plan"]["rules"]["max_current_days"], 10)
+
+    async def test_partial_effect_with_dependent_plan_settings_is_saved_applied_listed_and_revocable(self):
+        m, _ = await self.plan()
+        m2 = await self.step(m, araw([dict(type="set_number", key="max_days", value=30)]), "Применить")
+        m3 = await self.step(m2, araw([dict(type="set_number", key="target_days", value=20), dict(type="exclude_wild", wild="W2")],
+                                      scope="once_exception", expires_on="2099-01-01"), "Применить и запомнить")
+        rec = self.ctl.memory.entries()
+        self.assertEqual(len(rec), 1)
+        self.assertIsNotNone(exp.decode(rec[0]))  # not thrown away for failing on someone else's defaults
+        d = self.latest()
+        self.assertNotIn("W2", [ln["wild"] for ln in d["plan"]["lines"]])
+        self.assertEqual((d["plan"]["rules"]["target_days"], d["plan"]["rules"]["max_days"]), (20, 30))
+        self.assertTrue(d["plan"]["experience"][0]["applied"])
+        c, mm = cb(buttons(m3)["Память"], m3)
+        await self.ctl.handle_callback(c)
+        rv = [v for v in buttons(mm).values() if v.startswith("pl:rv:")]
+        self.assertEqual(len(rv), 1)
+        c, rm = cb(rv[0])
+        await self.ctl.handle_callback(c)
+        self.assertEqual([r["status"] for r in self.ctl.memory.entries()], ["revoked"])
+        self.assertIn("Запись отозвана", said(rm))
+        c, _ = cb(self.latest_keys(m3))
+        await self.ctl.handle_callback(c)
+        d = self.latest()
+        self.assertIn("W2", [ln["wild"] for ln in d["plan"]["lines"]])
+        self.assertEqual(d["plan"]["rules"]["max_days"], 30)  # the owner's own setting of this plan stays
+
+    async def remember_with_failures(self, recalc_fails, revoke_fails):
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        m, _ = await self.plan()
+        self.answers = [araw([dict(type="exclude_wild", wild="W2")], scope="once_exception", expires_on="2099-01-01")]
+        c, _ = cb(buttons(m)["Настройки"], m)
+        await self.ctl.handle_callback(c)
+        m.text = "запомни"
+        await self.ctl.handle_message(m)
+        c, m2 = cb(buttons(m)["Применить и запомнить"])
+        with ExitStack() as st:
+            if recalc_fails:
+                st.enter_context(patch.object(self.ctl, "_revise", AsyncMock(return_value=None)))
+            if revoke_fails:
+                st.enter_context(patch.object(self.ctl.memory, "revoke", side_effect=RuntimeError("db down")))
+            await self.ctl.handle_callback(c)
+        return said(m2), [r["status"] for r in self.ctl.memory.entries()]
+
+    async def test_recalc_failure_withdraws_the_record_and_says_so(self):
+        text, status = await self.remember_with_failures(recalc_fails=True, revoke_fails=False)
+        self.assertEqual(status, ["revoked"])
+        self.assertIn("запись отозвана", text.lower())
+
+    async def test_recalc_failure_with_failed_revoke_never_claims_the_record_is_revoked(self):
+        text, status = await self.remember_with_failures(recalc_fails=True, revoke_fails=True)
+        self.assertEqual(status, ["confirmed"])  # the record really is still active...
+        self.assertIn("НЕ удался", text)  # ...and the owner is told so, and where to fix it
+        self.assertIn("«Память»", text)
+        self.assertNotIn("Запись отозвана", text)
+
+    async def test_revoke_button_reports_revoked_only_after_the_status_changed(self):
+        from unittest.mock import patch
+        self.remember_global({"excluded_wild": ["W1"]})
+        rid = self.ctl.memory.entries()[0]["id"]
+        with patch.object(self.ctl.memory, "revoke", side_effect=RuntimeError("db down")):
+            c, m = cb(f"pl:rv:{rid}")
+            await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.memory.entries()[0]["status"], "confirmed")
+        self.assertNotIn("Запись отозвана", said(m))
+        with patch.object(self.ctl.memory, "revoke", return_value="revoked"):  # claims success, changes nothing
+            c, m = cb(f"pl:rv:{rid}")
+            await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.memory.entries()[0]["status"], "confirmed")
+        self.assertNotIn("Запись отозвана", said(m))
+        c, m = cb(f"pl:rv:{rid}")
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.memory.entries()[0]["status"], "revoked")
+        self.assertIn("Запись отозвана", said(m))
 
     async def test_expired_quantity_change_returns_to_the_owners_value_and_keeps_independent_settings(self):
         await self.mixed(expires_on="2020-01-01")  # term already over: nothing of the exception may remain

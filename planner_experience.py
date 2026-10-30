@@ -6,6 +6,7 @@ A structured entry is a normal planner_memory entry (kind "rule") whose text end
 shipments) and entries without a valid effect line never change a calculation. The owner's explicit settings of the
 current plan beat remembered numeric rules."""
 import json
+import math
 import re
 from datetime import date, timedelta
 
@@ -38,12 +39,13 @@ def changed_fixed(prev, new):
     return {fixed_id(f) for f in new["fixed"] if was.get((f["article"], f["cabinet"])) != _line(f)}
 
 
-def effect_between(old, new):
-    """(additive effect, has_removals) from base rules `old` to proposed rules `new`."""
+def effect_between(old, new, touched=()):
+    """(additive effect, has_removals) from base rules `old` to proposed rules `new`. A number the owner set explicitly
+    in this proposal (`touched`) is part of the effect even when it equals the base value; untouched numbers are not."""
     eff = {}
     add_w = [x for x in new["excluded_wild"] if x not in old["excluded_wild"]]
     add_c = [x for x in new["excluded_cabinets"] if x not in old["excluded_cabinets"]]
-    sets = {k: new[k] for k in _NUM + ("capacity",) if new[k] != old[k]}
+    sets = {k: new[k] for k in _NUM + ("capacity",) if new[k] != old[k] or k in touched}
     key = lambda f: (f["article"], f["cabinet"])  # noqa: E731
     was = {key(g): _line(g) for g in old["fixed"]}
     add_f = [f for f in new["fixed"] if was.get(key(f)) != _line(f)]  # new line OR changed quantity/reason of an existing one
@@ -137,6 +139,14 @@ def example_entry(owner_text, plan_id, plan_date):
                 target=plan_id, expires_on=None, kind="case")
 
 
+def _number_ok(k, v):
+    if k == "capacity":
+        return isinstance(v, int) and not isinstance(v, bool) and v in (20, 33)
+    return (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+            and v > 0 if k in planner._POSITIVE else
+            isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0)
+
+
 def decode(rec):
     """Structured effect of a memory record, or None (case entries and malformed lines are inert)."""
     if rec.get("kind") != "rule":
@@ -153,11 +163,15 @@ def decode(rec):
         for k in ("excluded_wild", "excluded_cabinets"):
             if k in eff and not (isinstance(eff[k], list) and all(isinstance(x, str) and x.strip() for x in eff[k])):
                 return None
-        if "set" in eff and not (isinstance(eff["set"], dict) and set(eff["set"]) <= set(_NUM) | {"capacity"}):
+        if "set" in eff and not (isinstance(eff["set"], dict) and set(eff["set"]) <= set(_NUM) | {"capacity"}
+                                 and all(_number_ok(k, v) for k, v in eff["set"].items())):
             return None
-        if "fixed" in eff and not isinstance(eff["fixed"], list):
-            return None
-        planner.validate_rules({**planner.default_rules(), **{k: eff[k] for k in eff if k != "set"}, **eff.get("set", {})})
+        if "fixed" in eff:
+            if not isinstance(eff["fixed"], list):
+                return None
+            planner.validate_rules({"fixed": eff["fixed"]})
+        # Only the record's own structure is checked here. Whether its numbers fit TOGETHER with this plan's other
+        # settings (e.g. target_days <= max_days) depends on the plan, so merge() decides that and says so visibly.
     except (ValueError, KeyError, TypeError):
         return None
     return {"category": cat, "effect": eff}
