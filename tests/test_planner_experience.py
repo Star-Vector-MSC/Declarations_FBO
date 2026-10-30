@@ -54,6 +54,20 @@ class UnitTests(unittest.TestCase):
         self.assertFalse(exp.persistable("example", eff, False)[0])
         self.assertFalse(exp.persistable("once_exception", {}, False)[0])
 
+    def test_effect_between_and_without_effect_compare_line_values_not_only_keys(self):
+        old = planner.default_rules()
+        old["fixed"] = [dict(article="A1", cabinet="K", quantity=6, reason="r"), dict(article="A2", cabinet="K", quantity=4, reason="r")]
+        new = planner.default_rules()
+        new["fixed"] = [dict(article="A1", cabinet="K", quantity=12, reason="r"), dict(article="A2", cabinet="K", quantity=4, reason="r")]
+        eff, removed = exp.effect_between(old, new)
+        self.assertEqual(eff, {"fixed": [dict(article="A1", cabinet="K", quantity=12, reason="r")]})
+        self.assertFalse(removed)
+        new["fixed"][1]["reason"] = "другая причина"  # a changed reason is a changed line too
+        self.assertEqual(len(exp.effect_between(old, new)[0]["fixed"]), 2)
+        back = exp.without_effect(new, eff, old)
+        self.assertEqual([(f["article"], f["quantity"]) for f in back["fixed"]], [("A1", 6), ("A2", 4)])
+        self.assertEqual(exp.without_effect(new, eff)["fixed"][0]["article"], "A2")  # no prior: a pure addition is dropped
+
     def test_confirmed_only_pending_rejected_revoked_expired_are_ignored(self):
         self.add(confirm=False)
         pend = self.add(confirm=False)[0]
@@ -368,6 +382,88 @@ class ExperienceFlowTests(UiBase):
             c, mm = cb(nxt)
             await self.ctl.handle_callback(c)
         self.assertEqual(pages, 2)
+
+    # --- a remembered change of an EXISTING required line (value, not only key) ------------------------------------
+    async def step(self, m2, answer, label):
+        """Owner opens settings on the latest plan message, sends text, taps `label` -> message of the shown new version."""
+        self.answers = [answer]
+        c, _ = cb(buttons(m2)["Настройки"], m2)
+        await self.ctl.handle_callback(c)
+        m2.text = "правка"
+        await self.ctl.handle_message(m2)
+        return await self.tap(m2, label)
+
+    @staticmethod
+    def fx(rules):
+        return sorted((f["article"], f["quantity"]) for f in rules["fixed"])
+
+    @staticmethod
+    def qty(d, art):
+        return [ln["quantity"] for ln in d["plan"]["lines"] if ln["article"] == art]
+
+    async def mixed(self, expires_on="2099-01-01"):
+        """Plan v2: the owner's own A1×6 and max_current_days=8; then ONE remembered proposal: A1 6->12 + W2 excluded."""
+        m, _ = await self.plan()
+        add = lambda art, q: dict(type="add_fixed", article=art, cabinet="Каб", quantity=q, reason="по поручению")  # noqa: E731
+        m2 = await self.step(m, araw([add("A1", 6), dict(type="set_number", key="max_current_days", value=8)]),
+                             "Применить")
+        before = self.latest()
+        self.assertEqual(self.fx(before["plan"]["base_rules"]), [("A1", 6)])
+        m3 = await self.step(m2, araw([add("A1", 12), dict(type="exclude_wild", wild="W2")], scope="once_exception",
+                                      expires_on=expires_on), "Применить и запомнить")
+        return m3
+
+    async def test_remembered_quantity_change_is_carried_by_memory_not_by_base_rules(self):
+        m3 = await self.mixed()
+        d = self.latest()
+        self.assertEqual(self.fx(d["plan"]["base_rules"]), [("A1", 6)])  # the owner's own values, not the exception
+        self.assertEqual(d["plan"]["base_rules"]["excluded_wild"], [])
+        self.assertEqual(self.qty(d, "A1"), [12])  # ...yet the plan uses the remembered 12
+        self.assertNotIn("W2", [ln["wild"] for ln in d["plan"]["lines"]])
+        self.assertEqual(d["plan"]["rules"]["max_current_days"], 8)
+        rec = self.ctl.memory.entries()
+        self.assertEqual(len(rec), 1)
+        self.assertEqual(exp.decode(rec[0])["effect"]["fixed"], [dict(article="A1", cabinet="Каб", quantity=12, reason="по поручению")])
+        c, _ = cb(self.latest_keys(m3))  # a later recalculation keeps the same result
+        await self.ctl.handle_callback(c)
+        d = self.latest()
+        self.assertEqual((self.qty(d, "A1"), self.fx(d["plan"]["base_rules"])), ([12], [("A1", 6)]))
+        self.assertNotIn("W2", [ln["wild"] for ln in d["plan"]["lines"]])
+
+    async def test_revoked_quantity_change_returns_to_the_owners_value_and_keeps_independent_settings(self):
+        m3 = await self.mixed()
+        self.ctl.memory.revoke(self.ctl.memory.entries()[0]["id"])
+        c, _ = cb(self.latest_keys(m3))
+        await self.ctl.handle_callback(c)
+        d = self.latest()
+        self.assertEqual(self.qty(d, "A1"), [6])
+        self.assertIn("W2", [ln["wild"] for ln in d["plan"]["lines"]])
+        self.assertEqual(self.fx(d["plan"]["rules"]), [("A1", 6)])
+        self.assertEqual(d["plan"]["rules"]["max_current_days"], 8)  # the owner's explicit number stays
+        self.assertEqual(d["plan"]["experience"], [])
+
+    async def test_expired_quantity_change_returns_to_the_owners_value_and_keeps_independent_settings(self):
+        await self.mixed(expires_on="2020-01-01")  # term already over: nothing of the exception may remain
+        d = self.latest()
+        self.assertEqual(self.qty(d, "A1"), [6])
+        self.assertIn("W2", [ln["wild"] for ln in d["plan"]["lines"]])
+        self.assertEqual(self.fx(d["plan"]["rules"]), [("A1", 6)])
+        self.assertEqual(d["plan"]["rules"]["max_current_days"], 8)
+        self.assertEqual(d["plan"]["experience"], [])
+
+    async def test_owners_later_change_of_the_same_line_beats_the_remembered_value(self):
+        m3 = await self.mixed()
+        add = dict(type="add_fixed", article="A1", cabinet="Каб", quantity=18, reason="новое поручение")
+        await self.step(m3, araw([add]), "Применить")
+        d = self.latest()
+        self.assertEqual(self.qty(d, "A1"), [18])  # this plan's own, newer decision wins over the remembered one
+        self.assertNotIn("W2", [ln["wild"] for ln in d["plan"]["lines"]])  # the unrelated exclusion still applies
+        self.ctl.memory.revoke(self.ctl.memory.entries()[0]["id"])
+        c, _ = cb(self.latest_keys(m3))
+        await self.ctl.handle_callback(c)
+        d = self.latest()
+        self.assertEqual(self.qty(d, "A1"), [18])
+        self.assertIn("W2", [ln["wild"] for ln in d["plan"]["lines"]])
 
     def seed_long_rules(self, n=5, wilds=12, width=70):
         for r in range(n):  # n permanent rules x `wilds` long-named wilds: their summaries alone exceed 4096 chars

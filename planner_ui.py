@@ -271,7 +271,7 @@ class PlannerController:
     async def _show(self, msg, d):
         await msg.answer(preview_text(d), reply_markup=self._keys(d))
 
-    def _build(self, uid, rules, day, wh, arrival=None, draft=None, touched=(), alive=None):  # worker thread
+    def _build(self, uid, rules, day, wh, arrival=None, draft=None, touched=(), release=(), alive=None):  # worker thread
         self._mem_ok()
         snap = self.sheets.snapshot()
         if wh is not None and wh not in snap["warehouses"]:
@@ -283,6 +283,9 @@ class PlannerController:
         explicit = set(draft["plan"].get("explicit_keys") or ()) if draft else {"capacity"}  # the wizard asks for it
         explicit |= {k for k in exp.NUMERIC + ("capacity",) if prev is not None and norm[k] != prev[k]}
         explicit |= set(touched)
+        explicit -= set(release)  # lines the owner has just handed to memory: the new remembered decision replaces their old pin
+        if prev is not None:  # a required line the owner added/changed in this plan is theirs: memory does not override it
+            explicit |= exp.changed_fixed(prev, norm)
         effective, experience = exp.merge(rules, selected, explicit)
         plan = planner.build_plan(snap, effective, day, wh, arrival)
         plan["base_rules"], plan["experience"], plan["explicit_keys"] = norm, experience, sorted(explicit)
@@ -656,11 +659,11 @@ class PlannerController:
                     planner._norm(x) for x in base["excluded_cabinets"]}
         return out
 
-    async def _revise(self, uid, ct, msg, d, rules, warehouse=..., touched=()):
+    async def _revise(self, uid, ct, msg, d, rules, warehouse=..., touched=(), release=()):
         p = d["plan"]
         ok, new = await self._guarded(uid, ct, msg, self._build, uid, rules, p["date"],
                                       p["warehouse"] if warehouse is ... else warehouse,
-                                      p.get("arrival_date"), d, tuple(touched), live=True)
+                                      p.get("arrival_date"), d, tuple(touched), tuple(release), live=True)
         if ok:
             try:
                 await msg.answer("Пересчитано: сохранена новая неизменяемая версия (в таблицу ничего не записано).")
@@ -784,7 +787,8 @@ class PlannerController:
         if not ok:
             await asyncio.to_thread(withdraw)
             return
-        new = await self._revise(uid, ct, msg, d, exp.without_effect(rules, memo["effect"]), touched=touched)
+        new = await self._revise(uid, ct, msg, d, exp.without_effect(rules, memo["effect"], base_rules(d)), touched=touched,
+                                 release=[exp.fixed_id(f) for f in memo["effect"].get("fixed", ())])
         if new is None:
             await asyncio.to_thread(withdraw)  # the plan could not be rebuilt: the remembered decision is withdrawn again
             await msg.answer("Запомнить не получилось: план с этим правилом не рассчитан, запись отозвана.")

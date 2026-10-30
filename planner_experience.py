@@ -24,6 +24,20 @@ _NUM = NUMERIC = ("min_sales", "max_current_days", "min_wild_days", "target_days
 _EFFECT_KEYS = {"excluded_wild", "excluded_cabinets", "set", "fixed"}
 
 
+def _line(f):
+    return (f["quantity"], f["reason"])
+
+
+def fixed_id(f):
+    return f"fixed:{f['article']}/{f['cabinet']}"
+
+
+def changed_fixed(prev, new):
+    """Ids of required lines of `new` that are new or differ in value (quantity/reason) from `prev`."""
+    was = {(g["article"], g["cabinet"]): _line(g) for g in prev["fixed"]}
+    return {fixed_id(f) for f in new["fixed"] if was.get((f["article"], f["cabinet"])) != _line(f)}
+
+
 def effect_between(old, new):
     """(additive effect, has_removals) from base rules `old` to proposed rules `new`."""
     eff = {}
@@ -31,7 +45,8 @@ def effect_between(old, new):
     add_c = [x for x in new["excluded_cabinets"] if x not in old["excluded_cabinets"]]
     sets = {k: new[k] for k in _NUM + ("capacity",) if new[k] != old[k]}
     key = lambda f: (f["article"], f["cabinet"])  # noqa: E731
-    add_f = [f for f in new["fixed"] if key(f) not in {key(g) for g in old["fixed"]}]
+    was = {key(g): _line(g) for g in old["fixed"]}
+    add_f = [f for f in new["fixed"] if was.get(key(f)) != _line(f)]  # new line OR changed quantity/reason of an existing one
     for name, val in (("excluded_wild", add_w), ("excluded_cabinets", add_c), ("set", sets), ("fixed", add_f)):
         if val:
             eff[name] = val
@@ -41,15 +56,24 @@ def effect_between(old, new):
     return eff, removed
 
 
-def without_effect(rules, effect):
+def without_effect(rules, effect, prior=None):
     """`rules` minus the list-type parts of `effect` (excluded wild/cabinets, fixed lines): a remembered decision is
-    carried by memory alone, so expiry or revocation removes it from the base rules too. Numbers stay as the owner's
-    own explicit values."""
+    carried by memory alone, so expiry or revocation removes it from the base rules too. A required line the effect
+    changed returns to its value in `prior` (the owner's rules before the proposal); one it added is dropped. Numbers
+    stay as the owner's own explicit values."""
     out = json.loads(json.dumps(rules))
     out["excluded_wild"] = [x for x in out["excluded_wild"] if x not in effect.get("excluded_wild", ())]
     out["excluded_cabinets"] = [x for x in out["excluded_cabinets"] if x not in effect.get("excluded_cabinets", ())]
     drop = {(f["article"], f["cabinet"]) for f in effect.get("fixed", ())}
-    out["fixed"] = [f for f in out["fixed"] if (f["article"], f["cabinet"]) not in drop]
+    was = {(g["article"], g["cabinet"]): g for g in (prior or {}).get("fixed", ())}
+    fixed = []
+    for f in out["fixed"]:
+        k = (f["article"], f["cabinet"])
+        if k not in drop:
+            fixed.append(f)
+        elif k in was:
+            fixed.append(json.loads(json.dumps(was[k])))
+    out["fixed"] = fixed
     return out
 
 
@@ -175,7 +199,18 @@ def merge(base, selected, explicit=()):
             else:
                 cand[k] = v
         key = lambda f: (f["article"], f["cabinet"])  # noqa: E731
-        cand["fixed"] = cand["fixed"] + [f for f in eff.get("fixed", ()) if key(f) not in {key(g) for g in cand["fixed"]}]
+        have = {key(g): g for g in cand["fixed"]}
+        swap = {}
+        for f in eff.get("fixed", ()):
+            g = have.get(key(f))
+            if g is None:
+                continue
+            if fixed_id(f) in explicit:  # the owner's own value of this line in this plan beats the remembered one
+                kept[fixed_id(f)] = g["quantity"]
+            elif _line(g) != _line(f):
+                swap[key(f)] = f
+        cand["fixed"] = ([swap.get(key(g), g) for g in cand["fixed"]]
+                         + [f for f in eff.get("fixed", ()) if key(f) not in have])
         try:
             rules = planner.validate_rules(cand)
         except ValueError as e:
