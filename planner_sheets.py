@@ -128,9 +128,11 @@ def _scalar(f):
     return opnd and depth == 0
 
 
-def _shift(f, dr, dc):
+def _shift(f, dr, dc, cmap=None):
     """Verified scalar formula text with relative cell refs moved by (rows, columns), as a paste would do; None if a ref
-    leaves the sheet. Absolute ($) parts stay put."""
+    leaves the sheet. Absolute ($) parts stay put. With cmap {source column: target column} (1-based, built from
+    header names when the two sheets' layouts differ) every column ref is translated by name instead; a ref to a
+    column that has no counterpart makes the formula unusable (None)."""
     bad = []
 
     def one(m):
@@ -138,7 +140,11 @@ def _shift(f, dr, dc):
         n = 0
         for ch in col.upper():
             n = n * 26 + ord(ch) - 64
-        n, r = n + (0 if ca else dc), int(row) + (0 if ra else dr)
+        if cmap is not None:
+            n = cmap.get(n, 0)
+        else:
+            n = n + (0 if ca else dc)
+        r = int(row) + (0 if ra else dr)
         if not 1 <= n <= 18278 or r < 1:
             bad.append(1)
             return m.group(0)
@@ -183,6 +189,34 @@ def _bind(header, names, where):
             raise PlannerSheetsError(f"Лист «{where}»: столбец «{n}» ожидается {want[k]} раз, найдено {len(found)}")
         out[(k, seen[k])] = found[seen[k]]
         seen[k] += 1
+    return out
+
+
+_ORIG_ALIAS = {_c("Название магазина", 1): "Название предмета"}  # owner renamed the duplicate column (2026-11)
+
+
+def _bind_orig(header):
+    """key (as in ORIGINAL) -> column of the live original sheet. Strict first; if the owner has changed the layout
+    (renamed duplicate «Название магазина», inserted columns) bind by header names with the known alias. Columns
+    that are not in ORIGINAL are ignored; anything still missing or ambiguous is an error."""
+    try:
+        return _bind(header, ORIGINAL, T_ORIG)
+    except PlannerSheetsError:
+        pass
+    seen, keys, names = Counter(), [], []
+    for n in ORIGINAL:
+        k = planner._norm(n)
+        key = (k, seen[k])
+        seen[k] += 1
+        keys.append(key)
+        names.append(_ORIG_ALIAS.get(key, n))
+    got = _bind(header, names, T_ORIG)
+    cnt = Counter()
+    out = {}
+    for key, n in zip(keys, names):
+        k = planner._norm(n)
+        out[key] = got[(k, cnt[k])]
+        cnt[k] += 1
     return out
 
 
@@ -408,7 +442,7 @@ class PlannerSheets:
         if any(isinstance(c, str) and c.startswith("=") and not _scalar(c) for r in rows for c in r):
             raise PlannerSheetsError("В тестовом листе есть формулы сложнее простой арифметики; "
                                      "дописывать строки небезопасно")
-        oc = _bind(orig[0], ORIGINAL, T_ORIG)
+        oc = _bind_orig(orig[0])
         act = oc[_c(ORIGINAL[0])]
         tpl = max((i for i in range(1, len(orig)) if not planner._blank(_cell(orig[i], act))), default=None)
         n, width, rc = len(plan["lines"]), max(cols.values()) + 1, ids[T_TARGET]["rows"]
@@ -434,10 +468,11 @@ class PlannerSheets:
                 vals = d["sheets"][0]["data"][0].get("rowData", [])[0].get("values", [])
             except (KeyError, IndexError, TypeError, AttributeError):
                 vals = []
+            cmap = {oc[k] + 1: cols[k] + 1 for k in oc}  # source column -> same-named column of the test sheet
             for key, ocol in oc.items():
                 f = ((vals[ocol] if ocol < len(vals) else {}).get("userEnteredValue") or {}).get("formulaValue")
                 if f and key not in per[0] and _scalar(f):  # unverifiable formulas are skipped, never written
-                    texts = [_shift(f, start + i - tpl, cols[key] - ocol) for i in range(n)]
+                    texts = [_shift(f, start + i - tpl, 0, cmap) for i in range(n)]
                     if None not in texts:
                         fcells[key] = texts
         for key, texts in fcells.items():
