@@ -40,6 +40,15 @@ class FakeSheets:
         self.published.append((draft["id"], draft["version"]))
         return "https://docs.google.com/spreadsheets/d/x/edit#gid=1&range=A3"
 
+    def reconcile(self, draft, rejected_before=(), apply=False):
+        self.reconciled = getattr(self, "reconciled", []) + [(draft["id"], tuple(rejected_before), apply)]
+        s = {"removed": [("A1", "Каб", 48)], "kept": 1, "total_pallets": 1.5, "capacity": 33, "warnings": [],
+             "added": [{"article": "A3", "cabinet": "Каб", "quantity": 40, "pallets": 1}],
+             "refused": sorted({("A1", "Каб")} | set(rejected_before))}
+        if apply:
+            s["url"] = "https://docs.google.com/spreadsheets/d/x/edit#gid=1&range=A2"
+        return s
+
 
 def msg(text, uid=OWNER):
     return SimpleNamespace(from_user=SimpleNamespace(id=uid), chat=SimpleNamespace(type=ChatType.PRIVATE), text=text,
@@ -570,6 +579,49 @@ class EditPublishTests(UiBase):
         await self.ctl.handle_callback(c)
         self.assertIn("Не отгружать зимой", said(m3))
         self.assertNotIn("Вентиляторы", said(m3))  # pending is never effective
+
+
+class UpdateFromSheetTests(UiBase):
+    async def exported(self):
+        m, b = await self.plan()
+        did, ver = b["Состав"].split(":")[2:4]
+        for data in (f"pl:pub:{did}:{ver}", f"pl:ok:{did}:{ver}"):
+            c, _ = cb(data, m)
+            await self.ctl.handle_callback(c)
+        c, m2 = cb(f"pl:op:{did}:{ver}", m)
+        await self.ctl.handle_callback(c)
+        return did, ver, m2
+
+    async def test_button_appears_only_after_export_and_update_needs_confirmation(self):
+        m, b = await self.plan()
+        self.assertNotIn("Обновить по листу", b)  # not written yet
+        did, ver, m2 = await self.exported()
+        up = buttons(m2)["Обновить по листу"]
+        self.assertEqual(up, f"pl:up:{did}:{ver}")
+        c, m3 = cb(f"pl:uk:{did}:{ver}", m2)  # confirm without the preview step
+        await self.ctl.handle_callback(c)
+        self.assertIn("Сначала нажмите", said(m3))
+        self.assertFalse(any(x[2] for x in getattr(self.sheets, "reconciled", [])))
+        c, m4 = cb(up, m2)
+        await self.ctl.handle_callback(c)
+        self.assertIn("– A1 · Каб · 48 шт", said(m4))
+        self.assertIn("+ A3 · Каб · 40 шт", said(m4))
+        self.assertFalse(any(x[2] for x in self.sheets.reconciled))  # preview writes nothing
+        c, m5 = cb(buttons(m4)["Подтвердить обновление"], m4)
+        await self.ctl.handle_callback(c)
+        self.assertTrue(self.sheets.reconciled[-1][2])
+        self.assertIn("range=A2", said(m5))
+        self.assertEqual(self.ctl.store.rejected(OWNER, did), [("A1", "Каб")])  # remembered: never proposed again
+        c, m6 = cb(f"pl:uk:{did}:{ver}", m4)  # replay of the confirm button
+        await self.ctl.handle_callback(c)
+        self.assertIn("Сначала нажмите", said(m6))
+
+    async def test_up_before_export_is_refused(self):
+        m, b = await self.plan()
+        did, ver = b["Состав"].split(":")[2:4]
+        c, m2 = cb(f"pl:up:{did}:{ver}", m)
+        await self.ctl.handle_callback(c)
+        self.assertIn("Сначала запишите", said(m2))
 
 
 class ParserTests(unittest.TestCase):

@@ -35,7 +35,7 @@ def fx(a, q, reason="promo", cab="C1"):
 
 
 def bp(*a, **k):  # these tests are about thresholds/packing, not the minimum-line practice (tested separately)
-    return P.build_plan(*a, **{"min_line_qty": 0, **k})
+    return P.build_plan(*a, **{"min_line_qty": 0, "min_cover": 0, **k})
 
 
 INVALID_GROUPS = (None, "", "   ", "\t\n", 0, 5, 5.0, -1.5, True, False, [], ["Item"], {}, {"g": "Item"},

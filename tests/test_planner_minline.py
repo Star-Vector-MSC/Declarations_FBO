@@ -67,3 +67,20 @@ class RatingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CrumbTest(unittest.TestCase):
+    def build(self, **kw):
+        # a fixed line takes 19 of 20 pallets; w2 needs ~5000 pcs but only 1 pallet (1000 pcs) of space is left
+        trows = [T("w1", "A1", stock=100000, s=(10, 10, 10, 10), fc=0), T("w2", "A2", stock=100000, s=(1000, 1000, 1000, 1000), fc=5)]
+        prows = [PK("w1", box=10, pal=100), PK("w2", box=10, pal=1000)]
+        rules = {"capacity": 20, "fixed": [{"article": "A1", "cabinet": "C1", "quantity": 1900, "reason": "x"}]}
+        return P.build_plan(snap(trows, prows), rules, "2026-11-05", "WH", None, min_line_qty=0, **kw)
+
+    def test_leftover_sliver_is_not_shipped_as_a_crumb(self):
+        r = self.build()
+        self.assertEqual([ln["article"] for ln in r["lines"]], ["A1"])
+        self.assertTrue(any("A2" in w and "only" in w for w in r["warnings"]))
+
+    def test_threshold_can_be_switched_off(self):
+        self.assertEqual([ln["article"] for ln in self.build(min_cover=0)["lines"]], ["A1", "A2"])

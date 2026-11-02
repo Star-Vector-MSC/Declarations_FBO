@@ -239,6 +239,21 @@ def _draft(d):
     return did, ver, plan
 
 
+def _cells(did, ver, plan, ln):
+    """The ONE owned cell map (input columns only: the sheet's own header formulas compute the rest)."""
+    sd, arr, rules = _serial(plan["date"]), _serial(plan.get("arrival_date")), _canon(plan["rules"])
+    return {_c("Дата отгрузки (склад)"): _dv(sd), _c("Сборка товара (Склад)"): _dv(sd - 1),
+            _c("Плановая дата прибытия авто на вб"): _dv(arr),
+            _c("Склад Wildberries"): _sv(plan["warehouse"]), _c("Статус отгрузки"): _sv("Одобрено"),
+            _c("wild"): _sv(ln["wild"]), _c("Артикул"): _art(ln["article"]),
+            _c("Название магазина"): _sv(ln["cabinet"]), _c("Название предмета"): _sv(ln["product"]),
+            _c("Тип поставки"): _sv("Монопаллета"), _c("К отгрузке"): _nv(ln["quantity"]),
+            _c("ID плана"): _sv(did), _c("Версия плана"): _nv(ver),
+            _c("Прогноз до"): _nv(ln["forecast_before"]), _c("Прогноз после"): _nv(ln["forecast_after"]),
+            _c("Причина"): _sv(ln["reason"]), _c("Снимок данных"): _sv(plan["source_hash"]),
+            _c("Правила плана"): _sv(rules)}
+
+
 def _guard(reqs, tid, r0, r1):
     """Every write destination and copy source must be the test sheet, cells only inside the rows inserted at [r0, r1).
     The original sheet is never a source or destination of a write (formulas are written as verified text)."""
@@ -392,6 +407,94 @@ class PlannerSheets:
     def _link(self, tid, row):
         return f"https://docs.google.com/spreadsheets/d/{self._config()[0]}/edit#gid={tid}&range=A{row}"
 
+    def reconcile(self, draft, rejected_before=(), apply=False):
+        """After the owner marked rows «Не согласовано» in the test sheet: drop those rows, keep the rest and append new
+        lines to fill the machine. apply=False only computes the summary. Rows are compacted by copying cells upwards
+        and clearing the tail: a row is never deleted, because deleting row 2 breaks the header formulas ($K$2 -> #REF!)."""
+        did, ver, plan = _draft(draft)
+        ids = self._meta()
+        tid, rc = ids[T_TARGET]["sheetId"], ids[T_TARGET]["rows"]
+        rows = self._values((T_TARGET,), "FORMULA")[0]
+        if not rows:
+            raise PlannerSheetsError("В тестовом листе нет заголовков")
+        head = self._values((T_TARGET,), "UNFORMATTED_VALUE", head=True)[0] or [[]]
+        cols = _bind(_heads(head[0], rows[0]), ORIGINAL + META, T_TARGET)
+
+        def g(i, n):
+            return _cell(rows[i], cols[_c(n)])
+
+        data = [i for i in range(1, len(rows)) if any(not planner._blank(c) and c is not False for c in rows[i])]
+        mine = [i for i in data if planner._ident(g(i, "ID плана")) == did]
+        if not mine:
+            raise PlannerSheetsError("Строк этого плана нет в тестовом листе: сначала запишите план.")
+        if len(mine) != len(data):
+            raise PlannerSheetsError("В тестовом листе есть строки не этого плана. Обновление по листу работает, когда "
+                                     "в листе один план: уберите лишние строки.")
+        refused = [i for i in mine if _s(g(i, "Статус отгрузки")) == "Не согласовано"]
+        kept = [i for i in mine if i not in set(refused)]
+
+        def ident(i):
+            return str(planner._ident(g(i, "Артикул"))), str(planner._ident(g(i, "Название магазина")))
+
+        fixed = []
+        for i in kept:
+            q = planner._num(g(i, "К отгрузке"))
+            if q is None or q <= 0 or q.denominator != 1:
+                raise PlannerSheetsError(f"Строка {i + 1}: «К отгрузке» должно быть целым положительным числом.")
+            fixed.append({"article": ident(i)[0], "cabinet": ident(i)[1], "quantity": int(q), "reason": "kept by owner"})
+        excl = {tuple(x) for x in rejected_before} | {ident(i) for i in refused}
+        fresh, _orig = self._read()
+        rules = dict(plan["rules"])
+        rules["fixed"] = fixed
+        try:
+            new = planner.build_plan(fresh, rules, plan["date"], plan["warehouse"], plan.get("arrival_date"), exclude=excl)
+        except ValueError as e:
+            raise PlannerSheetsError("Не удалось пересчитать состав: " + str(e)[:200]) from None
+        added = [ln for ln in new["lines"] if not ln["fixed"]]
+        summary = {"removed": [(*ident(i), planner._num(g(i, "К отгрузке"))) for i in refused], "kept": len(kept),
+                   "added": added, "total_pallets": new["total_pallets"], "capacity": plan["rules"]["capacity"],
+                   "warnings": new["warnings"][:5], "refused": sorted(excl)}
+        summary["removed"] = [(a, c, None if q is None else int(q)) for a, c, q in summary["removed"]]
+        if not apply:
+            return summary
+        if refused or added:
+            tc = [i for i, c in enumerate(rows[0]) if not planner._blank(c) and not (isinstance(c, str) and c.startswith("="))]
+            runs = []
+            for i in tc:
+                if runs and i == runs[-1][1]:
+                    runs[-1][1] = i + 1
+                else:
+                    runs.append([i, i + 1])
+
+            def region(r0, r1, a, b):
+                return {"sheetId": tid, "startRowIndex": r0, "endRowIndex": r1, "startColumnIndex": a, "endColumnIndex": b}
+            last, start = data[-1] + 1, 1 + len(kept)
+            end = start + len(added)
+            reqs = [{"appendDimension": {"sheetId": tid, "dimension": "ROWS", "length": end - rc}}] if end > rc else []
+            for j, src in enumerate(kept):
+                if src != 1 + j:
+                    reqs += [{"copyPaste": {"source": region(src, src + 1, a, b), "destination": region(1 + j, 2 + j, a, b),
+                                            "pasteType": "PASTE_NORMAL", "pasteOrientation": "NORMAL"}} for a, b in runs]
+            if last > start:
+                reqs += [{"updateCells": {"range": region(start, last, a, b), "fields": "userEnteredValue",
+                                          "rows": [{"values": [{} for _ in range(b - a)]} for _ in range(last - start)]}}
+                         for a, b in runs]
+            per = [_cells(did, ver, plan, ln) for ln in added]
+            for key in (per[0] if per else {}):
+                c = cols[key]
+                dated = "userEnteredFormat" in per[0][key]
+                reqs.append({"updateCells": {"range": region(start, end, c, c + 1), "rows": [{"values": [p[key]]} for p in per],
+                                             "fields": "userEnteredValue" + ",userEnteredFormat.numberFormat" * dated}})
+            for r in reqs:
+                (kind, b), = r.items()
+                dst = {"appendDimension": b, "copyPaste": b.get("destination"), "updateCells": b.get("range")}[kind]
+                src = b["source"]["sheetId"] if kind == "copyPaste" else tid
+                if dst.get("sheetId") != tid or src != tid or dst.get("startRowIndex", 1) < 1:
+                    raise PlannerSheetsError("Внутренняя проверка: запись вне тестового листа или в строку заголовков запрещена")
+            self._api("POST", ":batchUpdate", body={"requests": reqs})
+        summary["url"] = self._link(tid, 2)
+        return summary
+
     def publish(self, draft):
         did, ver, plan = _draft(draft)
         ids = self._meta()
@@ -406,19 +509,8 @@ class PlannerSheets:
         def g(r, n, o=0):
             return _cell(r, cols[_c(n, o)])
 
-        sd, arr, rules = _serial(plan["date"]), _serial(plan.get("arrival_date")), _canon(plan["rules"])
-
-        def cells(ln):  # the ONE owned cell map (input columns only: the sheet's own header formulas compute the rest)
-            return {_c("Дата отгрузки (склад)"): _dv(sd), _c("Сборка товара (Склад)"): _dv(sd - 1),
-                    _c("Плановая дата прибытия авто на вб"): _dv(arr),
-                    _c("Склад Wildberries"): _sv(plan["warehouse"]), _c("Статус отгрузки"): _sv("Одобрено"),
-                    _c("wild"): _sv(ln["wild"]), _c("Артикул"): _art(ln["article"]),
-                    _c("Название магазина"): _sv(ln["cabinet"]), _c("Название предмета"): _sv(ln["product"]),
-                    _c("Тип поставки"): _sv("Монопаллета"), _c("К отгрузке"): _nv(ln["quantity"]),
-                    _c("ID плана"): _sv(did), _c("Версия плана"): _nv(ver),
-                    _c("Прогноз до"): _nv(ln["forecast_before"]), _c("Прогноз после"): _nv(ln["forecast_after"]),
-                    _c("Причина"): _sv(ln["reason"]), _c("Снимок данных"): _sv(plan["source_hash"]),
-                    _c("Правила плана"): _sv(rules)}
+        def cells(ln):
+            return _cells(did, ver, plan, ln)
 
         per = [cells(ln) for ln in plan["lines"]]
         keys, need = list(per[0]), ("ID плана", "Версия плана", "Снимок данных", "Правила плана")

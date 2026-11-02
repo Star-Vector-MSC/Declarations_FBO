@@ -92,8 +92,22 @@ class FakeSession:
                         rows.append([])
                     rr = rows[g["startRowIndex"] + k]
                     rr.extend([""] * (c + 1 - len(rr)))
-                    v = row["values"][0].get("userEnteredValue", {})
-                    rr[c] = v.get("stringValue", v.get("numberValue", v.get("formulaValue", "")))
+                    for j, cell in enumerate(row["values"]):
+                        rr.extend([""] * (c + j + 1 - len(rr)))
+                        v = cell.get("userEnteredValue", {})
+                        rr[c + j] = v.get("stringValue", v.get("numberValue", v.get("formulaValue", "")))
+            cp = r.get("copyPaste")
+            if cp and cp["pasteType"] == "PASTE_NORMAL":
+                s, d = cp["source"], cp["destination"]
+                for k in range(s["endRowIndex"] - s["startRowIndex"]):
+                    for j in range(s["endColumnIndex"] - s["startColumnIndex"]):
+                        sr = rows[s["startRowIndex"] + k] if s["startRowIndex"] + k < len(rows) else []
+                        val = sr[s["startColumnIndex"] + j] if s["startColumnIndex"] + j < len(sr) else ""
+                        while len(rows) <= d["startRowIndex"] + k:
+                            rows.append([])
+                        dr = rows[d["startRowIndex"] + k]
+                        dr.extend([""] * (d["startColumnIndex"] + j + 1 - len(dr)))
+                        dr[d["startColumnIndex"] + j] = val
 
 
 class GatewayTest(unittest.TestCase):
@@ -362,3 +376,67 @@ class HeaderLabelsTest(unittest.TestCase):
         self.assertEqual(ps._heads(["a", "b"], ["a", "b"]), ["a", "b"])  # plain headers untouched
         ok = ["x", "Шт в коробе", "Итого коробов", "Шт на паллете", "y"]
         self.assertEqual(ps._heads(ok, f), ok)  # shown labels win
+
+
+class ReconcileTest(unittest.TestCase):
+    def setUp(self):
+        self.old = sys.modules.get("wb_declarations")
+        sys.modules["wb_declarations"] = types.SimpleNamespace(KEY="unused", SHIPMENTS=("fake-base", 100))
+        self.s = FakeSession()
+        self.gw = ps.PlannerSheets(session=self.s)
+        plan = planner.build_plan(self.gw.snapshot(), {}, "2026-11-02", "Коледино")
+        self.draft = {"id": "abcdef012345", "version": 1, "plan": json.loads(json.dumps(plan))}
+        self.s.tabs[ps.T_TARGET] = [list(ps.ORIGINAL + ps.META)]  # an empty test sheet: only the header
+        self.s.rc = 50
+        self.gw.publish(self.draft)
+
+    def tearDown(self):
+        if self.old is None:
+            sys.modules.pop("wb_declarations", None)
+        else:
+            sys.modules["wb_declarations"] = self.old
+
+    def art(self, i):
+        return self.s.tabs[ps.T_TARGET][i][COL("Артикул")]
+
+    def mark(self, i, text="Не согласовано"):
+        self.s.tabs[ps.T_TARGET][i][COL("Статус отгрузки")] = text
+
+    def test_plan_is_in_the_sheet_and_nothing_refused_means_nothing_to_do(self):
+        self.assertEqual([self.art(1), self.art(2)], ["A1", 12345])
+        n = len(self.s.posts)
+        r = self.gw.reconcile(self.draft, apply=True)
+        self.assertEqual((r["removed"], r["kept"], r["added"]), ([], 2, []))
+        self.assertEqual(len(self.s.posts), n)  # no write at all
+
+    def test_refused_row_is_removed_kept_rows_move_up_and_new_goods_go_to_the_end(self):
+        self.s.tabs[ps.T_TEST].append(["W3", "A3", "Каб", "Товар3", 1000, 5, 10, 10, 10, 10, 2, 2, 60])
+        self.s.tabs[ps.T_PACK].append(["W3", 1, 1, 10, 40])
+        self.mark(1)
+        r = self.gw.reconcile(self.draft)  # preview: no writes
+        self.assertEqual([(a, c) for a, c, _ in r["removed"]], [("A1", "Каб")])
+        self.assertEqual((r["kept"], [ln["article"] for ln in r["added"]]), (1, ["A3"]))
+        self.assertEqual(len(self.s.posts), 1)
+        r = self.gw.reconcile(self.draft, apply=True)
+        t = self.s.tabs[ps.T_TARGET]
+        self.assertEqual([self.art(1), self.art(2)], [12345, "A3"])  # kept row first, new one at the end
+        self.assertEqual(t[1][COL("Статус отгрузки")], "Одобрено")
+        self.assertEqual(t[1][list(ps.ORIGINAL + ps.META).index("ID плана")], self.draft["id"])
+        self.assertFalse(any("deleteDimension" in x for p in self.s.posts for x in p["requests"]))  # row 2 anchors formulas
+        self.assertIn(("A1", "Каб"), r["refused"])
+        self.assertEqual(len([x for x in t[1:] if any(c not in ("", None) for c in x)]), 2)
+
+    def test_refused_goods_are_not_proposed_again(self):
+        self.s.tabs[ps.T_TEST].append(["W3", "A3", "Каб", "Товар3", 1000, 5, 10, 10, 10, 10, 2, 2, 60])
+        self.s.tabs[ps.T_PACK].append(["W3", 1, 1, 10, 40])
+        r = self.gw.reconcile(self.draft, rejected_before=[("A3", "Каб")])
+        self.assertEqual(r["added"], [])
+
+    def test_foreign_rows_and_bad_quantity_are_refused(self):
+        self.s.tabs[ps.T_TARGET].append(["ручная"])
+        with self.assertRaises(ps.PlannerSheetsError):
+            self.gw.reconcile(self.draft)
+        self.s.tabs[ps.T_TARGET].pop()
+        self.s.tabs[ps.T_TARGET][1][COL("К отгрузке")] = 12.5
+        with self.assertRaises(ps.PlannerSheetsError):
+            self.gw.reconcile(self.draft)

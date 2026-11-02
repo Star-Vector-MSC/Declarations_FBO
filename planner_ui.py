@@ -263,7 +263,8 @@ class PlannerController:
         i, v = d["id"], d["version"]
         top = [[_btn("Состав", "ln", i, v, 0), _btn("Память", "mem", i, v)]]
         if d["version"] != d["latest_version"] or d.get("exported_version") is not None:
-            return _kb(top + [[_btn("Мои планы", "list")]])
+            upd = [[_btn("Обновить по листу", "up", i, v)]] if d.get("exported_version") == v else []
+            return _kb(top + upd + [[_btn("Мои планы", "list")]])
         other = 20 if d["plan"]["rules"]["capacity"] == 33 else 33
         last = ([_btn("Выбрать склад", "sw", i, v)] if d["plan"]["warehouse"] is None
                 else [_btn("Записать в тестовый лист", "pub", i, v)])
@@ -543,7 +544,7 @@ class PlannerController:
             if len(cb.data.encode()) > 64 or parts[0] != "pl":
                 raise ValueError
             act, a = parts[1], parts[2:]
-            if act in ("op", "ln", "mem", "rc", "set", "cap", "pub", "ok", "ap", "ar", "ex", "sw"):
+            if act in ("op", "ln", "mem", "rc", "set", "cap", "pub", "ok", "ap", "ar", "ex", "sw", "up", "uk"):
                 if not (len(a) >= 2 and _ID.fullmatch(a[0]) and a[1].isdigit()):
                     raise ValueError
                 a = [a[0], int(a[1])] + a[2:]
@@ -571,7 +572,7 @@ class PlannerController:
     async def _c_cn(self, uid, ct, msg):
         st = self._st.get(uid)
         if st:
-            for k in ("proposal", "confirm", "memo", "perm_ok", "example", "touched"):
+            for k in ("proposal", "confirm", "confirm_up", "memo", "perm_ok", "example", "touched"):
                 st.pop(k, None)
             if st["step"] in ("settings", "pickwh"):
                 self._st.pop(uid)
@@ -878,6 +879,63 @@ class PlannerController:
         if ok:
             await msg.answer("Запись отозвана. В уже сохранённых версиях планов ничего не меняется; новые расчёты и "
                              "«Пересчитать» её больше не учитывают.")
+
+    @staticmethod
+    def _update_text(s, final=False):
+        def lst(items, fmt):
+            out = [fmt(x) for x in items[:8]]
+            return "\n".join(out) + (f"\n… и ещё {len(items) - 8}" if len(items) > 8 else "")
+        parts = [("Готово. " if final else "") + f"Обновление по листу: убрано строк «Не согласовано»: {len(s['removed'])}, "
+                 f"оставлено: {s['kept']}, добавлено новых в конец: {len(s['added'])}.",
+                 f"Загрузка машины {s['total_pallets']} из {s['capacity']} паллет."]
+        if s["removed"]:
+            parts.append("Убираю:\n" + lst(s["removed"], lambda r: f"– {r[0]} · {r[1]}" + (f" · {r[2]} шт" if r[2] else "")))
+        if s["added"]:
+            parts.append("Добавляю:\n" + lst(s["added"], lambda ln: f"+ {ln['article']} · {ln['cabinet']} · {ln['quantity']} шт "
+                                              f"({ln['pallets']} пал.)"))
+        return "\n".join(parts)
+
+    async def _c_up(self, uid, ct, msg, did, ver):
+        d = await asyncio.to_thread(self.store.get, uid, did, ver)
+        if d.get("exported_version") != ver:
+            raise _Blocked("Сначала запишите этот план в тестовый лист.")
+        await msg.answer("Читаю тестовый лист…")
+
+        def work():
+            return self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did))
+        s = await asyncio.to_thread(work)
+        if not s["removed"] and not s["added"]:
+            await msg.answer(f"В листе нет строк «Не согласовано», и добавлять нечего: загрузка {s['total_pallets']} из "
+                             f"{s['capacity']} паллет.")
+            return
+        self._st[uid] = {"step": "confirm", "confirm_up": (did, ver)}
+        await msg.answer(self._update_text(s) + "\n\nПеред записью источники будут перепроверены; пишу только в "
+                         "«Планирование FBO — ТЕСТ».",
+                         reply_markup=_kb([[_btn("Подтвердить обновление", "uk", did, ver), _btn("Отмена", "cn")]]))
+
+    async def _c_uk(self, uid, ct, msg, did, ver):
+        g = self._gen.get(uid, 0)
+        d = await asyncio.to_thread(self.store.get, uid, did, ver)
+        if (self._st.get(uid) or {}).get("confirm_up") != (did, ver) or d.get("exported_version") != ver:
+            await msg.answer("Сначала нажмите «Обновить по листу» у этого плана.")
+            return
+        self._st.pop(uid, None)
+        await msg.answer("Обновляю тестовый лист…")
+
+        def work():
+            if not self._owner(uid, ct) or self._gen.get(uid, 0) != g:
+                raise _Blocked("Обновление отменено.")
+            pre = self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did))
+            self.store.add_rejected(uid, did, pre["refused"])  # first: a retry after a lost response must not resurrect them
+            return self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did), apply=True)
+        try:
+            s = await asyncio.to_thread(work)
+        except Exception as e:
+            if self._owner(uid, ct):
+                await msg.answer(_err(e))
+            return
+        if self._owner(uid, ct):
+            await msg.answer(self._update_text(s, final=True) + "\n" + s["url"])
 
     async def _c_pub(self, uid, ct, msg, did, ver):
         d = await self._draft(uid, did, ver)

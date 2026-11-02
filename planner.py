@@ -22,6 +22,9 @@ MIN_LINE_QTY = 0
 KEEP_LINE_QTY = 50  # with the minimum on: an unliftable line below this is dropped
 # General rule: an article rated below this is not shipped to FBO (owner: threshold 4-4.1; rating 0/unknown = no data).
 MIN_RATING = 4.0
+# A line squeezed by leftover machine space / free stock must cover at least this share of what it needs (crumbs such as
+# one box or one piece are not shipped; owner: "смысл отправлять 1 коробку").
+MIN_COVER = Fraction(1, 2)
 _DEMAND_LABELS = {"growth": "рост", "stable": "стабильно", "gentle_decline": "плавное снижение",
                   "sharp_decline": "резкое падение", "uncertain": "неопределённо"}
 _PACK = {"wild": ("wild", 0, 1), "box": ("шт в коробе", 1, 2), "pallet": ("штук на палете", 1, 2)}
@@ -178,7 +181,7 @@ def _horizon(dm, T, M):
 
 
 def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, demand_mode="advisory",
-               min_line_qty=MIN_LINE_QTY, min_rating=MIN_RATING):
+               min_line_qty=MIN_LINE_QTY, min_rating=MIN_RATING, exclude=(), min_cover=MIN_COVER):
     """demand_mode: "advisory" shows the demand state per line and never changes a quantity (default: the state
     thresholds are not yet validated, see docs/demand-policy.md); "apply" also limits horizons by that state."""
     if demand_mode not in ("advisory", "apply"):
@@ -314,11 +317,12 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
     T, M = th["target_days"], th["max_days"]
     low = T * Fraction(7, 10)  # "reasonably near target" window for pallet presets: [0.7*target, max_days]
     fixed_keys = {(fx["article"], fx["cabinet"]) for fx in r["fixed"]}
+    excl = {(str(a), str(c)) for a, c in exclude}  # lines the owner has refused: never proposed again
     cands, eligible = [], 0
     for key, x in src.items():
         if x["wild"] in banned or x["wild"] in badgroup:
             continue  # permanent ban / unverifiable group: rejected before any eligibility/quantity work
-        if key in fixed_keys or _norm(x["wild"]) in ex_w or _norm(key[1]) in ex_c:
+        if key in fixed_keys or key in excl or _norm(x["wild"]) in ex_w or _norm(key[1]) in ex_c:
             continue
         if any(x[k] is None for k in _METRICS):
             warn.append(f"test row {x['row']} {key[0]}/{key[1]}: missing or invalid numeric data; skipped")
@@ -366,6 +370,12 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
             k = (T - f) * s7 / box
             q = min({box * max(1, min(nb, n)) for n in (math.floor(k), math.ceil(k))}, key=score)
             how = "whole boxes"
+        need = math.ceil((T - f) * s7)  # what the line would add to reach the target
+        room = min(budget[w] - used.get(w, 0), math.floor((cap - total) * pal))
+        if room < need and q < need * min_cover:  # only crumbs fit (leftover machine space / stock): not worth a shipment
+            warn.append(f"{x['article']}/{x['cabinet']}: only {q} of the needed {need} pcs fit "
+                        "(machine space/free stock); skipped")
+            continue
         if q < min_line_qty and Fraction(q, pal) < Fraction(1, 2):
             half = Fraction(pal, 2)
             lift = [box * -(-min_line_qty // box)]

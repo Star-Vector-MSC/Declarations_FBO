@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS versions(id TEXT NOT NULL, version INTEGER NOT NULL, 
 CREATE INDEX IF NOT EXISTS versions_owner ON versions(owner_id, id);
 CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY, version INTEGER NOT NULL, url TEXT NOT NULL,
   exported_at TEXT NOT NULL, FOREIGN KEY(id, version) REFERENCES versions(id, version));
+CREATE TABLE IF NOT EXISTS rejected(id TEXT NOT NULL, article TEXT NOT NULL, cabinet TEXT NOT NULL,
+  created_at TEXT NOT NULL, PRIMARY KEY(id, article, cabinet));
 CREATE TRIGGER IF NOT EXISTS versions_no_u BEFORE UPDATE ON versions BEGIN SELECT RAISE(ABORT, 'immutable'); END;
 CREATE TRIGGER IF NOT EXISTS versions_no_d BEFORE DELETE ON versions BEGIN SELECT RAISE(ABORT, 'immutable'); END;
 CREATE TRIGGER IF NOT EXISTS exports_no_u BEFORE UPDATE ON exports BEGIN SELECT RAISE(ABORT, 'immutable'); END;
@@ -140,3 +142,17 @@ class DraftStore:
             if d["exported_version"] == d["version"] and d["export_url"] == url:
                 return d
             raise DraftConflict("Другая версия этого черновика уже выгружена")
+
+    def add_rejected(self, owner, did, items):
+        """Remember (article, cabinet) pairs the owner refused in the sheet, so a later update never proposes them again."""
+        owner = _owner(owner)
+        with self._tx(True) as con:
+            self._get(con, owner, did)
+            for a, c in items:
+                con.execute("INSERT OR IGNORE INTO rejected VALUES (?,?,?,?)", (did, str(a), str(c), _now()))
+
+    def rejected(self, owner, did):
+        owner = _owner(owner)
+        with self._tx() as con:
+            self._get(con, owner, did)
+            return [(a, c) for a, c in con.execute("SELECT article, cabinet FROM rejected WHERE id=? ORDER BY rowid", (did,))]
