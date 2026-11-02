@@ -16,6 +16,8 @@ _TEST = {"wild": ("wild", 0, 1), "article": ("артикул", 0, 1), "cabinet":
          "cur": ("остаток на (дней)", 0, 1), "s3": (_S + "3 дня", 0, 1), "s7": (_S + "7 дней", 0, 1),
          "s14": (_S + "14 дней", 0, 1), "s30": (_S + "30 дней", 0, 1),
          "forecast": ("прогнозные остатки в днях", 0, 2), "wild_days": ("остаток на дней по вилду", 0, 1)}
+_DEMAND_LABELS = {"growth": "рост", "stable": "стабильно", "gentle_decline": "плавное снижение",
+                  "sharp_decline": "резкое падение", "uncertain": "неопределённо"}
 _PACK = {"wild": ("wild", 0, 1), "box": ("шт в коробе", 1, 2), "pallet": ("штук на палете", 1, 2)}
 _METRICS = ("cur", "s3", "s7", "s14", "s30", "forecast", "wild_days")
 _NUM_RE = re.compile(r"[+-]?(?:\d+(?:[.,]\d+)?|[.,]\d+)")
@@ -157,7 +159,23 @@ def _table(rows, spec, name):
     return out
 
 
-def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
+def _horizon(dm, T, M):
+    """Policy of docs/demand-policy.md -> (target, max) days or (None, None) = no automatic replenishment."""
+    st = dm["state"] if dm else None
+    if st == "sharp_decline":
+        return None, None
+    if st == "growth":
+        return M, M
+    if st == "gentle_decline":
+        return min(T, 7), min(M, 7)
+    return T, M
+
+
+def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, demand_mode="advisory"):
+    """demand_mode: "advisory" shows the demand state per line and never changes a quantity (default: the state
+    thresholds are not yet validated, see docs/demand-policy.md); "apply" also limits horizons by that state."""
+    if demand_mode not in ("advisory", "apply"):
+        raise ValueError("demand_mode must be advisory or apply")
     r = validate_rules(rules)
     sd = _date(shipment_date, "shipment_date")
     ad = None if arrival_date is None else _date(arrival_date, "arrival_date")
@@ -228,6 +246,16 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
             budget[w], pack[w] = max(0, math.floor(next(iter(s)))), next(iter(pk))
     warn.extend(f"wild {w}: {bad[w]}; blocked" for w in sorted(bad))
 
+    dem = snapshot.get("demand") if isinstance(snapshot.get("demand"), dict) else None
+    if dem is not None and dem.get("problems"):
+        warn.extend(f"demand: {p}" for p in dem["problems"])
+
+    def demand_of(x):
+        if dem is None:
+            return None
+        v = (dem.get("by_article") or {}).get(x["article"])
+        return v if isinstance(v, dict) and v.get("state") else {"state": "uncertain", "why": "нет данных о заказах"}
+
     ex_w = {_norm(x) for x in r["excluded_wild"]}
     ex_c = {_norm(x) for x in r["excluded_cabinets"]}
     cap, lines, used, total = r["capacity"], [], {}, Fraction(0)
@@ -243,6 +271,10 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
                       "quantity": q, "box_qty": box, "pallet_qty": pal, "pallets": _f(Fraction(q, pal)),
                       "forecast_before": _f(f), "forecast_after": _f(after), "sales7": _f(s7),
                       "reason": reason, "fixed": fixed})
+        dm = demand_of(x)
+        if dm is not None:
+            lines[-1]["demand"] = {"state": dm["state"], "label": _DEMAND_LABELS.get(dm["state"], dm["state"]),
+                                   "why": dm.get("why", ""), "applied": demand_mode == "apply"}
 
     for fx in r["fixed"]:
         key, q = (fx["article"], fx["cabinet"]), fx["quantity"]
@@ -286,11 +318,18 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None):
                 or x["cur"] > th["max_current_days"] or x["wild_days"] < th["min_wild_days"]):
             continue
         eligible += 1
-        if x["forecast"] < T and x["wild"] not in bad:
+        if x["wild"] in bad:
+            continue
+        x["_T"], x["_M"] = _horizon(demand_of(x), T, M) if demand_mode == "apply" else (T, M)
+        if x["_T"] is None:
+            warn.append(f"{x['article']}/{x['cabinet']}: demand state {_DEMAND_LABELS['sharp_decline']}; "
+                        "no automatic replenishment")
+        elif x["forecast"] < x["_T"]:
             cands.append(x)
     cands.sort(key=lambda x: (x["forecast"], x["article"], x["cabinet"]))
 
     for x in cands:
+        T, M, low = x["_T"], x["_M"], x["_T"] * Fraction(7, 10)
         w, f, s7 = x["wild"], x["forecast"], x["s7"]
         box, pal = pack[w]
         lim = min(budget[w] - used.get(w, 0), math.floor((cap - total) * pal), math.floor((M - f) * s7))

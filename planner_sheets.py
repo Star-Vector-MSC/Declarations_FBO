@@ -8,9 +8,11 @@ from datetime import date, datetime, timedelta, timezone
 from fractions import Fraction
 
 import planner
+import planner_demand
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 _API = "https://sheets.googleapis.com/v4/spreadsheets/"
+T_ORDERS = "Количество заказов"
 T_TEST, T_PACK, T_ORIG, T_TARGET = "тест", "кол-во на палете и в коробе", "Отгрузка FBO", "Планирование FBO — ТЕСТ"
 ORIGINAL = (
     "Фактическая Дата отгрузки на вб", "Номер поставки", "Плановая дата поставки на ВБ",
@@ -312,10 +314,28 @@ class PlannerSheets:
             raise PlannerSheetsError(f"Лист «{T_ORIG}» пуст")
         wc = _bind(orig[0], ("Склад Wildberries",), T_ORIG)[_c("Склад Wildberries")]
         whs = sorted({w for w in (planner._ident(_cell(r, wc)) for r in orig[1:]) if w})
-        body = _canon({"test": test, "packing": pack, "warehouses": whs})
-        return {"test": test, "packing": pack, "warehouses": whs,
-                "source_hash": hashlib.sha256(body.encode("utf-8")).hexdigest(),
-                "captured_at": datetime.now(MSK).isoformat(timespec="seconds")}, orig
+        captured = datetime.now(MSK).isoformat(timespec="seconds")
+        demand = self._demand(captured)
+        parts = {"test": test, "packing": pack, "warehouses": whs}
+        if demand is not None:
+            parts["demand"] = demand
+        body = _canon(parts)
+        snap = {"test": test, "packing": pack, "warehouses": whs,
+                "source_hash": hashlib.sha256(body.encode("utf-8")).hexdigest(), "captured_at": captured}
+        if demand is not None:
+            snap["demand"] = demand
+        return snap, orig
+
+    def _demand(self, captured):
+        """Read-only demand classification per WB article; a failed read never blocks planning (plan says so)."""
+        try:
+            raw = self._values((T_ORDERS,), "UNFORMATTED_VALUE")[0]
+            o = planner_demand.parse_orders(raw, captured)
+        except Exception:
+            return {"ok": False, "problems": ["лист «Количество заказов» не прочитан; динамика спроса не оценена"],
+                    "by_article": {}}
+        return {"ok": o["ok"], "problems": o["problems"], "ref": o["ref"],
+                "by_article": {a: planner_demand.classify(v) for a, v in o["series"].items()} if o["ok"] else {}}
 
     def snapshot(self):
         self._meta()
