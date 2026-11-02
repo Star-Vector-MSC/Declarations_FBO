@@ -192,6 +192,21 @@ def _bind(header, names, where):
     return out
 
 
+_LABELS = re.compile(r'^=\{\s*((?:"[^"]*"\s*\\?\s*)+);')
+
+
+def _heads(shown, formulas):
+    """Header labels as shown; where a header array formula shows an error or nothing (it cannot spill while the
+    sheet has no data rows), take its own literal labels: ={"A"\"B"; ARRAYFORMULA(...)} -> A, B."""
+    out = list(shown) + [None] * max(0, len(formulas) - len(shown))
+    for i, f in enumerate(formulas):
+        m = _LABELS.match(f) if isinstance(f, str) else None
+        for k, lab in enumerate(re.findall(r'"([^"]*)"', m.group(1)) if m else ()):
+            if i + k < len(out) and (planner._blank(out[i + k]) or str(out[i + k]).startswith("#")):
+                out[i + k] = lab
+    return out
+
+
 def _draft(d):
     try:
         did, ver, plan = d["id"], d["version"], d["plan"]
@@ -360,7 +375,7 @@ class PlannerSheets:
             raise PlannerSheetsError("В тестовом листе нет заголовков")
         # header cells hold array formulas (as in the original): bind by their shown labels, not by formula text
         head = self._values((T_TARGET,), "UNFORMATTED_VALUE", head=True)[0] or [[]]
-        cols = _bind(head[0], ORIGINAL + META, T_TARGET)
+        cols = _bind(_heads(head[0], rows[0]), ORIGINAL + META, T_TARGET)
 
         def g(r, n, o=0):
             return _cell(r, cols[_c(n, o)])

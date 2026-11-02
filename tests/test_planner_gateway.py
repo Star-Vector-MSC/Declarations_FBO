@@ -335,3 +335,13 @@ class OriginalLayoutChangeTest(unittest.TestCase):
     def test_shift_translates_columns_by_name(self):
         self.assertEqual(ps._shift("=A2*AE2", 3, 0, {1: 1, 31: 30}), "=A5*AD5")
         self.assertIsNone(ps._shift("=A2*AE2", 3, 0, {1: 1}))  # a ref to a column without counterpart
+
+
+class HeaderLabelsTest(unittest.TestCase):
+    def test_labels_come_from_formula_when_the_array_cannot_spill(self):
+        f = ['x', '={"Шт в коробе"\\"Итого коробов"\\"Шт на паллете";\nARRAYFORMULA(1)}', None, None, 'y']
+        shown = ["x", "#REF! (Result was not automatically expanded)", "", "", "y"]
+        self.assertEqual(ps._heads(shown, f), ["x", "Шт в коробе", "Итого коробов", "Шт на паллете", "y"])
+        self.assertEqual(ps._heads(["a", "b"], ["a", "b"]), ["a", "b"])  # plain headers untouched
+        ok = ["x", "Шт в коробе", "Итого коробов", "Шт на паллете", "y"]
+        self.assertEqual(ps._heads(ok, f), ok)  # shown labels win
