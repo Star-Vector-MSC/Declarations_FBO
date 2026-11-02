@@ -201,6 +201,16 @@ class GatewayTest(unittest.TestCase):
         ins = self.s.posts[0]["requests"][0]["insertDimension"]["range"]
         self.assertEqual(ins["startIndex"], 2)  # right below the last real row, not below the checkbox tail
 
+    def test_empty_sheet_is_written_in_place_without_inserting_rows(self):
+        t = self.s.tabs[ps.T_TARGET]
+        del t[1:]
+        t.extend([[""] * 14 + [False] for _ in range(5)])
+        self.gw.publish(self.draft)
+        reqs = self.s.posts[0]["requests"]
+        self.assertFalse(any("insertDimension" in r or "copyPaste" in r for r in reqs))  # formula ranges must not shift
+        starts = {r["updateCells"]["range"]["startRowIndex"] for r in reqs if "updateCells" in r}
+        self.assertEqual(starts, {1})
+
     def test_config_gid_and_swapped_titles_refused(self):
         for bad in (["same", "same"], ["fake-base", "100"], ["fake-base", True], ["fake-base"]):
             sys.modules["wb_declarations"] = types.SimpleNamespace(KEY="unused", SHIPMENTS=bad)

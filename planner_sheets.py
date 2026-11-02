@@ -389,7 +389,6 @@ class PlannerSheets:
                     _c("wild"): _sv(ln["wild"]), _c("Артикул"): _sv(ln["article"]),
                     _c("Название магазина"): _sv(ln["cabinet"]), _c("Название предмета"): _sv(ln["product"]),
                     _c("Тип поставки"): _sv("Монопаллета"), _c("К отгрузке"): _nv(ln["quantity"]),
-                    _c("Комментарии"): _sv(f"ТЕСТ. План {did} v{ver}: {ln['reason']}"),
                     _c("ID плана"): _sv(did), _c("Версия плана"): _nv(ver),
                     _c("Прогноз до"): _nv(ln["forecast_before"]), _c("Прогноз после"): _nv(ln["forecast_after"]),
                     _c("Причина"): _sv(ln["reason"]), _c("Снимок данных"): _sv(plan["source_hash"]),
@@ -440,11 +439,17 @@ class PlannerSheets:
         def area(c0, c1, sid=tid, r0=start, r1=end):
             return {"sheetId": sid, "startRowIndex": r0, "endRowIndex": r1, "startColumnIndex": c0, "endColumnIndex": c1}
 
-        # Grid needs a row at `start`; then insert n fresh rows there (rows typed meanwhile shift down, preserved).
-        reqs = [{"appendDimension": {"sheetId": tid, "dimension": "ROWS", "length": last + 1 - rc}}] if last >= rc else []
-        reqs.append({"insertDimension": {"range": {"sheetId": tid, "dimension": "ROWS", "startIndex": start,
-                                                   "endIndex": end}, "inheritFromBefore": start > 1}})
-        fr = last - 1 if last >= 2 else (end if rc >= 2 else None)
+        # Empty sheet (no data rows): write into the existing blank rows. An insert at row 2 would push every
+        # open-ended header formula range ($L$2:$L ...) below the new rows, and the formulas would stop seeing them.
+        # Otherwise: grid needs a row at `start`; insert n fresh rows there (rows typed meanwhile shift down, preserved).
+        direct = last == 1
+        if direct:
+            reqs = [{"appendDimension": {"sheetId": tid, "dimension": "ROWS", "length": end - rc}}] if end > rc else []
+        else:
+            reqs = [{"appendDimension": {"sheetId": tid, "dimension": "ROWS", "length": last + 1 - rc}}] if last >= rc else []
+            reqs.append({"insertDimension": {"range": {"sheetId": tid, "dimension": "ROWS", "startIndex": start,
+                                                       "endIndex": end}, "inheritFromBefore": start > 1}})
+        fr = None if direct else (last - 1 if last >= 2 else (end if rc >= 2 else None))
         if fr is not None:
             reqs += [{"copyPaste": {"source": area(0, width, r0=fr, r1=fr + 1), "destination": area(0, width),
                                     "pasteType": t, "pasteOrientation": "NORMAL"}}
