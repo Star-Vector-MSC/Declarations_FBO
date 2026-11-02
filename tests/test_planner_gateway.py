@@ -164,7 +164,7 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(len(self.s.posts), 1)
 
     def test_source_mismatch_forged_and_capacity(self):
-        self.s.tabs[ps.T_TEST][1][4] = 999
+        self.s.tabs[ps.T_TEST][1][4] = 10  # a change that alters the plan itself
         with self.assertRaises(ps.SourceChangedError):
             self.gw.publish(self.draft)
         self.s.tabs[ps.T_TEST][1][4] = 1000
@@ -181,6 +181,11 @@ class GatewayTest(unittest.TestCase):
         with self.assertRaises(ps.PlannerSheetsError):
             self.gw.publish(forged)
         self.assertEqual(self.s.posts, [])
+
+    def test_source_change_that_leaves_the_plan_identical_still_publishes(self):
+        self.s.tabs[ps.T_TEST][1][4] = 999  # fresh hash differs, recalculated plan is the same
+        self.assertTrue(self.gw.publish(self.draft).startswith("https://"))
+        self.assertEqual(len(self.s.posts), 1)
 
     def test_config_gid_and_swapped_titles_refused(self):
         for bad in (["same", "same"], ["fake-base", "100"], ["fake-base", True], ["fake-base"]):

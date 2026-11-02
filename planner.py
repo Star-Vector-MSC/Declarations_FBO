@@ -208,6 +208,8 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
             if not (isinstance(c["product"], str) and c["product"].strip()):
                 badgroup.add(w)  # ban status cannot be verified -> block whole wild
         if not (w and a and cab):
+            if not (w or a or cab):
+                continue  # no identity at all (empty tail of the sheet): nothing to plan, nothing to report
             warn.append(f"test row {n}: missing or invalid wild/article/cabinet; skipped")
             continue
         if (a, cab) in src or (a, cab) in dup:

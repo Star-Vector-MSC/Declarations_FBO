@@ -132,6 +132,16 @@ class PlanTest(unittest.TestCase):
             P.build_plan(s, {}, "2026-10-28", "WH", demand_mode="x")
 
 
+class BlankTailTest(unittest.TestCase):
+    def test_rows_without_any_identity_are_not_warnings_but_partial_ones_are(self):
+        s = snap([T("w1", "A1", fc=2), [None] * 13, ["", "", "", "x"] + [None] * 9, ["w2", None, None] + [None] * 10],
+                 [PK("w1")])
+        r = P.build_plan(s, {}, "2026-10-28", "WH", "2026-10-30")
+        w = [x for x in r["warnings"] if "missing or invalid wild/article/cabinet" in x]
+        self.assertEqual(len(w), 1)
+        self.assertIn("test row 5", w[0])
+
+
 class UiTest(unittest.TestCase):
     def test_lines_text_shows_demand_state(self):
         import planner_ui

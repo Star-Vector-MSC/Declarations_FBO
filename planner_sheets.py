@@ -426,8 +426,8 @@ class PlannerSheets:
             return self._link(tid, mine[0] + 1)
 
         fresh, orig = self._read()
-        if fresh["source_hash"] != plan["source_hash"] or plan["warehouse"] not in fresh["warehouses"]:
-            raise SourceChangedError("Исходные данные изменились после расчёта. Пересчитайте план и сохраните новую версию.")
+        if plan["warehouse"] not in fresh["warehouses"]:
+            raise SourceChangedError("Склад плана больше не найден в исходных данных. Пересчитайте план и сохраните новую версию.")
         try:
             new = planner.build_plan(fresh, plan["rules"], plan["date"], plan["warehouse"], plan.get("arrival_date"))
         except ValueError:
