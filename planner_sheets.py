@@ -18,11 +18,11 @@ ORIGINAL = (
     "Фактическая Дата отгрузки на вб", "Номер поставки", "Плановая дата поставки на ВБ",
     "Плановая дата прибытия авто на вб", "Дата отгрузки (склад)", "Сборка товара (Склад)",
     "Факт Сборка товара (Склад)", "Готовность склада (Алексей)", "Склад Wildberries", "Статус отгрузки", "wild",
-    "Артикул", "Название магазина", "Название магазина", "Чек лист Декларация", "Свободный остаток",
+    "Артикул", "Название магазина", "Название предмета", "Чек лист Декларация", "Свободный остаток",
     "Остаток на дней по стоку", "Тип поставки", "Количество", "Итого паллет", "Палето-мест в машине",
     "Шт в коробе", "Итого коробов", "Шт на паллете", "средние продажи в день по артикулу",
     "Текущий остаток на ФБО", "Рейтинг", "Остаток на (дней)", "К отгрузке", "Дней загрузки план",
-    "Вес товара ед", "Вес товара в поставке", "Комментарии", "Собрано по факту (Склад)", "Факт Иван",
+    "Короб", "Вес товара ед", "Вес товара в поставке", "Комментарии", "Собрано по факту (Склад)", "Факт Иван",
     "Факт сборка (Дима)", "Итого паллет", "Общее кол-во к отгрузке на палете")
 META = ("ID плана", "Версия плана", "Прогноз до", "Прогноз после", "Причина", "Снимок данных", "Правила плана")
 MSK = timezone(timedelta(hours=3), "MSK")  # Moscow: fixed UTC+3, no DST
@@ -189,34 +189,6 @@ def _bind(header, names, where):
             raise PlannerSheetsError(f"Лист «{where}»: столбец «{n}» ожидается {want[k]} раз, найдено {len(found)}")
         out[(k, seen[k])] = found[seen[k]]
         seen[k] += 1
-    return out
-
-
-_ORIG_ALIAS = {_c("Название магазина", 1): "Название предмета"}  # owner renamed the duplicate column (2026-11)
-
-
-def _bind_orig(header):
-    """key (as in ORIGINAL) -> column of the live original sheet. Strict first; if the owner has changed the layout
-    (renamed duplicate «Название магазина», inserted columns) bind by header names with the known alias. Columns
-    that are not in ORIGINAL are ignored; anything still missing or ambiguous is an error."""
-    try:
-        return _bind(header, ORIGINAL, T_ORIG)
-    except PlannerSheetsError:
-        pass
-    seen, keys, names = Counter(), [], []
-    for n in ORIGINAL:
-        k = planner._norm(n)
-        key = (k, seen[k])
-        seen[k] += 1
-        keys.append(key)
-        names.append(_ORIG_ALIAS.get(key, n))
-    got = _bind(header, names, T_ORIG)
-    cnt = Counter()
-    out = {}
-    for key, n in zip(keys, names):
-        k = planner._norm(n)
-        out[key] = got[(k, cnt[k])]
-        cnt[k] += 1
     return out
 
 
@@ -442,7 +414,7 @@ class PlannerSheets:
         if any(isinstance(c, str) and c.startswith("=") and not _scalar(c) for r in rows for c in r):
             raise PlannerSheetsError("В тестовом листе есть формулы сложнее простой арифметики; "
                                      "дописывать строки небезопасно")
-        oc = _bind_orig(orig[0])
+        oc = _bind(orig[0], ORIGINAL, T_ORIG)
         act = oc[_c(ORIGINAL[0])]
         tpl = max((i for i in range(1, len(orig)) if not planner._blank(_cell(orig[i], act))), default=None)
         n, width, rc = len(plan["lines"]), max(cols.values()) + 1, ids[T_TARGET]["rows"]

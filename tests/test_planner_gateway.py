@@ -325,28 +325,6 @@ if __name__ == "__main__":
     unittest.main()
 
 class OriginalLayoutChangeTest(unittest.TestCase):
-    def live(self):
-        h = list(ps.ORIGINAL)
-        h[13] = "Название предмета"  # owner renamed the duplicate column
-        h.insert(30, "Короб")  # and inserted a new one before «Вес товара ед»
-        return h
-
-    def test_old_layout_binds_strictly(self):
-        oc = ps._bind_orig(list(ps.ORIGINAL))
-        self.assertEqual(oc[ps._c("Название магазина", 1)], 13)
-
-    def test_changed_layout_binds_by_names(self):
-        oc = ps._bind_orig(self.live())
-        self.assertEqual(oc[ps._c("Название магазина", 0)], 12)
-        self.assertEqual(oc[ps._c("Название магазина", 1)], 13)
-        self.assertEqual(oc[ps._c("Вес товара ед")], 31)
-        self.assertEqual(oc[ps._c("Общее кол-во к отгрузке на палете")], 38)
-
-    def test_missing_column_is_still_an_error(self):
-        h = [x for x in self.live() if x != "Комментарии"]
-        with self.assertRaises(ps.PlannerSheetsError):
-            ps._bind_orig(h)
-
     def test_shift_translates_columns_by_name(self):
         self.assertEqual(ps._shift("=A2*AE2", 3, 0, {1: 1, 31: 30}), "=A5*AD5")
         self.assertIsNone(ps._shift("=A2*AE2", 3, 0, {1: 1}))  # a ref to a column without counterpart
