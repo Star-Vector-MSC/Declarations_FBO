@@ -190,7 +190,9 @@ def lines_text(d, page):
     out = [f"Состав плана {d['id']} v{d['version']}, страница {page + 1}/{max(1, -(-len(ls) // PAGE))}:"]
     for ln in ls[page * PAGE:(page + 1) * PAGE]:
         out.append(f"{ln['wild']} · {ln['article']} · {ln['cabinet']}: {ln['quantity']} шт ({ln['pallets']} пал.), "
-                   f"прогноз {ln['forecast_before']}→{ln['forecast_after']}. {ln['reason']}")
+                   f"прогноз {ln['forecast_before']}→{ln['forecast_after']}. {ln['reason']}"
+                   + (f" Спрос: {ln['demand']['label']} ({ln['demand']['why']})"
+                      f"{'' if ln['demand']['applied'] else ', на количество не влияет'}." if ln.get("demand") else ""))
     return "\n".join(out), page
 
 

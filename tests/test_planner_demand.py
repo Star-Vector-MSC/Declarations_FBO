@@ -132,5 +132,15 @@ class PlanTest(unittest.TestCase):
             P.build_plan(s, {}, "2026-10-28", "WH", demand_mode="x")
 
 
+class UiTest(unittest.TestCase):
+    def test_lines_text_shows_demand_state(self):
+        import planner_ui
+        s = snap([T("w1", "A1", fc=2)], [PK("w1")])
+        s["demand"] = {"ok": True, "problems": [], "by_article": {"A1": {"state": "growth", "why": "x2"}}}
+        plan = P.build_plan(s, {}, "2026-10-28", "WH", "2026-10-30")
+        txt, _ = planner_ui.lines_text({"id": "p", "version": 1, "plan": plan}, 0)
+        self.assertIn("Спрос: рост (x2), на количество не влияет", txt)
+
+
 if __name__ == "__main__":
     unittest.main()
