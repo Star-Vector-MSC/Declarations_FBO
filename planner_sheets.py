@@ -27,7 +27,7 @@ ORIGINAL = (
 META = ("ID плана", "Версия плана", "Прогноз до", "Прогноз после", "Причина", "Снимок данных", "Правила плана")
 MSK = timezone(timedelta(hours=3), "MSK")  # Moscow: fixed UTC+3, no DST
 _EPOCH = date(1899, 12, 30)
-_DF = {"numberFormat": {"type": "DATE", "pattern": "dd.mm.yyyy"}}
+_DF = {"numberFormat": {"type": "DATE", "pattern": "dd.MM.yyyy"}}
 _TOK = re.compile(r"\s*(?:(\$?[A-Za-z]{1,3}\$?[1-9][0-9]*|[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)|([-+*/^%()]))")
 _REF = re.compile(r"(?<![A-Za-z0-9.])(\$?)([A-Za-z]{1,3})(\$?)([1-9][0-9]*)")
 _HEX12 = re.compile(r"[0-9a-f]{12}")
