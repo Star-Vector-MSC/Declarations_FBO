@@ -25,6 +25,9 @@ MIN_RATING = 4.0
 # A line squeezed by leftover machine space / free stock must cover at least this share of what it needs (crumbs such as
 # one box or one piece are not shipped; owner: "смысл отправлять 1 коробку").
 MIN_COVER = Fraction(1, 2)
+# A line below this many pieces and below half a pallet is not worth a shipment (owner rejected 12/24/40-pcs lines of
+# wilds with pallets of 240-320 pcs after earlier 20/40/60 ones; he did ship 54-100 pcs and half pallets of 72).
+FLOOR_LINE_QTY = 50
 _DEMAND_LABELS = {"growth": "рост", "stable": "стабильно", "gentle_decline": "плавное снижение",
                   "sharp_decline": "резкое падение", "uncertain": "неопределённо"}
 _PACK = {"wild": ("wild", 0, 1), "box": ("шт в коробе", 1, 2), "pallet": ("штук на палете", 1, 2)}
@@ -181,7 +184,7 @@ def _horizon(dm, T, M):
 
 
 def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, demand_mode="advisory",
-               min_line_qty=MIN_LINE_QTY, min_rating=MIN_RATING, exclude=(), min_cover=MIN_COVER):
+               min_line_qty=MIN_LINE_QTY, min_rating=MIN_RATING, exclude=(), min_cover=MIN_COVER, floor_qty=FLOOR_LINE_QTY):
     """demand_mode: "advisory" shows the demand state per line and never changes a quantity (default: the state
     thresholds are not yet validated, see docs/demand-policy.md); "apply" also limits horizons by that state."""
     if demand_mode not in ("advisory", "apply"):
@@ -388,6 +391,9 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
                 warn.append(f"{x['article']}/{x['cabinet']}: line of {q} pcs is below {KEEP_LINE_QTY} and cannot be "
                             f"lifted to {min_line_qty} (stock/capacity/max_days); skipped")
                 continue
+        if q < floor_qty and Fraction(q, pal) < Fraction(1, 2):
+            warn.append(f"{x['article']}/{x['cabinet']}: {q} pcs is below {floor_qty} and below half a pallet; skipped")
+            continue
         emit(x, q, f"regular: {how} toward {_f(T)} days", False)
 
     return {"rules": r, "date": sd.isoformat(), "warehouse": None if warehouse is None else warehouse.strip(),

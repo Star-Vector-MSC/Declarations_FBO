@@ -92,7 +92,7 @@ class PlanTest(unittest.TestCase):
     def build(self, state, mode="advisory", **kw):
         s = snap([T("w1", "A1", fc=2)], [PK("w1")])
         s["demand"] = {"ok": True, "problems": [], "by_article": {"A1": {"state": state, "why": "x"}}}
-        return P.build_plan(s, {}, "2026-10-28", "WH", "2026-10-30", demand_mode=mode, min_line_qty=0)
+        return P.build_plan(s, {}, "2026-10-28", "WH", "2026-10-30", demand_mode=mode, min_line_qty=0, floor_qty=0)
 
     def test_advisory_never_changes_quantity(self):
         base = P.build_plan(snap([T("w1", "A1", fc=2)], [PK("w1")]), {}, "2026-10-28", "WH", "2026-10-30")
@@ -120,7 +120,7 @@ class PlanTest(unittest.TestCase):
         s["demand"] = {"ok": True, "problems": [], "by_article": {}}
         base = P.build_plan(snap([T("w1", "A1", fc=2)], [PK("w1")]), {}, "2026-10-28", "WH", "2026-10-30")
         for mode in ("advisory", "apply"):
-            r = P.build_plan(s, {}, "2026-10-28", "WH", "2026-10-30", demand_mode=mode, min_line_qty=0)
+            r = P.build_plan(s, {}, "2026-10-28", "WH", "2026-10-30", demand_mode=mode, min_line_qty=0, floor_qty=0)
             self.assertEqual(r["lines"][0]["quantity"], base["lines"][0]["quantity"])
             self.assertEqual(r["lines"][0]["demand"]["state"], "uncertain")
 

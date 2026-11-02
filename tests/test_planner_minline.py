@@ -43,9 +43,19 @@ class MinimumLineTest(unittest.TestCase):
         self.assertEqual([ln["quantity"] for ln in r["lines"]], [20])
 
 
-    def test_off_by_default(self):
+    def test_lift_is_off_by_default_but_the_floor_is_on(self):
+        # 40 pcs of a 600-pcs-pallet item: not lifted (off), and dropped by the 50-pcs floor
         r = plan([T("w1", "A1", s=(10, 10, 10, 10), fc=5.7)], [PK("w1", box=20, pal=600)])
-        self.assertEqual([ln["quantity"] for ln in r["lines"]], [40])
+        self.assertEqual(r["lines"], [])
+        self.assertTrue(any("below 50 and below half a pallet" in w for w in r["warnings"]))
+
+    def test_floor_keeps_50_plus_and_half_pallets_and_can_be_switched_off(self):
+        ok = plan([T("w1", "A1", s=(10, 10, 10, 10), fc=4.0)], [PK("w1", box=10, pal=600)])  # needs 60 pcs
+        self.assertEqual([ln["quantity"] for ln in ok["lines"]], [60])
+        half = plan([T("w1", "A1", s=(29, 29, 29, 29), fc=9.5)], [PK("w1", box=1, pal=72)])  # 18 pcs = 1/4 pallet
+        self.assertEqual(half["lines"], [])  # a quarter of a small pallet is still < 50 and < half
+        off = plan([T("w1", "A1", s=(10, 10, 10, 10), fc=5.7)], [PK("w1", box=20, pal=600)], floor_qty=0)
+        self.assertEqual([ln["quantity"] for ln in off["lines"]], [40])
 
 
 class RatingTest(unittest.TestCase):
