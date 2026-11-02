@@ -141,7 +141,7 @@ class GatewayTest(unittest.TestCase):
         t = self.s.tabs[ps.T_TARGET]
         self.assertEqual([t[2][15], t[3][15], t[2][36], t[3][36]], ["=M3", "=M4", "=T3", "=T4"])  # verified text, shifted
         self.assertEqual(t[1][:3], ["ручная", "", "=1+1"])
-        self.assertEqual([t[2][COL("Артикул")], t[3][COL("Артикул")]], ["A1", "12345"])
+        self.assertEqual([t[2][COL("Артикул")], t[3][COL("Артикул")]], ["A1", 12345])
         self.assertEqual(t[2][COL("Тип поставки")], "Монопаллета")
         self.assertEqual(t[2][COL("Статус отгрузки")], "Одобрено")
         self.assertEqual(t[2][COL("Сборка товара (Склад)")], t[2][COL("Дата отгрузки (склад)")] - 1)
@@ -230,7 +230,7 @@ class GatewayTest(unittest.TestCase):
         self.s.hook = lambda: t.append(["человек", "x"])
         self.assertTrue(self.gw.publish(self.draft).endswith("range=A3"))
         self.assertEqual((t[1][:3], t[4], len(t)), (["ручная", "", "=1+1"], ["человек", "x"], 5))
-        self.assertEqual([t[2][COL("Артикул")], t[3][COL("Артикул")]], ["A1", "12345"])
+        self.assertEqual([t[2][COL("Артикул")], t[3][COL("Артикул")]], ["A1", 12345])
         kinds = {next(iter(r)) for r in self.s.posts[0]["requests"]}
         self.assertEqual(kinds, {"insertDimension", "copyPaste", "updateCells"})
         out = [{"updateCells": {"range": {"sheetId": 777, "startRowIndex": 1, "endRowIndex": 2}}}]
@@ -244,7 +244,7 @@ class GatewayTest(unittest.TestCase):
             {"appendDimension": {"sheetId": 777, "dimension": "ROWS", "length": 1}},
             {"insertDimension": {"range": {"sheetId": 777, "dimension": "ROWS", "startIndex": 2, "endIndex": 4},
                                  "inheritFromBefore": True}}])
-        self.assertEqual(self.s.tabs[ps.T_TARGET][3][COL("Артикул")], "12345")
+        self.assertEqual(self.s.tabs[ps.T_TARGET][3][COL("Артикул")], 12345)
 
     def test_wiped_ids_after_lost_response_blocked(self):
         self.s.fail = True

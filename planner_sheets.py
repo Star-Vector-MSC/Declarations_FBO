@@ -75,6 +75,12 @@ def _sv(v):
     return {} if v is None else {"userEnteredValue": {"stringValue": str(v)}}
 
 
+def _art(v):
+    """WB article as the original sheet stores it: a number (formula lookups compare types), text only when it is
+    not a plain number (leading zero, letters)."""
+    return _nv(int(v)) if isinstance(v, str) and re.fullmatch(r"[1-9][0-9]{0,14}", v) else _sv(v)
+
+
 def _nv(v):
     return {} if v is None else {"userEnteredValue": {"numberValue": v}}
 
@@ -386,7 +392,7 @@ class PlannerSheets:
             return {_c("Дата отгрузки (склад)"): _dv(sd), _c("Сборка товара (Склад)"): _dv(sd - 1),
                     _c("Плановая дата прибытия авто на вб"): _dv(arr),
                     _c("Склад Wildberries"): _sv(plan["warehouse"]), _c("Статус отгрузки"): _sv("Одобрено"),
-                    _c("wild"): _sv(ln["wild"]), _c("Артикул"): _sv(ln["article"]),
+                    _c("wild"): _sv(ln["wild"]), _c("Артикул"): _art(ln["article"]),
                     _c("Название магазина"): _sv(ln["cabinet"]), _c("Название предмета"): _sv(ln["product"]),
                     _c("Тип поставки"): _sv("Монопаллета"), _c("К отгрузке"): _nv(ln["quantity"]),
                     _c("ID плана"): _sv(did), _c("Версия плана"): _nv(ver),
