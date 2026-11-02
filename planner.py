@@ -16,6 +16,9 @@ _TEST = {"wild": ("wild", 0, 1), "article": ("артикул", 0, 1), "cabinet":
          "cur": ("остаток на (дней)", 0, 1), "s3": (_S + "3 дня", 0, 1), "s7": (_S + "7 дней", 0, 1),
          "s14": (_S + "14 дней", 0, 1), "s30": (_S + "30 дней", 0, 1),
          "forecast": ("прогнозные остатки в днях", 0, 2), "wild_days": ("остаток на дней по вилду", 0, 1)}
+# Owner practice (2026-11-02): a regular line is not worth a shipment below 80 pcs unless it is at least half a pallet.
+MIN_LINE_QTY = 80
+KEEP_LINE_QTY = 50  # an unliftable line below this is dropped; owner ships 54-74 pcs sometimes ("не всегда")
 _DEMAND_LABELS = {"growth": "рост", "stable": "стабильно", "gentle_decline": "плавное снижение",
                   "sharp_decline": "резкое падение", "uncertain": "неопределённо"}
 _PACK = {"wild": ("wild", 0, 1), "box": ("шт в коробе", 1, 2), "pallet": ("штук на палете", 1, 2)}
@@ -171,7 +174,8 @@ def _horizon(dm, T, M):
     return T, M
 
 
-def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, demand_mode="advisory"):
+def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, demand_mode="advisory",
+               min_line_qty=MIN_LINE_QTY):
     """demand_mode: "advisory" shows the demand state per line and never changes a quantity (default: the state
     thresholds are not yet validated, see docs/demand-policy.md); "apply" also limits horizons by that state."""
     if demand_mode not in ("advisory", "apply"):
@@ -355,6 +359,18 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
             k = (T - f) * s7 / box
             q = min({box * max(1, min(nb, n)) for n in (math.floor(k), math.ceil(k))}, key=score)
             how = "whole boxes"
+        if q < min_line_qty and Fraction(q, pal) < Fraction(1, 2):
+            half = Fraction(pal, 2)
+            lift = [box * -(-min_line_qty // box)]
+            if half.denominator == 1 and half % box == 0:
+                lift.append(int(half))  # half a pallet is a normal shipment for small-pallet wilds
+            lift = [v for v in lift if v <= lim and after(v) <= M]
+            if lift:
+                how, q = f"minimum shipment (lifted from {q} pcs)", min(lift)
+            elif q < KEEP_LINE_QTY:
+                warn.append(f"{x['article']}/{x['cabinet']}: line of {q} pcs is below {KEEP_LINE_QTY} and cannot be "
+                            f"lifted to {min_line_qty} (stock/capacity/max_days); skipped")
+                continue
         emit(x, q, f"regular: {how} toward {_f(T)} days", False)
 
     return {"rules": r, "date": sd.isoformat(), "warehouse": None if warehouse is None else warehouse.strip(),

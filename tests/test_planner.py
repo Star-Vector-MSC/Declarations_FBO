@@ -33,13 +33,18 @@ def fx(a, q, reason="promo", cab="C1"):
     return {"article": a, "cabinet": cab, "quantity": q, "reason": reason}
 
 
+
+def bp(*a, **k):  # these tests are about thresholds/packing, not the minimum-line practice (tested separately)
+    return P.build_plan(*a, **{"min_line_qty": 0, **k})
+
+
 INVALID_GROUPS = (None, "", "   ", "\t\n", 0, 5, 5.0, -1.5, True, False, [], ["Item"], {}, {"g": "Item"},
                   float("nan"), float("inf"), float("-inf"))
 
 
 class PlannerTest(unittest.TestCase):
     def plan(self, trows, prows, snapshot=None, **rules):
-        res = P.build_plan(snapshot or snap(trows, prows), rules, "2026-10-28", "WH", "2026-10-30")
+        res = bp(snapshot or snap(trows, prows), rules, "2026-10-28", "WH", "2026-10-30")
         json.dumps(res, allow_nan=False)
         total = Fraction(0)
         for ln in res["lines"]:
@@ -141,7 +146,7 @@ class PlannerTest(unittest.TestCase):
                  ([fx("B", 400 * 21)], {"capacity": 20}, "capacity"), ([fx("L", 10, cab="C9")], {}, "no exact")]
         for fixed, extra, msg in cases:
             with self.assertRaisesRegex(ValueError, msg):
-                P.build_plan(small, dict(fixed=fixed, **extra), "2026-10-28", "WH")
+                bp(small, dict(fixed=fixed, **extra), "2026-10-28", "WH")
 
     def test_packing_conflicts_identical_and_blank(self):
         rows = [T("W1", "A"), T("W2", "B"), T("W3", "C"), T("W4", "D")]
@@ -189,14 +194,14 @@ class PlannerTest(unittest.TestCase):
         for args in [("2026-13-01", "WH"), ("28.10.2026", "WH"), ("2026-10-28", ""), ("2026-10-28", "  "),
                      ("2026-10-28", 5), ("2026-10-28", "WH", "2026-10-01")]:
             with self.assertRaises(ValueError):
-                P.build_plan(s, None, *args)
-        res = P.build_plan(s, None, "2026-10-28", "WH")
+                bp(s, None, *args)
+        res = bp(s, None, "2026-10-28", "WH")
         self.assertEqual((res["source_hash"], res["arrival_date"], res["date"]), ("h1", None, "2026-10-28"))
 
     def test_plan_without_warehouse_is_a_real_preliminary_plan(self):
         s = snap([T("W1", "A")], [PK("W1")])
-        with_wh = P.build_plan(s, None, "2026-10-28", "WH")
-        pre = P.build_plan(s, None, "2026-10-28", None)
+        with_wh = bp(s, None, "2026-10-28", "WH")
+        pre = bp(s, None, "2026-10-28", None)
         self.assertIsNone(pre["warehouse"])  # never a random or placeholder warehouse
         self.assertEqual(pre["lines"], with_wh["lines"])
         self.assertTrue(pre["lines"])
