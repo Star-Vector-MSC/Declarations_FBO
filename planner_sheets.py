@@ -13,6 +13,7 @@ import planner_demand
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 _API = "https://sheets.googleapis.com/v4/spreadsheets/"
 T_ORDERS = "Количество заказов"
+T_UNIT = "БД Юнит"
 T_TEST, T_PACK, T_ORIG, T_TARGET = "тест", "кол-во на палете и в коробе", "Отгрузка FBO", "Планирование FBO — ТЕСТ"
 ORIGINAL = (
     "Фактическая Дата отгрузки на вб", "Номер поставки", "Плановая дата поставки на ВБ",
@@ -344,15 +345,34 @@ class PlannerSheets:
         whs = sorted({w for w in (planner._ident(_cell(r, wc)) for r in orig[1:]) if w})
         captured = datetime.now(MSK).isoformat(timespec="seconds")
         demand = self._demand(captured)
+        ratings = self._ratings()
         parts = {"test": test, "packing": pack, "warehouses": whs}
         if demand is not None:
             parts["demand"] = demand
+        if ratings is not None:
+            parts["ratings"] = ratings
         body = _canon(parts)
         snap = {"test": test, "packing": pack, "warehouses": whs,
                 "source_hash": hashlib.sha256(body.encode("utf-8")).hexdigest(), "captured_at": captured}
         if demand is not None:
             snap["demand"] = demand
+        if ratings is not None:
+            snap["ratings"] = ratings
         return snap, orig
+
+    def _ratings(self):
+        """{article: rating} from «БД Юнит» (columns A and AW, read-only); None if unreadable (plan then says so)."""
+        try:
+            d = self._api("GET", "/values:batchGet", {"ranges": [_rng(T_UNIT) + "!A:A", _rng(T_UNIT) + "!AW:AW"],
+                                                      "valueRenderOption": "UNFORMATTED_VALUE",
+                                                      "majorDimension": "COLUMNS"})
+            a, w = ([(v.get("values") or [[]])[0] for v in d["valueRanges"]] + [[], []])[:2]
+            if not a or planner._norm(a[0]) != "артикул" or planner._norm((w or [""])[0]) != "рейтинг":
+                return None
+            return {str(planner._ident(x)): v for x, v in zip(a[1:], w[1:])
+                    if planner._ident(x) and isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0}
+        except Exception:
+            return None
 
     def _demand(self, captured):
         """Read-only demand classification per WB article; a failed read never blocks planning (plan says so)."""

@@ -16,9 +16,12 @@ _TEST = {"wild": ("wild", 0, 1), "article": ("артикул", 0, 1), "cabinet":
          "cur": ("остаток на (дней)", 0, 1), "s3": (_S + "3 дня", 0, 1), "s7": (_S + "7 дней", 0, 1),
          "s14": (_S + "14 дней", 0, 1), "s30": (_S + "30 дней", 0, 1),
          "forecast": ("прогнозные остатки в днях", 0, 2), "wild_days": ("остаток на дней по вилду", 0, 1)}
-# Owner practice (2026-11-02): a regular line is not worth a shipment below 80 pcs unless it is at least half a pallet.
-MIN_LINE_QTY = 80
-KEEP_LINE_QTY = 50  # an unliftable line below this is dropped; owner ships 54-74 pcs sometimes ("не всегда")
+# Minimum shipment line: the owner's 80 pcs / 50 pcs figures are practice for particular product groups, not a general
+# rule (2026-11-02), so the mechanism stays but is off by default (0); a per-group setting can switch it on later.
+MIN_LINE_QTY = 0
+KEEP_LINE_QTY = 50  # with the minimum on: an unliftable line below this is dropped
+# General rule: an article rated below this is not shipped to FBO (owner: threshold 4-4.1; rating 0/unknown = no data).
+MIN_RATING = 4.0
 _DEMAND_LABELS = {"growth": "рост", "stable": "стабильно", "gentle_decline": "плавное снижение",
                   "sharp_decline": "резкое падение", "uncertain": "неопределённо"}
 _PACK = {"wild": ("wild", 0, 1), "box": ("шт в коробе", 1, 2), "pallet": ("штук на палете", 1, 2)}
@@ -175,7 +178,7 @@ def _horizon(dm, T, M):
 
 
 def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, demand_mode="advisory",
-               min_line_qty=MIN_LINE_QTY):
+               min_line_qty=MIN_LINE_QTY, min_rating=MIN_RATING):
     """demand_mode: "advisory" shows the demand state per line and never changes a quantity (default: the state
     thresholds are not yet validated, see docs/demand-policy.md); "apply" also limits horizons by that state."""
     if demand_mode not in ("advisory", "apply"):
@@ -324,6 +327,10 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
                 or x["cur"] > th["max_current_days"] or x["wild_days"] < th["min_wild_days"]):
             continue
         eligible += 1
+        rt = _num((snapshot.get("ratings") or {}).get(x["article"]))
+        if rt is not None and 0 < rt < _num(min_rating):
+            warn.append(f"{x['article']}/{x['cabinet']}: rating {_f(rt)} is below {min_rating}; not shipped")
+            continue
         if x["wild"] in bad:
             continue
         x["_T"], x["_M"] = _horizon(demand_of(x), T, M) if demand_mode == "apply" else (T, M)
