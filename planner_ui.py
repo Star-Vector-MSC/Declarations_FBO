@@ -895,6 +895,17 @@ class PlannerController:
                                               f"({ln['pallets']} пал.)"))
         return "\n".join(parts)
 
+    def _rules_fn(self, d):
+        """Rules for an update: the plan's own rules plus every remembered decision valid today (e.g. a wild the owner
+        has permanently excluded after the plan was made)."""
+        plan = d["plan"]
+
+        def fn(snap):
+            wilds = set(planner_ai.catalog(snap)["wilds"].values())
+            sel = exp.select(self.memory.entries(), plan_id=d["id"], on_date=plan["date"], wilds=wilds)
+            return exp.merge(base_rules(d), sel, set(plan.get("explicit_keys") or ()))[0]
+        return fn
+
     async def _c_up(self, uid, ct, msg, did, ver):
         d = await asyncio.to_thread(self.store.get, uid, did, ver)
         if d.get("exported_version") != ver:
@@ -902,7 +913,8 @@ class PlannerController:
         await msg.answer("Читаю тестовый лист…")
 
         def work():
-            return self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did))
+            self._mem_ok()
+            return self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did), rules_fn=self._rules_fn(d))
         s = await asyncio.to_thread(work)
         if not s["removed"] and not s["added"]:
             await msg.answer(f"В листе нет строк «Не согласовано», и добавлять нечего: загрузка {s['total_pallets']} из "
@@ -925,9 +937,11 @@ class PlannerController:
         def work():
             if not self._owner(uid, ct) or self._gen.get(uid, 0) != g:
                 raise _Blocked("Обновление отменено.")
-            pre = self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did))
+            self._mem_ok()
+            fn = self._rules_fn(d)
+            pre = self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did), rules_fn=fn)
             self.store.add_rejected(uid, did, pre["refused"])  # first: a retry after a lost response must not resurrect them
-            return self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did), apply=True)
+            return self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did), apply=True, rules_fn=fn)
         try:
             s = await asyncio.to_thread(work)
         except Exception as e:

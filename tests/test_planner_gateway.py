@@ -432,6 +432,14 @@ class ReconcileTest(unittest.TestCase):
         r = self.gw.reconcile(self.draft, rejected_before=[("A3", "Каб")])
         self.assertEqual(r["added"], [])
 
+    def test_current_rules_from_memory_are_used_for_the_refill(self):
+        self.s.tabs[ps.T_TEST].append(["W3", "A3", "Каб", "Товар3", 1000, 5, 10, 10, 10, 10, 2, 2, 60])
+        self.s.tabs[ps.T_PACK].append(["W3", 1, 1, 10, 40])
+        self.mark(1)
+        self.assertEqual([ln["article"] for ln in self.gw.reconcile(self.draft)["added"]], ["A3"])
+        r = self.gw.reconcile(self.draft, rules_fn=lambda snap: {**self.draft["plan"]["rules"], "excluded_wild": ["W3"]})
+        self.assertEqual(r["added"], [])  # a wild excluded after the plan was made is not added back
+
     def test_foreign_rows_and_bad_quantity_are_refused(self):
         self.s.tabs[ps.T_TARGET].append(["ручная"])
         with self.assertRaises(ps.PlannerSheetsError):

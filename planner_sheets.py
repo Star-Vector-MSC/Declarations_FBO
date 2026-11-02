@@ -407,7 +407,7 @@ class PlannerSheets:
     def _link(self, tid, row):
         return f"https://docs.google.com/spreadsheets/d/{self._config()[0]}/edit#gid={tid}&range=A{row}"
 
-    def reconcile(self, draft, rejected_before=(), apply=False):
+    def reconcile(self, draft, rejected_before=(), apply=False, rules_fn=None):
         """After the owner marked rows «Не согласовано» in the test sheet: drop those rows, keep the rest and append new
         lines to fill the machine. apply=False only computes the summary. Rows are compacted by copying cells upwards
         and clearing the tail: a row is never deleted, because deleting row 2 breaks the header formulas ($K$2 -> #REF!)."""
@@ -444,7 +444,7 @@ class PlannerSheets:
             fixed.append({"article": ident(i)[0], "cabinet": ident(i)[1], "quantity": int(q), "reason": "kept by owner"})
         excl = {tuple(x) for x in rejected_before} | {ident(i) for i in refused}
         fresh, _orig = self._read()
-        rules = dict(plan["rules"])
+        rules = dict(rules_fn(fresh) if rules_fn else plan["rules"])  # rules_fn: saved rules + what memory knows today
         rules["fixed"] = fixed
         try:
             new = planner.build_plan(fresh, rules, plan["date"], plan["warehouse"], plan.get("arrival_date"), exclude=excl)

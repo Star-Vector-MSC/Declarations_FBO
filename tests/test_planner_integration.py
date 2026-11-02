@@ -40,7 +40,9 @@ class FakeSheets:
         self.published.append((draft["id"], draft["version"]))
         return "https://docs.google.com/spreadsheets/d/x/edit#gid=1&range=A3"
 
-    def reconcile(self, draft, rejected_before=(), apply=False):
+    def reconcile(self, draft, rejected_before=(), apply=False, rules_fn=None):
+        if rules_fn:
+            self.rules_seen = rules_fn(self.snapshot())  # the controller builds it from the plan + memory
         self.reconciled = getattr(self, "reconciled", []) + [(draft["id"], tuple(rejected_before), apply)]
         s = {"removed": [("A1", "Каб", 48)], "kept": 1, "total_pallets": 1.5, "capacity": 33, "warnings": [],
              "added": [{"article": "A3", "cabinet": "Каб", "quantity": 40, "pallets": 1}],
@@ -611,6 +613,7 @@ class UpdateFromSheetTests(UiBase):
         await self.ctl.handle_callback(c)
         self.assertTrue(self.sheets.reconciled[-1][2])
         self.assertIn("range=A2", said(m5))
+        self.assertEqual(self.sheets.rules_seen["capacity"], 33)
         self.assertEqual(self.ctl.store.rejected(OWNER, did), [("A1", "Каб")])  # remembered: never proposed again
         c, m6 = cb(f"pl:uk:{did}:{ver}", m4)  # replay of the confirm button
         await self.ctl.handle_callback(c)
