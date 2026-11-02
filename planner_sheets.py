@@ -426,7 +426,7 @@ class PlannerSheets:
             raise SourceChangedError("Сохранённый план не совпадает с пересчётом по текущим данным. Пересчитайте план.")
 
         last = len(rows)
-        while last > 1 and all(planner._blank(c) for c in rows[last - 1]):
+        while last > 1 and all(planner._blank(c) or c is False for c in rows[last - 1]):  # empty checkboxes are not data
             last -= 1
         if any(isinstance(c, str) and c.startswith("=") and not _scalar(c) for r in rows[1:] for c in r):
             raise PlannerSheetsError("В тестовом листе есть формулы сложнее простой арифметики; "

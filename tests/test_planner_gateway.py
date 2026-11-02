@@ -194,6 +194,13 @@ class GatewayTest(unittest.TestCase):
         self.assertTrue(self.gw.publish(self.draft).startswith("https://"))
         self.assertEqual(len(self.s.posts), 1)
 
+    def test_trailing_empty_checkbox_rows_do_not_push_the_plan_down(self):
+        t = self.s.tabs[ps.T_TARGET]
+        t.extend([[""] * 14 + [False] for _ in range(30)])
+        self.gw.publish(self.draft)
+        ins = self.s.posts[0]["requests"][0]["insertDimension"]["range"]
+        self.assertEqual(ins["startIndex"], 2)  # right below the last real row, not below the checkbox tail
+
     def test_config_gid_and_swapped_titles_refused(self):
         for bad in (["same", "same"], ["fake-base", "100"], ["fake-base", True], ["fake-base"]):
             sys.modules["wb_declarations"] = types.SimpleNamespace(KEY="unused", SHIPMENTS=bad)
