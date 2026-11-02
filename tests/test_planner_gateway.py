@@ -46,7 +46,7 @@ class FakeSession:
         def f(s):
             return {"userEnteredValue": {"formulaValue": s}}
         self.tpl = [{}] * 38
-        self.tpl[13], self.tpl[19], self.tpl[25], self.tpl[36] = f("=M2"), f("=S2/X2"), f("=ARRAYFORMULA(A2:A)"), f("=T2")
+        self.tpl[15], self.tpl[19], self.tpl[25], self.tpl[36] = f("=M2"), f("=S2/X2"), f("=ARRAYFORMULA(A2:A)"), f("=T2")
         self.posts, self.fail, self.grid, self.hook = [], False, [], None
         self.rc, self.ids = 3, dict(IDS)
 
@@ -61,7 +61,11 @@ class FakeSession:
                 raise ConnectionError("response lost")
             return Resp({})
         if url.endswith("/values:batchGet"):
-            return Resp({"valueRanges": [{"values": copy.deepcopy(self.tabs[r[1:-1]])} for r in params["ranges"]]})
+            def tab(r):
+                head = r.endswith("!1:1")
+                v = copy.deepcopy(self.tabs[(r[1:-5] if head else r[1:-1])])
+                return {"values": v[:1] if head else v}
+            return Resp({"valueRanges": [tab(r) for r in params["ranges"]]})
         if "rowData" in params["fields"]:
             self.grid.append(params["ranges"])
             return Resp({"sheets": [{"data": [{"rowData": [{"values": self.tpl}]}]}]})
@@ -135,11 +139,14 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual([r["copyPaste"]["source"]["sheetId"] for r in reqs if "copyPaste" in r], [777, 777])
         self.assertEqual(self.s.grid, ["'Отгрузка FBO'!2:2"])
         t = self.s.tabs[ps.T_TARGET]
-        self.assertEqual([t[2][13], t[3][13], t[2][36], t[3][36]], ["=M3", "=M4", "=T3", "=T4"])  # verified text, shifted
+        self.assertEqual([t[2][15], t[3][15], t[2][36], t[3][36]], ["=M3", "=M4", "=T3", "=T4"])  # verified text, shifted
         self.assertEqual(t[1][:3], ["ручная", "", "=1+1"])
         self.assertEqual([t[2][COL("Артикул")], t[3][COL("Артикул")]], ["A1", "12345"])
         self.assertEqual(t[2][COL("Тип поставки")], "Монопаллета")
-        self.assertEqual(t[2][COL("Статус отгрузки")], "")
+        self.assertEqual(t[2][COL("Статус отгрузки")], "Одобрено")
+        self.assertEqual(t[2][COL("Сборка товара (Склад)")], t[2][COL("Дата отгрузки (склад)")] - 1)
+        self.assertEqual(t[2][COL("К отгрузке")], 48)
+        self.assertEqual(t[2][COL("Название предмета")], self.draft["plan"]["lines"][0]["product"])
 
     def test_lost_response_replay_after_source_moved(self):
         self.s.fail = True
@@ -153,7 +160,7 @@ class GatewayTest(unittest.TestCase):
 
     def test_edited_markers_and_other_version_refused(self):
         self.gw.publish(self.draft)
-        q = COL("Количество")
+        q = COL("К отгрузке")
         self.s.tabs[ps.T_TARGET][2][q] = 60
         with self.assertRaises(ps.PublishConflictError):
             self.gw.publish(self.draft)
@@ -239,13 +246,13 @@ class GatewayTest(unittest.TestCase):
         self.gw.publish(self.draft)
         t, hdr = self.s.tabs[ps.T_TARGET], list(ps.ORIGINAL + ps.META)
         for name, v in (("Артикул", "012345"), ("Название магазина", "Каб2"), ("wild", "W9"), ("Плановая дата прибытия авто на вб", 46001), ("Правила плана", "{}"),
-                        ("Шт в коробе", ""), ("Прогноз после", 12345.5), ("Склад Wildberries", "Казань")):
+                        ("Статус отгрузки", ""), ("Прогноз после", 12345.5), ("Склад Wildberries", "Казань")):
             c = hdr.index(name)
             old, t[3][c] = t[3][c], v
             with self.assertRaises(ps.PublishConflictError, msg=name):
                 self.gw.publish(self.draft)
             t[3][c] = old
-        t[2][COL("Количество")] = 48.0
+        t[2][COL("К отгрузке")] = 48.0
         t[2], t[3] = t[3], t[2]
         self.assertTrue(self.gw.publish(self.draft).endswith("range=A3"))
         del t[3]
@@ -266,10 +273,10 @@ class GatewayTest(unittest.TestCase):
                 self.gw.publish(self.draft)
             row.pop()
         self.assertEqual(self.s.posts, [])
-        self.s.tpl[13] = {"userEnteredValue": {"formulaValue": "=SEQUENCE(9)"}}
+        self.s.tpl[15] = {"userEnteredValue": {"formulaValue": "=SEQUENCE(9)"}}
         self.gw.publish(self.draft)
         t = self.s.tabs[ps.T_TARGET]
-        self.assertEqual((t[2][13], t[2][36]), ("", "=T3"))  # unverifiable formula skipped, not copied
+        self.assertEqual((t[2][15], t[2][36]), ("", "=T3"))  # unverifiable formula skipped, not copied
         self.s.tabs[ps.T_TARGET].clear()
         for bad_src in ({"sheetId": 100}, {"sheetId": 100, "startColumnIndex": 3}):
             req = [{"copyPaste": {"source": bad_src, "destination": {"sheetId": 777, "startRowIndex": 2, "endRowIndex": 3},

@@ -305,8 +305,9 @@ class PlannerSheets:
             raise PlannerSheetsError("Тестовый лист был пересоздан; перезапустите бота")
         return ids
 
-    def _values(self, titles, render):
-        d = self._api("GET", "/values:batchGet", {"ranges": [_rng(t) for t in titles], "valueRenderOption": render,
+    def _values(self, titles, render, head=False):
+        d = self._api("GET", "/values:batchGet", {"ranges": [_rng(t) + ("!1:1" if head else "") for t in titles],
+                                                  "valueRenderOption": render,
                                                   "dateTimeRenderOption": "SERIAL_NUMBER", "majorDimension": "ROWS"})
         vr = d.get("valueRanges", [])
         if len(vr) != len(titles):
@@ -357,21 +358,22 @@ class PlannerSheets:
         rows = self._values((T_TARGET,), "FORMULA")[0]
         if not rows:
             raise PlannerSheetsError("В тестовом листе нет заголовков")
-        cols = _bind(rows[0], ORIGINAL + META, T_TARGET)
+        # header cells hold array formulas (as in the original): bind by their shown labels, not by formula text
+        head = self._values((T_TARGET,), "UNFORMATTED_VALUE", head=True)[0] or [[]]
+        cols = _bind(head[0], ORIGINAL + META, T_TARGET)
 
         def g(r, n, o=0):
             return _cell(r, cols[_c(n, o)])
 
         sd, arr, rules = _serial(plan["date"]), _serial(plan.get("arrival_date")), _canon(plan["rules"])
 
-        def cells(ln):  # the ONE owned input+metadata cell map: used for writing and for replay comparison
-            return {_c("Дата отгрузки (склад)"): _dv(sd), _c("Плановая дата прибытия авто на вб"): _dv(arr),
-                    _c("Склад Wildberries"): _sv(plan["warehouse"]), _c("wild"): _sv(ln["wild"]),
-                    _c("Артикул"): _sv(ln["article"]), _c("Название магазина"): _sv(ln["cabinet"]),
-                    _c("Тип поставки"): _sv("Монопаллета"), _c("Количество"): _nv(ln["quantity"]),
-                    _c("Шт в коробе"): _nv(ln["box_qty"]), _c("Шт на паллете"): _nv(ln["pallet_qty"]),
-                    _c("Итого паллет"): _nv(ln["pallets"]), _c("Итого коробов"): _nv(ln["quantity"] // ln["box_qty"]),
-                    _c("средние продажи в день по артикулу"): _nv(ln["sales7"]),
+        def cells(ln):  # the ONE owned cell map (input columns only: the sheet's own header formulas compute the rest)
+            return {_c("Дата отгрузки (склад)"): _dv(sd), _c("Сборка товара (Склад)"): _dv(sd - 1),
+                    _c("Плановая дата прибытия авто на вб"): _dv(arr),
+                    _c("Склад Wildberries"): _sv(plan["warehouse"]), _c("Статус отгрузки"): _sv("Одобрено"),
+                    _c("wild"): _sv(ln["wild"]), _c("Артикул"): _sv(ln["article"]),
+                    _c("Название магазина"): _sv(ln["cabinet"]), _c("Название предмета"): _sv(ln["product"]),
+                    _c("Тип поставки"): _sv("Монопаллета"), _c("К отгрузке"): _nv(ln["quantity"]),
                     _c("Комментарии"): _sv(f"ТЕСТ. План {did} v{ver}: {ln['reason']}"),
                     _c("ID плана"): _sv(did), _c("Версия плана"): _nv(ver),
                     _c("Прогноз до"): _nv(ln["forecast_before"]), _c("Прогноз после"): _nv(ln["forecast_after"]),
@@ -411,7 +413,7 @@ class PlannerSheets:
         last = len(rows)
         while last > 1 and all(planner._blank(c) for c in rows[last - 1]):
             last -= 1
-        if any(isinstance(c, str) and c.startswith("=") and not _scalar(c) for r in rows for c in r):
+        if any(isinstance(c, str) and c.startswith("=") and not _scalar(c) for r in rows[1:] for c in r):
             raise PlannerSheetsError("В тестовом листе есть формулы сложнее простой арифметики; "
                                      "дописывать строки небезопасно")
         oc = _bind(orig[0], ORIGINAL, T_ORIG)
@@ -443,7 +445,7 @@ class PlannerSheets:
             cmap = {oc[k] + 1: cols[k] + 1 for k in oc}  # source column -> same-named column of the test sheet
             for key, ocol in oc.items():
                 f = ((vals[ocol] if ocol < len(vals) else {}).get("userEnteredValue") or {}).get("formulaValue")
-                if f and key not in per[0] and _scalar(f):  # unverifiable formulas are skipped, never written
+                if f and key not in per[0] and _scalar(f) and _REF.search(f):  # unverifiable formulas are skipped, never written
                     texts = [_shift(f, start + i - tpl, 0, cmap) for i in range(n)]
                     if None not in texts:
                         fcells[key] = texts
