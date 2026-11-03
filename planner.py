@@ -327,6 +327,13 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
     low = T * Fraction(7, 10)  # "reasonably near target" window for pallet presets: [0.7*target, max_days]
     fixed_keys = {(fx["article"], fx["cabinet"]) for fx in r["fixed"]}
     excl = {(str(a), str(c)) for a, c in exclude}  # lines the owner has refused: never proposed again
+    # Stock keeps selling until the goods reach WB: the planning forecast is the sheet's forecast minus those days
+    # (never below 0). Lines still show the sheet's own forecast.
+    ref = (meta.get("captured_at") or "")[:10]
+    try:
+        run_days = max(0, ((ad or sd) - date.fromisoformat(ref)).days)
+    except ValueError:
+        run_days = 0
     cands, eligible = [], 0
     for key, x in src.items():
         if x["wild"] in banned or x["wild"] in badgroup:
@@ -346,17 +353,18 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
             continue
         if x["wild"] in bad:
             continue
+        x["fa"] = max(Fraction(0), x["forecast"] - run_days)
         x["_T"], x["_M"] = _horizon(demand_of(x), T, M) if demand_mode == "apply" else (T, M)
         if x["_T"] is None:
             warn.append(f"{x['article']}/{x['cabinet']}: demand state {_DEMAND_LABELS.get((demand_of(x) or {}).get('state'), '')}; "
                         "no automatic replenishment")
-        elif x["forecast"] < x["_T"]:
+        elif x["fa"] < x["_T"]:
             cands.append(x)
-    cands.sort(key=lambda x: (x["forecast"], x["article"], x["cabinet"]))
+    cands.sort(key=lambda x: (x["fa"], x["article"], x["cabinet"]))
 
     for x in cands:
         T, M, low = x["_T"], x["_M"], x["_T"] * Fraction(7, 10)
-        w, f, s7 = x["wild"], x["forecast"], x["s7"]
+        w, f, s7 = x["wild"], x["fa"], x["s7"]
         box, pal = pack[w]
         lim = min(budget[w] - used.get(w, 0), math.floor((cap - total) * pal), math.floor((M - f) * s7))
         nb = lim // box

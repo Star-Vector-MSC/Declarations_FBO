@@ -94,3 +94,30 @@ class CrumbTest(unittest.TestCase):
 
     def test_threshold_can_be_switched_off(self):
         self.assertEqual([ln["article"] for ln in self.build(min_cover=0)["lines"]], ["A1", "A2"])
+
+
+class RunDownTest(unittest.TestCase):
+    """Stock keeps selling until the goods reach WB: the forecast used for planning is lowered by those days."""
+
+    def qty(self, captured, fc, arrival=None):
+        s = snap([T("w1", "A1", fc=fc)], [PK("w1")])
+        s["captured_at"] = captured
+        r = P.build_plan(s, {}, "2026-11-05", "WH", arrival, min_line_qty=0, floor_qty=0, min_cover=0, demand_mode="advisory")
+        return sum(l["quantity"] for l in r["lines"])
+
+    def test_more_is_needed_the_longer_the_goods_travel(self):
+        same_day = self.qty("2026-11-05T08:00", 6)
+        self.assertGreater(self.qty("2026-11-02T08:00", 6), same_day)  # 3 days before shipment
+        self.assertGreaterEqual(self.qty("2026-11-02T08:00", 6, arrival="2026-11-07"), self.qty("2026-11-02T08:00", 6))
+
+    def test_stock_that_looked_sufficient_now_enters_the_plan(self):
+        self.assertEqual(self.qty("2026-11-05T08:00", 11), 0)
+        self.assertGreater(self.qty("2026-11-02T08:00", 11), 0)  # 11 - 3 = 8 days left on arrival
+
+    def test_runs_out_before_arrival_counts_as_zero_not_negative(self):
+        zero = self.qty("2026-10-01T08:00", 2)
+        self.assertEqual(zero, self.qty("2026-10-01T08:00", 0))
+        self.assertGreater(zero, 0)
+
+    def test_bad_capture_date_means_no_run_down(self):
+        self.assertEqual(self.qty("", 6), self.qty("2026-11-05T08:00", 6))

@@ -26,7 +26,7 @@ def PK(w, box=10, pal=400):
 
 
 def snap(trows, prows, th=TH):
-    return {"test": [th] + trows, "packing": [PH] + prows, "source_hash": "h1", "captured_at": "2026-10-27T08:00"}
+    return {"test": [th] + trows, "packing": [PH] + prows, "source_hash": "h1", "captured_at": "2026-12-31T08:00"}  # after every test date: no run-down before arrival
 
 
 def fx(a, q, reason="promo", cab="C1"):
