@@ -1,0 +1,619 @@
+"""Google Sheets gateway for FBO planning: read-only sources; append-only rows to the pinned TEST sheet
+via one atomic batchUpdate. Config/credentials/session are created lazily (nothing at import/constructor)."""
+import hashlib
+import json
+import re
+from collections import Counter
+from datetime import date, datetime, timedelta, timezone
+from fractions import Fraction
+
+import planner
+import planner_demand
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+_API = "https://sheets.googleapis.com/v4/spreadsheets/"
+T_ORDERS = "Количество заказов"
+T_UNIT = "БД Юнит"
+T_TEST, T_PACK, T_ORIG, T_TARGET = "тест", "кол-во на палете и в коробе", "Отгрузка FBO", "Планирование FBO — ТЕСТ"
+ORIGINAL = (
+    "Фактическая Дата отгрузки на вб", "Номер поставки", "Плановая дата поставки на ВБ",
+    "Плановая дата прибытия авто на вб", "Дата отгрузки (склад)", "Сборка товара (Склад)",
+    "Факт Сборка товара (Склад)", "Готовность склада (Алексей)", "Склад Wildberries", "Статус отгрузки", "wild",
+    "Артикул", "Название магазина", "Название предмета", "Чек лист Декларация", "Свободный остаток",
+    "Остаток на дней по стоку", "Тип поставки", "Количество", "Итого паллет", "Палето-мест в машине",
+    "Шт в коробе", "Итого коробов", "Шт на паллете", "средние продажи в день по артикулу",
+    "Текущий остаток на ФБО", "Рейтинг", "Остаток на (дней)", "К отгрузке", "Дней загрузки план",
+    "Короб", "Вес товара ед", "Вес товара в поставке", "Комментарии", "Собрано по факту (Склад)", "Факт Иван",
+    "Факт сборка (Дима)", "Итого паллет", "Общее кол-во к отгрузке на палете")
+META = ("ID плана", "Версия плана", "Прогноз до", "Прогноз после", "Причина", "Снимок данных", "Правила плана")
+MSK = timezone(timedelta(hours=3), "MSK")  # Moscow: fixed UTC+3, no DST
+_EPOCH = date(1899, 12, 30)
+_DF = {"numberFormat": {"type": "DATE", "pattern": "dd.MM.yyyy"}}
+_TOK = re.compile(r"\s*(?:(\$?[A-Za-z]{1,3}\$?[1-9][0-9]*|[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)|([-+*/^%()]))")
+_REF = re.compile(r"(?<![A-Za-z0-9.])(\$?)([A-Za-z]{1,3})(\$?)([1-9][0-9]*)")
+_HEX12 = re.compile(r"[0-9a-f]{12}")
+_UNSURE = ("Связь с Google Sheets прервалась во время записи, результат неизвестен. Повторите публикацию "
+           "той же версии: повтор проверит маркеры и не создаст дубликатов.")
+
+
+class PlannerSheetsError(Exception):
+    """Friendly sanitized error, safe to show to the user."""
+
+
+class SourceChangedError(PlannerSheetsError):
+    pass
+
+
+class PublishConflictError(PlannerSheetsError):
+    pass
+
+
+class PublishUncertainError(PlannerSheetsError):
+    pass
+
+
+def _c(name, occ=0):
+    return planner._norm(name), occ
+
+
+def _rng(title):
+    return "'" + title.replace("'", "''") + "'"
+
+
+def _cell(row, i):
+    return row[i] if i < len(row) else None
+
+
+def _canon(x):
+    return json.dumps(x, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _s(v):
+    return v.strip() if isinstance(v, str) else v
+
+
+def _sv(v):
+    return {} if v is None else {"userEnteredValue": {"stringValue": str(v)}}
+
+
+def _art(v):
+    """WB article as the original sheet stores it: a number (formula lookups compare types), text only when it is
+    not a plain number (leading zero, letters)."""
+    return _nv(int(v)) if isinstance(v, str) and re.fullmatch(r"[1-9][0-9]{0,14}", v) else _sv(v)
+
+
+def _nv(v):
+    return {} if v is None else {"userEnteredValue": {"numberValue": v}}
+
+
+def _dv(v):
+    return dict(_nv(v), userEnteredFormat=_DF)
+
+
+def _serial(iso):
+    return None if iso is None else (date.fromisoformat(iso) - _EPOCH).days
+
+
+def _cmp(v):
+    """Comparable cell value (sheet value or our CellData): text stays exact text ("12345" != "012345"), numbers compare
+    exactly as numbers (48 == 48.0), blank -> None. A text/number type change counts as a difference."""
+    if isinstance(v, dict):
+        u = v.get("userEnteredValue") or {}
+        v = u["stringValue"] if "stringValue" in u else u.get("numberValue")
+    if isinstance(v, bool):
+        return ("b", v)
+    if isinstance(v, (int, float)):
+        return ("n", Fraction(repr(v)))
+    return ("s", v.strip()) if isinstance(v, str) and v.strip() else None
+
+
+def _scalar(f):
+    """Provably scalar formula: '=' then numbers / single-cell refs ($A$1), + - * / ^ %, parentheses, spaces."""
+    if not isinstance(f, str) or not f.startswith("="):
+        return False
+    s, i, depth, opnd = f[1:].rstrip(), 0, 0, False
+    while i < len(s):
+        m = _TOK.match(s, i)
+        if not m:
+            return False
+        i, a, op = m.end(), m.group(1), m.group(2)
+        if a or op == "(":
+            if opnd:  # operand/call directly after an operand (e.g. LOG10(5)) is not arithmetic
+                return False
+            depth, opnd = depth + (op == "("), bool(a)
+        elif op == ")":
+            if not opnd or not depth:
+                return False
+            depth -= 1
+        elif op == "%":
+            if not opnd:
+                return False
+        elif opnd:
+            opnd = False
+        elif op not in "+-":
+            return False
+    return opnd and depth == 0
+
+
+def _shift(f, dr, dc, cmap=None):
+    """Verified scalar formula text with relative cell refs moved by (rows, columns), as a paste would do; None if a ref
+    leaves the sheet. Absolute ($) parts stay put. With cmap {source column: target column} (1-based, built from
+    header names when the two sheets' layouts differ) every column ref is translated by name instead; a ref to a
+    column that has no counterpart makes the formula unusable (None)."""
+    bad = []
+
+    def one(m):
+        ca, col, ra, row = m.groups()
+        n = 0
+        for ch in col.upper():
+            n = n * 26 + ord(ch) - 64
+        if cmap is not None:
+            n = cmap.get(n, 0)
+        else:
+            n = n + (0 if ca else dc)
+        r = int(row) + (0 if ra else dr)
+        if not 1 <= n <= 18278 or r < 1:
+            bad.append(1)
+            return m.group(0)
+        out = ""
+        while n:
+            n, k = divmod(n - 1, 26)
+            out = chr(65 + k) + out
+        return f"{ca}{out}{ra}{r}"
+    res = _REF.sub(one, f)
+    return None if bad or not _scalar(res) else res
+
+
+def _sid(x):
+    v = x.get("spreadsheet_id") or x.get("id") if isinstance(x, dict) else x
+    if not isinstance(v, str) or not v.strip():
+        raise PlannerSheetsError("Конфигурация таблиц некорректна")
+    return v.strip()
+
+
+def _rows(values):
+    """Drop fully blank rows (header kept first) and trailing blank cells."""
+    out = []
+    for i, r in enumerate(values or []):
+        r = list(r)
+        while r and planner._blank(r[-1]):
+            r.pop()
+        if r or i == 0:
+            out.append(r)
+    return out
+
+
+def _bind(header, names, where):
+    """Map (normalized name, occurrence) -> column; each name must occur exactly as often as expected."""
+    pos, want, seen, out = {}, Counter(planner._norm(n) for n in names), Counter(), {}
+    for i, h in enumerate(header):
+        if not planner._blank(h):
+            pos.setdefault(planner._norm(h), []).append(i)
+    for n in names:
+        k = planner._norm(n)
+        found = pos.get(k, [])
+        if len(found) != want[k]:
+            raise PlannerSheetsError(f"Лист «{where}»: столбец «{n}» ожидается {want[k]} раз, найдено {len(found)}")
+        out[(k, seen[k])] = found[seen[k]]
+        seen[k] += 1
+    return out
+
+
+_LABELS = re.compile(r'^=\{\s*((?:"[^"]*"\s*\\?\s*)+);')
+
+
+def _heads(shown, formulas):
+    """Header labels as shown; where a header array formula shows an error or nothing (it cannot spill while the
+    sheet has no data rows), take its own literal labels: ={"A"\"B"; ARRAYFORMULA(...)} -> A, B."""
+    out = list(shown) + [None] * max(0, len(formulas) - len(shown))
+    for i, f in enumerate(formulas):
+        m = _LABELS.match(f) if isinstance(f, str) else None
+        for k, lab in enumerate(re.findall(r'"([^"]*)"', m.group(1)) if m else ()):
+            if i + k < len(out) and (planner._blank(out[i + k]) or str(out[i + k]).startswith("#")):
+                out[i + k] = lab
+    return out
+
+
+def _draft(d):
+    try:
+        did, ver, plan = d["id"], d["version"], d["plan"]
+        lines, cap = plan["lines"], plan["rules"]["capacity"]
+        ok = bool(isinstance(did, str) and _HEX12.fullmatch(did) and type(ver) is int and ver > 0
+                  and isinstance(plan["source_hash"], str) and isinstance(plan["warehouse"], str))
+        _serial(plan["date"]), _serial(plan.get("arrival_date"))
+        total = Fraction(0)
+        for ln in lines:
+            q, b, p = ln["quantity"], ln["box_qty"], ln["pallet_qty"]
+            ok = ok and all(type(x) is int and x > 0 for x in (q, b, p)) and q % b == 0
+            ok = ok and all(isinstance(ln[k], str) and ln[k] for k in ("wild", "article", "cabinet"))
+            total += Fraction(q, p)
+        over = total > cap
+    except (TypeError, KeyError, ValueError, AttributeError, ZeroDivisionError):
+        ok = False
+    if not ok:
+        raise PlannerSheetsError("Некорректный черновик плана (нужны целые коробки и полные строки)")
+    if not lines:
+        raise PlannerSheetsError("План пуст — публиковать нечего")
+    if over:
+        raise PlannerSheetsError("План превышает вместимость машины")
+    return did, ver, plan
+
+
+def _cells(did, ver, plan, ln):
+    """The ONE owned cell map (input columns only: the sheet's own header formulas compute the rest)."""
+    sd, arr, rules = _serial(plan["date"]), _serial(plan.get("arrival_date")), _canon(plan["rules"])
+    return {_c("Дата отгрузки (склад)"): _dv(sd), _c("Сборка товара (Склад)"): _dv(sd - 1),
+            _c("Плановая дата прибытия авто на вб"): _dv(arr),
+            _c("Склад Wildberries"): _sv(plan["warehouse"]), _c("Статус отгрузки"): _sv("Одобрено"),
+            _c("wild"): _sv(ln["wild"]), _c("Артикул"): _art(ln["article"]),
+            _c("Название магазина"): _sv(ln["cabinet"]), _c("Название предмета"): _sv(ln["product"]),
+            _c("Тип поставки"): _sv("Монопаллета"), _c("К отгрузке"): _nv(ln["quantity"]),
+            _c("ID плана"): _sv(did), _c("Версия плана"): _nv(ver),
+            _c("Прогноз до"): _nv(ln["forecast_before"]), _c("Прогноз после"): _nv(ln["forecast_after"]),
+            _c("Причина"): _sv(ln["reason"]), _c("Снимок данных"): _sv(plan["source_hash"]),
+            _c("Правила плана"): _sv(rules)}
+
+
+def _guard(reqs, tid, r0, r1, hi=None):
+    """Every write destination and copy source must be the test sheet, cells only inside the rows inserted at [r0, r1).
+    The original sheet is never a source or destination of a write (formulas are written as verified text).
+    hi: cells (not rows) may extend to this row when stale service cells below the new rows are wiped."""
+    hi = r1 if hi is None else max(r1, hi)
+    for r in reqs:
+        (kind, b), = r.items()
+        dst = {"appendDimension": b, "insertDimension": b.get("range"), "copyPaste": b.get("destination"),
+               "updateCells": b.get("range")}.get(kind)
+        src = b["source"]["sheetId"] if kind == "copyPaste" else tid
+        if (not dst or dst.get("sheetId") != tid or src != tid
+                or (kind == "insertDimension"
+                    and (dst.get("dimension"), dst.get("startIndex"), dst.get("endIndex")) != ("ROWS", r0, r1))
+                or (kind in ("copyPaste", "updateCells")
+                    and not r0 <= dst.get("startRowIndex", -1) < dst.get("endRowIndex", -1) <= hi)):
+            raise PlannerSheetsError("Внутренняя проверка: запись вне тестового листа запрещена")
+
+
+class PlannerSheets:
+    """snapshot() -> dict; publish(draft) -> link to the first test row of that plan version."""
+
+    def __init__(self, session=None):
+        self._session, self._cfg, self._pinned = session, None, None
+
+    def _config(self):
+        if self._cfg is None:
+            try:
+                import wb_declarations as wb  # existing project config only: (workbook_id, original_sheet_gid)
+                base, og, key = _sid(wb.SHIPMENTS[0]), wb.SHIPMENTS[1], wb.KEY
+            except PlannerSheetsError:
+                raise
+            except Exception:
+                raise PlannerSheetsError("Конфигурация таблиц недоступна") from None
+            if type(og) is not int or og < 0:
+                raise PlannerSheetsError("Конфигурация таблиц некорректна")
+            self._cfg = base, key, og
+        return self._cfg
+
+    def _http(self):
+        if self._session is None:
+            key = self._config()[1]
+            try:
+                from google.auth.transport.requests import AuthorizedSession
+                from google.oauth2 import service_account as sa
+                make = (sa.Credentials.from_service_account_info if isinstance(key, dict)
+                        else sa.Credentials.from_service_account_file)
+                self._session = AuthorizedSession(make(key, scopes=SCOPES))
+            except Exception:
+                raise PlannerSheetsError("Не удалось подключиться к Google Sheets") from None
+        return self._session
+
+    def _api(self, method, suffix="", params=None, body=None):
+        base, http, write = self._config()[0], self._http(), method == "POST"
+        try:
+            r = http.request(method, _API + base + suffix, params=params, json=body, timeout=90)
+            code = r.status_code
+        except Exception:
+            raise (PublishUncertainError(_UNSURE) if write
+                   else PlannerSheetsError("Google Sheets недоступен, попробуйте позже")) from None
+        if write and (code >= 500 or code in (408, 429)):
+            raise PublishUncertainError(_UNSURE)
+        if code != 200:
+            raise PlannerSheetsError(f"Google Sheets отклонил запрос (код {code})" + ("; запись не выполнена" * write))
+        try:
+            return r.json()
+        except Exception:
+            if write:
+                return {}
+            raise PlannerSheetsError("Некорректный ответ Google Sheets") from None
+
+    def _meta(self):
+        d = self._api("GET", "", {"fields": "sheets.properties(sheetId,title,gridProperties.rowCount)"})
+        props = [s.get("properties", {}) for s in d.get("sheets", [])]
+        ids = {}
+        for t in (T_TEST, T_PACK, T_ORIG, T_TARGET):
+            m = [p for p in props if p.get("title") == t]
+            if len(m) != 1:
+                raise PlannerSheetsError(f"Лист «{t}» должен быть ровно один")
+            ids[t] = {"sheetId": m[0].get("sheetId", 0), "rows": m[0].get("gridProperties", {}).get("rowCount", 0)}
+        tid, og = ids[T_TARGET]["sheetId"], self._config()[2]
+        if ids[T_ORIG]["sheetId"] != og:
+            raise PlannerSheetsError(f"Лист «{T_ORIG}» не совпадает с настроенным исходным листом")
+        if tid == og or tid in {ids[t]["sheetId"] for t in (T_TEST, T_PACK, T_ORIG)}:
+            raise PlannerSheetsError("Тестовый лист совпадает с исходным")
+        if self._pinned is None:
+            self._pinned = tid
+        elif self._pinned != tid:
+            raise PlannerSheetsError("Тестовый лист был пересоздан; перезапустите бота")
+        return ids
+
+    def _values(self, titles, render, head=False):
+        d = self._api("GET", "/values:batchGet", {"ranges": [_rng(t) + ("!1:1" if head else "") for t in titles],
+                                                  "valueRenderOption": render,
+                                                  "dateTimeRenderOption": "SERIAL_NUMBER", "majorDimension": "ROWS"})
+        vr = d.get("valueRanges", [])
+        if len(vr) != len(titles):
+            raise PlannerSheetsError("Неполный ответ Google Sheets")
+        return [[list(r) for r in v.get("values", [])] for v in vr]
+
+    def _read(self):
+        test, pack, orig = self._values((T_TEST, T_PACK, T_ORIG), "UNFORMATTED_VALUE")
+        test, pack = _rows(test), _rows(pack)
+        if not orig:
+            raise PlannerSheetsError(f"Лист «{T_ORIG}» пуст")
+        wc = _bind(orig[0], ("Склад Wildberries",), T_ORIG)[_c("Склад Wildberries")]
+        whs = sorted({w for w in (planner._ident(_cell(r, wc)) for r in orig[1:]) if w})
+        captured = datetime.now(MSK).isoformat(timespec="seconds")
+        demand = self._demand(captured)
+        ratings = self._ratings()
+        parts = {"test": test, "packing": pack, "warehouses": whs}
+        if demand is not None:
+            parts["demand"] = demand
+        if ratings is not None:
+            parts["ratings"] = ratings
+        body = _canon(parts)
+        snap = {"test": test, "packing": pack, "warehouses": whs,
+                "source_hash": hashlib.sha256(body.encode("utf-8")).hexdigest(), "captured_at": captured}
+        if demand is not None:
+            snap["demand"] = demand
+        if ratings is not None:
+            snap["ratings"] = ratings
+        return snap, orig
+
+    def _ratings(self):
+        """{article: rating} from «БД Юнит» (columns A and AW, read-only); None if unreadable (plan then says so)."""
+        try:
+            d = self._api("GET", "/values:batchGet", {"ranges": [_rng(T_UNIT) + "!A:A", _rng(T_UNIT) + "!AW:AW"],
+                                                      "valueRenderOption": "UNFORMATTED_VALUE",
+                                                      "majorDimension": "COLUMNS"})
+            a, w = ([(v.get("values") or [[]])[0] for v in d["valueRanges"]] + [[], []])[:2]
+            if not a or planner._norm(a[0]) != "артикул" or planner._norm((w or [""])[0]) != "рейтинг":
+                return None
+            return {str(planner._ident(x)): v for x, v in zip(a[1:], w[1:])
+                    if planner._ident(x) and isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0}
+        except Exception:
+            return None
+
+    def _demand(self, captured):
+        """Read-only demand classification per WB article; a failed read never blocks planning (plan says so)."""
+        try:
+            raw = self._values((T_ORDERS,), "UNFORMATTED_VALUE")[0]
+            o = planner_demand.parse_orders(raw, captured)
+        except Exception:
+            return {"ok": False, "problems": ["лист «Количество заказов» не прочитан; динамика спроса не оценена"],
+                    "by_article": {}}
+        return {"ok": o["ok"], "problems": o["problems"], "ref": o["ref"],
+                "by_article": {a: planner_demand.classify(v) for a, v in o["series"].items()} if o["ok"] else {}}
+
+    def snapshot(self):
+        self._meta()
+        return self._read()[0]
+
+    def _link(self, tid, row):
+        return f"https://docs.google.com/spreadsheets/d/{self._config()[0]}/edit#gid={tid}&range=A{row}"
+
+    def reconcile(self, draft, rejected_before=(), apply=False, rules_fn=None):
+        """After the owner marked rows «Не согласовано» in the test sheet: drop those rows, keep the rest and append new
+        lines to fill the machine. apply=False only computes the summary. Rows are compacted by copying cells upwards
+        and clearing the tail: a row is never deleted, because deleting row 2 breaks the header formulas ($K$2 -> #REF!)."""
+        did, ver, plan = _draft(draft)
+        ids = self._meta()
+        tid, rc = ids[T_TARGET]["sheetId"], ids[T_TARGET]["rows"]
+        rows = self._values((T_TARGET,), "FORMULA")[0]
+        if not rows:
+            raise PlannerSheetsError("В тестовом листе нет заголовков")
+        head = self._values((T_TARGET,), "UNFORMATTED_VALUE", head=True)[0] or [[]]
+        cols = _bind(_heads(head[0], rows[0]), ORIGINAL + META, T_TARGET)
+
+        def g(i, n):
+            return _cell(rows[i], cols[_c(n)])
+
+        mcols = {cols[_c(m)] for m in META}
+
+        def typed(i):  # a row holds data when a visible input column does; leftover service columns alone are debris
+            return any(not planner._blank(c) and c is not False for k, c in enumerate(rows[i]) if k not in mcols)
+        data = [i for i in range(1, len(rows)) if typed(i)]
+        anyrow = [i for i in range(1, len(rows)) if any(not planner._blank(c) and c is not False for c in rows[i])]
+        mine = [i for i in data if planner._ident(g(i, "ID плана")) == did]
+        if not mine:
+            raise PlannerSheetsError("Строк этого плана нет в тестовом листе: сначала запишите план.")
+        if len(mine) != len(data):
+            raise PlannerSheetsError("В тестовом листе есть строки не этого плана. Обновление по листу работает, когда "
+                                     "в листе один план: уберите лишние строки.")
+        refused = [i for i in mine if _s(g(i, "Статус отгрузки")) == "Не согласовано"]
+        kept = [i for i in mine if i not in set(refused)]
+
+        def ident(i):
+            return str(planner._ident(g(i, "Артикул"))), str(planner._ident(g(i, "Название магазина")))
+
+        fixed = []
+        for i in kept:
+            q = planner._num(g(i, "К отгрузке"))
+            if q is None or q <= 0 or q.denominator != 1:
+                raise PlannerSheetsError(f"Строка {i + 1}: «К отгрузке» должно быть целым положительным числом.")
+            fixed.append({"article": ident(i)[0], "cabinet": ident(i)[1], "quantity": int(q), "reason": "kept by owner"})
+        excl = {tuple(x) for x in rejected_before} | {ident(i) for i in refused}
+        fresh, _orig = self._read()
+        rules = dict(rules_fn(fresh) if rules_fn else plan["rules"])  # rules_fn: saved rules + what memory knows today
+        rules["fixed"] = fixed
+        try:
+            new = planner.build_plan(fresh, rules, plan["date"], plan["warehouse"], plan.get("arrival_date"), exclude=excl)
+        except ValueError as e:
+            raise PlannerSheetsError("Не удалось пересчитать состав: " + str(e)[:200]) from None
+        added = [ln for ln in new["lines"] if not ln["fixed"]]
+        summary = {"removed": [(*ident(i), planner._num(g(i, "К отгрузке"))) for i in refused], "kept": len(kept),
+                   "added": added, "total_pallets": new["total_pallets"], "capacity": plan["rules"]["capacity"],
+                   "warnings": new["warnings"][:5], "refused": sorted(excl)}
+        summary["removed"] = [(a, c, None if q is None else int(q)) for a, c, q in summary["removed"]]
+        if not apply:
+            return summary
+        if refused or added:
+            tc = [i for i, c in enumerate(rows[0]) if not planner._blank(c) and not (isinstance(c, str) and c.startswith("="))]
+            runs = []
+            for i in tc:
+                if runs and i == runs[-1][1]:
+                    runs[-1][1] = i + 1
+                else:
+                    runs.append([i, i + 1])
+
+            def region(r0, r1, a, b):
+                return {"sheetId": tid, "startRowIndex": r0, "endRowIndex": r1, "startColumnIndex": a, "endColumnIndex": b}
+            last, start = max(anyrow[-1], data[-1]) + 1, 1 + len(kept)
+            end = start + len(added)
+            reqs = [{"appendDimension": {"sheetId": tid, "dimension": "ROWS", "length": end - rc}}] if end > rc else []
+            for j, src in enumerate(kept):
+                if src != 1 + j:
+                    reqs += [{"copyPaste": {"source": region(src, src + 1, a, b), "destination": region(1 + j, 2 + j, a, b),
+                                            "pasteType": "PASTE_NORMAL", "pasteOrientation": "NORMAL"}} for a, b in runs]
+            if last > start:
+                reqs += [{"updateCells": {"range": region(start, last, a, b), "fields": "userEnteredValue",
+                                          "rows": [{"values": [{} for _ in range(b - a)]} for _ in range(last - start)]}}
+                         for a, b in runs]
+            per = [_cells(did, ver, plan, ln) for ln in added]
+            for key in (per[0] if per else {}):
+                c = cols[key]
+                dated = "userEnteredFormat" in per[0][key]
+                reqs.append({"updateCells": {"range": region(start, end, c, c + 1), "rows": [{"values": [p[key]]} for p in per],
+                                             "fields": "userEnteredValue" + ",userEnteredFormat.numberFormat" * dated}})
+            for r in reqs:
+                (kind, b), = r.items()
+                dst = {"appendDimension": b, "copyPaste": b.get("destination"), "updateCells": b.get("range")}[kind]
+                src = b["source"]["sheetId"] if kind == "copyPaste" else tid
+                if dst.get("sheetId") != tid or src != tid or dst.get("startRowIndex", 1) < 1:
+                    raise PlannerSheetsError("Внутренняя проверка: запись вне тестового листа или в строку заголовков запрещена")
+            self._api("POST", ":batchUpdate", body={"requests": reqs})
+        summary["url"] = self._link(tid, 2)
+        return summary
+
+    def publish(self, draft):
+        did, ver, plan = _draft(draft)
+        ids = self._meta()
+        tid = ids[T_TARGET]["sheetId"]
+        rows = self._values((T_TARGET,), "FORMULA")[0]
+        if not rows:
+            raise PlannerSheetsError("В тестовом листе нет заголовков")
+        # header cells hold array formulas (as in the original): bind by their shown labels, not by formula text
+        head = self._values((T_TARGET,), "UNFORMATTED_VALUE", head=True)[0] or [[]]
+        cols = _bind(_heads(head[0], rows[0]), ORIGINAL + META, T_TARGET)
+
+        def g(r, n, o=0):
+            return _cell(r, cols[_c(n, o)])
+
+        def cells(ln):
+            return _cells(did, ver, plan, ln)
+
+        per = [cells(ln) for ln in plan["lines"]]
+        keys, need = list(per[0]), ("ID плана", "Версия плана", "Снимок данных", "Правила плана")
+        for r in rows[1:]:  # plan rows whose ID/required markers were wiped while other traces remain: orphans
+            com = _s(g(r, "Комментарии"))
+            marked = any(not planner._blank(g(r, m)) for m in META) or str(com or "").startswith("ТЕСТ. План ")
+            if marked and any(planner._blank(g(r, m)) for m in need):
+                raise PublishConflictError("В тестовом листе есть строки плана с неполными маркерами (стёрт ID?); "
+                                           "запись не выполнена, проверьте лист вручную")
+        # Markers first (before live-source hash): an exported revision is never written twice.
+        mine = [i for i in range(1, len(rows)) if planner._ident(g(rows[i], "ID плана")) == did]
+        if mine:
+            if any(planner._num(g(rows[i], "Версия плана")) != ver for i in mine):
+                raise PublishConflictError("Другая версия этого плана уже выгружена; повторная выгрузка запрещена")
+            got = Counter(tuple(_cmp(_cell(rows[i], cols[k])) for k in keys) for i in mine)
+            if got != Counter(tuple(_cmp(p[k]) for k in keys) for p in per):
+                raise PublishConflictError("Строки этой версии в тестовом листе неполны или изменены; "
+                                           "запись не выполнена, проверьте лист вручную")
+            return self._link(tid, mine[0] + 1)
+
+        fresh, orig = self._read()
+        if plan["warehouse"] not in fresh["warehouses"]:
+            raise SourceChangedError("Склад плана больше не найден в исходных данных. Пересчитайте план и сохраните новую версию.")
+        try:
+            new = planner.build_plan(fresh, plan["rules"], plan["date"], plan["warehouse"], plan.get("arrival_date"))
+        except ValueError:
+            new = None
+        if new is None or any(_canon(new[k]) != _canon(plan.get(k))
+                              for k in ("lines", "rules", "date", "warehouse", "arrival_date")):
+            raise SourceChangedError("Сохранённый план не совпадает с пересчётом по текущим данным. Пересчитайте план.")
+
+        mcols = {cols[_c(m)] for m in META}
+
+        def typed(r):  # leftover service columns (ID, version, ...) of a plan the owner already cleared are debris, not data
+            return any(not planner._blank(c) and c is not False for k, c in enumerate(r) if k not in mcols)
+        tail = len(rows)
+        while tail > 1 and all(planner._blank(c) or c is False for c in rows[tail - 1]):  # empty checkboxes are not data
+            tail -= 1
+        last = tail
+        while last > 1 and not typed(rows[last - 1]):
+            last -= 1
+        if any(isinstance(c, str) and c.startswith("=") and not _scalar(c) for r in rows[1:] for c in r):
+            raise PlannerSheetsError("В тестовом листе есть формулы сложнее простой арифметики; "
+                                     "дописывать строки небезопасно")
+        oc = _bind(orig[0], ORIGINAL, T_ORIG)
+        act = oc[_c(ORIGINAL[0])]
+        tpl = max((i for i in range(1, len(orig)) if not planner._blank(_cell(orig[i], act))), default=None)
+        n, width, rc = len(plan["lines"]), max(cols.values()) + 1, ids[T_TARGET]["rows"]
+        start, end = last, last + n
+
+        def area(c0, c1, sid=tid, r0=start, r1=end):
+            return {"sheetId": sid, "startRowIndex": r0, "endRowIndex": r1, "startColumnIndex": c0, "endColumnIndex": c1}
+
+        # Empty sheet (no data rows): write into the existing blank rows. An insert at row 2 would push every
+        # open-ended header formula range ($L$2:$L ...) below the new rows, and the formulas would stop seeing them.
+        # Otherwise: grid needs a row at `start`; insert n fresh rows there (rows typed meanwhile shift down, preserved).
+        direct = last == 1 or tail > last  # debris below the data: overwrite those rows instead of inserting above them
+        if direct:
+            reqs = [{"appendDimension": {"sheetId": tid, "dimension": "ROWS", "length": end - rc}}] if end > rc else []
+        else:
+            reqs = [{"appendDimension": {"sheetId": tid, "dimension": "ROWS", "length": last + 1 - rc}}] if last >= rc else []
+            reqs.append({"insertDimension": {"range": {"sheetId": tid, "dimension": "ROWS", "startIndex": start,
+                                                       "endIndex": end}, "inheritFromBefore": start > 1}})
+        fr = None if direct else (last - 1 if last >= 2 else (end if rc >= 2 else None))
+        if fr is not None:
+            reqs += [{"copyPaste": {"source": area(0, width, r0=fr, r1=fr + 1), "destination": area(0, width),
+                                    "pasteType": t, "pasteOrientation": "NORMAL"}}
+                     for t in ("PASTE_FORMAT", "PASTE_DATA_VALIDATION")]
+        fcells = {}  # formula cells: verified scalar text from the latest actual original row, shifted per new row
+        if tpl is not None:
+            d = self._api("GET", "", {"ranges": f"{_rng(T_ORIG)}!{tpl + 1}:{tpl + 1}",
+                                      "fields": "sheets(data(rowData(values(userEnteredValue))))"})
+            try:
+                vals = d["sheets"][0]["data"][0].get("rowData", [])[0].get("values", [])
+            except (KeyError, IndexError, TypeError, AttributeError):
+                vals = []
+            cmap = {oc[k] + 1: cols[k] + 1 for k in oc}  # source column -> same-named column of the test sheet
+            for key, ocol in oc.items():
+                f = ((vals[ocol] if ocol < len(vals) else {}).get("userEnteredValue") or {}).get("formulaValue")
+                if f and key not in per[0] and _scalar(f) and _REF.search(f):  # unverifiable formulas are skipped, never written
+                    texts = [_shift(f, start + i - tpl, 0, cmap) for i in range(n)]
+                    if None not in texts:
+                        fcells[key] = texts
+        for key, texts in fcells.items():
+            c = cols[key]
+            reqs.append({"updateCells": {"range": area(c, c + 1), "fields": "userEnteredValue",
+                                         "rows": [{"values": [{"userEnteredValue": {"formulaValue": t}}]} for t in texts]}})
+        for key in per[0]:
+            c = cols[key]
+            dated = "userEnteredFormat" in per[0][key]
+            reqs.append({"updateCells": {"range": area(c, c + 1), "rows": [{"values": [p[key]]} for p in per],
+                                         "fields": "userEnteredValue" + ",userEnteredFormat.numberFormat" * dated}})
+        if tail > last and tail > end:  # service-column debris left below the new rows
+            for c in sorted(mcols):
+                reqs.append({"updateCells": {"range": area(c, c + 1, r0=end, r1=tail), "fields": "userEnteredValue",
+                                             "rows": [{"values": [{}]} for _ in range(tail - end)]}})
+        _guard(reqs, tid, start, end, tail)
+        self._api("POST", ":batchUpdate", body={"requests": reqs})
+        return self._link(tid, start + 1)

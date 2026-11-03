@@ -1,0 +1,1000 @@
+"""Owner-only Telegram controller for the TEST-only FBO planner: immutable draft versions, one explicitly confirmed
+publish into «Планирование FBO — ТЕСТ». Storage, memory and Google clients are lazy; settings are fixed commands."""
+import asyncio
+import copy
+import os
+import re
+import secrets
+import threading
+from collections import Counter
+from datetime import date, datetime, timedelta
+
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+
+import planner
+import planner_ai
+import planner_experience as exp
+from planner_sheets import MSK, PlannerSheets, PlannerSheetsError, SourceChangedError
+from planner_storage import DraftError, DraftStore
+
+ENTRY = ("Новый план", "Мои планы")
+LEAVE = ("Декларации", "Главное меню")  # reset the planner state; the declarations handler then runs as before
+OLD_BUTTONS = ("Ближайшая отгрузка", "Обновить базу", "База файлов", "Выбрать дату", "Проверить отметки",
+               "Файлы по кабинету", "По номеру поставки")
+NO_WH = "склад не выбран"
+NO_WH_NOTE = ("Склад не выбран: это предварительный состав. Доступность слотов автоматически не проверялась "
+              "(такой проверки в боте нет), склад выберите сами. Запись в тестовый лист возможна только после выбора склада.")
+GENERIC = "Операция не выполнена. Повторите позже."
+MEM_DOWN = "Память помощника недоступна — создание и запись планов заблокированы, пока её не восстановят."
+HELP = ("Команды настроек (по одной в сообщении):\n"
+        "Продажи от 8 · Запас до 10 · Остаток wild от 30 · Цель 10 · Максимум 13 · Машина 20\n"
+        "Исключить wild wild123 · Исключить кабинет Название\n"
+        "Добавить АРТИКУЛ | КАБИНЕТ | КОЛИЧЕСТВО | ПРИЧИНА · Убрать АРТИКУЛ | КАБИНЕТ\n"
+        "Можно и обычным текстом (разбирает ИИ): «исключи кабинет …», «поставь машину 20», «добавь обязательно …». "
+        "Неясное я уточню. Изменения применяются только после «Применить».")
+_NUMCMD = (("остаток wild от", "min_wild_days"), ("продажи от", "min_sales"), ("запас до", "max_current_days"),
+           ("цель", "target_days"), ("максимум", "max_days"))
+_LABEL = {"min_sales": "Продажи от", "max_current_days": "Запас до", "min_wild_days": "Остаток wild от",
+          "target_days": "Цель", "max_days": "Максимум", "capacity": "Машина (паллет)",
+          "excluded_wild": "Исключённые wild", "excluded_cabinets": "Исключённые кабинеты", "fixed": "Обязательные строки"}
+_ID = re.compile(r"[0-9a-f]{12}")
+_DATE = re.compile(r"\d{2}\.\d{2}\.\d{4}")
+PAGE = 10
+
+
+class UnknownCommand(ValueError):
+    """Not one of the fixed settings commands (candidate for the free-text AI path)."""
+
+
+class _Blocked(Exception):
+    """User-facing refusal raised inside worker threads."""
+
+
+def _err(e):
+    if isinstance(e, (PlannerSheetsError, DraftError, _Blocked, planner_ai.AIUnavailable, planner_ai.AIRejected)):
+        return str(e)
+    if isinstance(e, ValueError):
+        return "Не удалось построить план: " + str(e)[:300]
+    return GENERIC
+
+
+def _cb(*parts):
+    data = ":".join(str(p) for p in parts)
+    assert len(data.encode()) <= 64
+    return data
+
+
+MEM_PAGE = 8  # memory records per screen: message and keyboard stay far below Telegram limits
+
+
+def _btn(text, *parts):
+    return InlineKeyboardButton(text=text, callback_data=_cb("pl", *parts))
+
+
+def _kb(rows):
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _num(s):
+    v = float(s.replace(",", "."))
+    return int(v) if v == int(v) else v
+
+
+def parse_command(text, rules, touched=None, explicit=(), context=None):
+    """One settings command -> (new validated rules, summary). ValueError carries a user-facing message.
+    `touched` (a set) receives the numeric/capacity key the owner set explicitly, even to an unchanged value;
+    `explicit` = keys already explicit in this plan; `context` = the plan's effective rules (limits are judged there)."""
+    hit = None
+    t = " ".join(text.split())
+    if not t:
+        raise ValueError(HELP)
+    if len(t) > 300:  # no fixed command is this long: hand over to the free-text path (which has its own limit)
+        raise UnknownCommand(HELP)
+    new, low = copy.deepcopy(rules), t.casefold()
+    for prefix, key in _NUMCMD:
+        if low.startswith(prefix + " "):
+            rest = low[len(prefix):].strip()
+            if not re.fullmatch(r"\d{1,4}(?:[.,]\d{1,2})?", rest) or _num(rest) > 1000:
+                raise ValueError("Нужно число от 0 до 1000, например: " + prefix + " 8")
+            new[key], hit = _num(rest), key
+            break
+    else:
+        m = re.fullmatch(r"(?i)машина\s+(20|33)", t)
+        if m:
+            new["capacity"], hit = int(m.group(1)), "capacity"
+        elif re.fullmatch(r"(?i)исключить wild\s+\S.{0,80}", t):
+            new["excluded_wild"] = list(new["excluded_wild"]) + [t[len("исключить wild"):].strip()]
+        elif re.fullmatch(r"(?i)исключить кабинет\s+\S.{0,120}", t):
+            new["excluded_cabinets"] = list(new["excluded_cabinets"]) + [t[len("исключить кабинет"):].strip()]
+        elif low.startswith("добавить "):
+            p = [x.strip() for x in t[len("добавить "):].split("|")]
+            if len(p) != 4 or not all(p) or not re.fullmatch(r"\d{1,7}", p[2]) or int(p[2]) <= 0 or len(p[3]) > 200:
+                raise ValueError("Формат: Добавить АРТИКУЛ | КАБИНЕТ | КОЛИЧЕСТВО | ПРИЧИНА")
+            if any(f["article"] == p[0] and f["cabinet"] == p[1] for f in new["fixed"]):
+                raise ValueError("Такая обязательная строка уже есть; сначала уберите её.")
+            new["fixed"] = list(new["fixed"]) + [dict(article=p[0], cabinet=p[1], quantity=int(p[2]), reason=p[3])]
+        elif low.startswith("убрать "):
+            p = [x.strip() for x in t[len("убрать "):].split("|")]
+            keep = [f for f in new["fixed"] if (f["article"], f["cabinet"]) != tuple(p)]
+            if len(p) != 2 or len(keep) == len(new["fixed"]):
+                raise ValueError("Такой обязательной строки нет. Формат: Убрать АРТИКУЛ | КАБИНЕТ")
+            new["fixed"] = keep
+        else:
+            raise UnknownCommand("Не понял указание, ничего не изменено.\n" + HELP)
+    try:
+        new = planner_ai.check_in_context(new, context, (hit,) if hit else (), explicit)
+    except ValueError as e:
+        raise ValueError("Недопустимые настройки: " + str(e)[:200]) from None
+    diff = [f"{_LABEL[k]}: {rules[k]} → {new[k]}" for k in new if new[k] != rules[k]]
+    if touched is not None and hit and not diff and hit not in set(explicit):  # same value, but now the owner's own choice (beats memory)
+        diff = [f"{_LABEL[hit]}: {new[hit]} (задано вами явно — память это не перекроет)"]
+    if not diff:
+        raise ValueError("Это уже так настроено, изменений нет.")
+    if touched is not None and hit:
+        touched.add(hit)
+    return new, "\n".join(diff)
+
+
+def warning_summary(warnings):
+    cats = Counter()
+    for w in warnings:
+        kind, _, rest = w.partition(":")
+        rest = (rest or kind).split(";")[0].split()
+        cats[(kind.split()[0], " ".join(rest[:4]))] += 1
+    lines = [f"• {k[0]}: {k[1]} — {n}" for k, n in cats.most_common(5)]
+    return lines, [w[:160] for w in warnings[:3]]
+
+
+def preview_text(d):
+    p, r = d["plan"], d["plan"]["rules"]
+    lines = [f"ТЕСТОВЫЙ план {d['id']} · версия {d['version']}",
+             "Запись возможна только в лист «Планирование FBO — ТЕСТ».",
+             f"Отгрузка {p['date']} · склад {p['warehouse'] or NO_WH} · машина {r['capacity']} паллет",
+             f"Строк: {len(p['lines'])} · загрузка {p['total_pallets']} паллет",
+             f"Правила: продажи от {r['min_sales']}, запас до {r['max_current_days']}, остаток wild от "
+             f"{r['min_wild_days']}, цель {r['target_days']}, максимум {r['max_days']}; "
+             f"исключений wild {len(r['excluded_wild'])}, кабинетов {len(r['excluded_cabinets'])}, "
+             f"обязательных строк {len(r['fixed'])}"]
+    at = len(lines)
+    if p["warehouse"] is None:
+        lines.append(NO_WH_NOTE)
+    if p["remaining_pallets"] and p["remaining_pallets"] > 0:
+        lines.append(f"Недобор: {p['remaining_pallets']} паллет (правила сами не ослабляются; смените машину или условия).")
+    if not p["lines"]:
+        lines.append("Подходящих строк нет.")
+    if p["warnings"]:
+        cats, ex = warning_summary(p["warnings"])
+        lines.append(f"Предупреждений: {len(p['warnings'])} (полный список сохранён в версии). По видам:")
+        lines += cats + ["Примеры:"] + ["– " + e for e in ex]
+    if d.get("exported_version") == d["version"]:
+        lines.append("Выгружено в тестовый лист: " + d["export_url"])
+    elif d["version"] != d["latest_version"]:
+        lines.append(f"Это старая версия; актуальная — {d['latest_version']}.")
+    elif d.get("exported_version") is not None:
+        lines.append(f"Версия {d['exported_version']} уже выгружена; изменения запрещены.")
+    for k in range(5, -1, -1):  # the experience description is auxiliary: it shrinks first so plan data and keys stay
+        text = "\n".join(lines[:at] + exp.experience_lines(p.get("experience"), limit=k) + lines[at:])
+        if len(text) <= exp.TG_LIMIT:
+            break
+    return text
+
+
+def base_rules(d):
+    """The owner's own rules of a draft (remembered effects are merged in on every calculation, never frozen in)."""
+    return d["plan"].get("base_rules") or d["plan"]["rules"]
+
+
+def lines_text(d, page):
+    ls = d["plan"]["lines"]
+    page = max(0, min(page, max(0, (len(ls) - 1) // PAGE)))
+    out = [f"Состав плана {d['id']} v{d['version']}, страница {page + 1}/{max(1, -(-len(ls) // PAGE))}:"]
+    for ln in ls[page * PAGE:(page + 1) * PAGE]:
+        out.append(f"{ln['wild']} · {ln['article']} · {ln['cabinet']}: {ln['quantity']} шт ({ln['pallets']} пал.), "
+                   f"прогноз {ln['forecast_before']}→{ln['forecast_after']}. {ln['reason']}"
+                   + (f" Спрос: {ln['demand']['label']} ({ln['demand']['why']})"
+                      f"{'' if ln['demand']['applied'] else ', на количество не влияет'}." if ln.get("demand") else ""))
+    return "\n".join(out), page
+
+
+class PlannerController:
+    """handle_message(message)->bool (True = consumed), handle_callback(callback), reset(owner)."""
+
+    def __init__(self, store=None, sheets=None, memory=None, is_owner=None, data_dir=None, ai=None):
+        self._store, self._sheets, self._memory, self._ai = store, sheets, memory, ai
+        self._is_owner, self._data_dir = is_owner, data_dir
+        self._lock, self._st, self._gen = asyncio.Lock(), {}, {}
+        self._commit = threading.Lock()  # serialises "check still wanted + store" with reset()
+
+    # lazy collaborators -------------------------------------------------------------------------------------
+    def _dir(self):
+        if self._data_dir is None:
+            import wb_declarations
+            self._data_dir = os.path.join(str(wb_declarations.PROJECT), "data")
+        return self._data_dir
+
+    @property
+    def store(self):
+        if self._store is None:
+            self._store = DraftStore(os.path.join(self._dir(), "planner_drafts.sqlite3"))
+        return self._store
+
+    @property
+    def sheets(self):
+        if self._sheets is None:
+            self._sheets = PlannerSheets()
+        return self._sheets
+
+    @property
+    def memory(self):
+        if self._memory is None:
+            from planner_memory import MemoryStore
+            self._memory = MemoryStore(os.path.join(self._dir(), "planner_memory.sqlite3"),
+                                       os.path.join(self._dir(), "planner_memory-ledger.md"))
+        return self._memory
+
+    @property
+    def ai(self):
+        return self._ai or planner_ai.interpret
+
+    # helpers -------------------------------------------------------------------------------------------------
+    def _owner(self, uid, chat_type):
+        if self._is_owner is not None:
+            return bool(self._is_owner(uid, chat_type))
+        import telegram_bot  # lazy: avoids a circular import
+        return bool(telegram_bot.is_owner(uid, chat_type))
+
+    def reset(self, owner):
+        with self._commit:  # waits for an in-flight store; later stores see the new generation
+            self._gen[owner] = self._gen.get(owner, 0) + 1
+        self._st.pop(owner, None)
+
+    def _mem_ok(self):
+        try:
+            self.memory.applicable(on_date=datetime.now(MSK).date().isoformat())
+        except Exception:
+            raise _Blocked(MEM_DOWN) from None
+
+    @staticmethod
+    def _main():
+        import telegram_bot
+        return telegram_bot.keyboard()
+
+    def _keys(self, d):
+        i, v = d["id"], d["version"]
+        top = [[_btn("Состав", "ln", i, v, 0), _btn("Память", "mem", i, v)]]
+        if d["version"] != d["latest_version"] or d.get("exported_version") is not None:
+            upd = [[_btn("Обновить по листу", "up", i, v)]] if d.get("exported_version") == v else []
+            return _kb(top + upd + [[_btn("Мои планы", "list")]])
+        other = 20 if d["plan"]["rules"]["capacity"] == 33 else 33
+        last = ([_btn("Выбрать склад", "sw", i, v)] if d["plan"]["warehouse"] is None
+                else [_btn("Записать в тестовый лист", "pub", i, v)])
+        return _kb(top + [[_btn("Пересчитать", "rc", i, v), _btn("Настройки", "set", i, v)],
+                          [_btn(f"Машина {other} паллет", "cap", i, v, other)], last])
+
+    async def _show(self, msg, d):
+        await msg.answer(preview_text(d), reply_markup=self._keys(d))
+
+    def _build(self, uid, rules, day, wh, arrival=None, draft=None, touched=(), release=(), alive=None):  # worker thread
+        self._mem_ok()
+        snap = self.sheets.snapshot()
+        if wh is not None and wh not in snap["warehouses"]:
+            raise _Blocked("Такого склада сейчас нет в таблице. Начните новый план.")
+        wilds = set(planner_ai.catalog(snap)["wilds"].values())
+        selected = exp.select(self.memory.entries(), plan_id=draft["id"] if draft else None, on_date=day, wilds=wilds)
+        norm = planner.validate_rules(rules, cross=False)  # the target<=max limit is checked on the merged rules
+        prev = base_rules(draft) if draft else None
+        explicit = set(draft["plan"].get("explicit_keys") or ()) if draft else {"capacity"}  # the wizard asks for it
+        explicit |= {k for k in exp.NUMERIC + ("capacity",) if prev is not None and norm[k] != prev[k]}
+        explicit |= set(touched)
+        explicit -= set(release)  # lines the owner has just handed to memory: the new remembered decision replaces their old pin
+        if prev is not None:  # a required line the owner added/changed in this plan is theirs: memory does not override it
+            explicit |= exp.changed_fixed(prev, norm)
+        effective, experience = exp.merge(rules, selected, explicit)
+        plan = planner.build_plan(snap, effective, day, wh, arrival)
+        plan["base_rules"], plan["experience"], plan["explicit_keys"] = norm, experience, sorted(explicit)
+        with self._commit:  # owner/menu re-check after the slow read, atomically with the store
+            if alive is not None and not alive():
+                raise _Blocked("Действие отменено.")
+            return self.store.revise(uid, draft["id"], draft["version"], plan) if draft else self.store.create(uid, plan)
+
+    async def _guarded(self, uid, chat_type, msg, work, *args, live=False):
+        """Owner re-check around a long operation + menu race guard. Returns (ok, result).
+        live=True passes work an `alive()` check to run right before it stores anything."""
+        g = self._gen.get(uid, 0)
+        kw = {"alive": lambda: self._owner(uid, chat_type) and self._gen.get(uid, 0) == g} if live else {}
+        try:
+            res = await asyncio.to_thread(lambda: work(*args, **kw))
+        except Exception as e:
+            if self._owner(uid, chat_type):
+                await msg.answer(_err(e))
+            return False, None
+        if not self._owner(uid, chat_type):
+            return False, None
+        if self._gen.get(uid, 0) != g:
+            await msg.answer("Вы вернулись в меню. Если расчёт успел сохраниться, он в «Мои планы».")
+            return False, None
+        return True, res
+
+    # messages ------------------------------------------------------------------------------------------------
+    async def handle_message(self, message):
+        user = message.from_user
+        text = (message.text or "").strip()
+        if user is None or text.startswith("/"):
+            return False
+        uid, ct = user.id, message.chat.type
+        if text in LEAVE or text in OLD_BUTTONS:
+            self.reset(uid)
+            return False
+        if text in ENTRY:
+            if not self._owner(uid, ct):
+                return False
+            self.reset(uid)
+            async with self._lock:
+                return await (self._new(uid, message) if text == "Новый план" else self._list(uid, ct, message))
+        st = self._st.get(uid)
+        if not st or st["step"] not in ("date", "wh", "cap", "settings", "pickwh"):
+            return False
+        if st["step"] == "settings" and text.isdigit():
+            return False  # supply numbers are never intercepted
+        if not self._owner(uid, ct):
+            self.reset(uid)
+            return False
+        async with self._lock:
+            st = self._st.get(uid)
+            if not st or not self._owner(uid, ct):
+                return False
+            return await getattr(self, "_t_" + st["step"])(uid, ct, message, text, st)
+
+    async def _new(self, uid, msg):
+        self._st[uid] = {"step": "date"}
+        await msg.answer("Новый тестовый план. Напишите дату отгрузки ДД.ММ.ГГГГ или нажмите кнопку.",
+                         reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Завтра"),
+                         KeyboardButton(text="Послезавтра")], [KeyboardButton(text="Главное меню")]],
+                         resize_keyboard=True))
+        return True
+
+    async def _list(self, uid, ct, msg):
+        try:
+            ds = await asyncio.to_thread(self.store.list, uid, 10)
+        except Exception as e:
+            await msg.answer(_err(e))
+            return True
+        if not ds:
+            await msg.answer("Сохранённых планов пока нет.", reply_markup=self._main())
+            return True
+        rows = [[_btn(f"{d['id']} v{d['latest_version']} · {d['plan']['date']} · {d['plan']['warehouse'] or 'без склада'}"[:60],
+                      "op", d["id"], d["latest_version"])] for d in ds]
+        await msg.answer("Ваши последние планы:", reply_markup=_kb(rows))
+        return True
+
+    async def _t_date(self, uid, ct, msg, text, st):
+        today, low = datetime.now(MSK).date(), text.casefold()
+        shortcut = {"сегодня": 0, "завтра": 1, "послезавтра": 2}
+        if low in shortcut:
+            day = today + timedelta(days=shortcut[low])
+        elif _DATE.fullmatch(text):
+            try:
+                day = date(int(text[6:]), int(text[3:5]), int(text[:2]))
+            except ValueError:
+                await msg.answer("Такой даты нет. Формат ДД.ММ.ГГГГ.")
+                return True
+        else:
+            return False
+        if day < today:
+            await msg.answer("Дата в прошлом. Напишите сегодняшнюю или будущую дату.")
+            return True
+
+        def work():
+            self._mem_ok()
+            return self.sheets.snapshot()["warehouses"]
+        ok, whs = await self._guarded(uid, ct, msg, work)
+        if not ok:
+            return True
+        if not whs:
+            await msg.answer("В таблице нет складов Wildberries.")
+            return True
+        self._st[uid] = {"step": "wh", "date": day.isoformat(), "whs": whs[:40]}
+        rows = [[_btn(w[:40], "wh", i)] for i, w in enumerate(self._st[uid]["whs"])]
+        rows.append([_btn("Пока без склада", "wn")])
+        await msg.answer(f"Дата {day.strftime('%d.%m.%Y')}. Выберите склад или нажмите «Пока без склада» — "
+                         "соберу предварительный состав, склад выберете позже:", reply_markup=_kb(rows))
+        return True
+
+    async def _t_wh(self, uid, ct, msg, text, st):
+        if text in st["whs"]:
+            return await self._pick_wh(uid, msg, st["whs"].index(text))
+        if re.search(r"(?i)\bбез склада\b", text):  # also «Пока без склада, надо проверять слоты по товарам»
+            return await self._pick_wh(uid, msg, None)
+        return False
+
+    async def _t_pickwh(self, uid, ct, msg, text, st):
+        return False  # the warehouse is chosen with the buttons only
+
+    async def _pick_wh(self, uid, msg, idx):
+        st = self._st[uid]
+        st.update(step="cap", wh=None if idx is None else st["whs"][idx])
+        await msg.answer((f"Склад {st['wh']}." if idx is not None else "Склад не выбран — будет предварительный состав.")
+                         + " Выберите машину:", reply_markup=_kb(
+            [[_btn("33 паллет", "wc", 33), _btn("20 паллет", "wc", 20)]]))
+        return True
+
+    async def _t_cap(self, uid, ct, msg, text, st):
+        m = re.fullmatch(r"(?i)(20|33) паллет", text)  # bare numbers belong to the supply-number handler
+        return await self._make(uid, ct, msg, int(m.group(1))) if m else False
+
+    async def _make(self, uid, ct, msg, cap):
+        st = self._st.get(uid)
+        if not st or st.get("step") != "cap":
+            await msg.answer("Начните заново: «Новый план».")
+            return True
+        ok, d = await self._guarded(uid, ct, msg, self._build, uid, {"capacity": cap}, st["date"], st["wh"],
+                                    live=True)
+        if ok:
+            self._st.pop(uid, None)
+            await msg.answer("План рассчитан и сохранён как черновик (в таблицу ничего не записано)."
+                             + (" Склад выберете позже в этом плане." if d["plan"]["warehouse"] is None else ""),
+                             reply_markup=self._main())
+            await self._show(msg, d)
+        return True
+
+    async def _t_settings(self, uid, ct, msg, text, st):
+        try:
+            d = await asyncio.to_thread(self.store.get, uid, st["id"])
+            if d["version"] != st["ver"] or d.get("exported_version") is not None:
+                raise _Blocked("План изменился; откройте актуальную версию в «Моих планах».")
+            touched = set()
+            rules, summary = parse_command(text, base_rules(d), touched, d["plan"].get("explicit_keys") or (),
+                                            d["plan"]["rules"])
+        except UnknownCommand:
+            return await self._t_ai(uid, ct, msg, text, st)
+        except (ValueError, _Blocked, DraftError) as e:
+            await msg.answer(_err(e) if not isinstance(e, ValueError) else str(e))
+            return True
+        nonce = secrets.token_hex(3)
+        st.update(proposal=rules, nonce=nonce, touched=sorted(touched))
+        await msg.answer("Предлагаемые изменения (пока не применены):\n" + summary, reply_markup=_kb(
+            [[_btn("Применить", "ap", st["id"], st["ver"], nonce), _btn("Отмена", "cn")]]))
+        return True
+
+    async def _t_ai(self, uid, ct, msg, text, st):
+        """Free text -> model proposal -> (clarifying questions | confirmation). Never applies anything itself."""
+        if len(text) > 600:
+            await msg.answer("Слишком длинное указание (до 600 символов). Разбейте его на части.")
+            return True
+        prev = st.get("ai_prev")  # (original request kept whole, bounded clarification log, open questions)
+        orig, log = (prev[0], f"{prev[1]}\n[Вопросы бота: {' | '.join(prev[2])}]\n[Ответ владельца: {text}]"[-1000:]) \
+            if prev else (text, "")
+        full = f"{orig}\n{log}" if log else orig
+        await msg.answer("Разбираю указание…")
+        did, ver = st["id"], st["ver"]
+
+        def work():
+            self._mem_ok()
+            d = self.store.get(uid, did)
+            if d["version"] != ver or d.get("exported_version") is not None:
+                raise _Blocked("План изменился; откройте актуальную версию в «Моих планах».")
+            return self.ai(full, base_rules(d), self.sheets.snapshot(), d["plan"]["lines"], locked=self._locked(d),
+                           explicit=d["plan"].get("explicit_keys") or (), context=d["plan"]["rules"])
+        ok, p = await self._guarded(uid, ct, msg, work)
+        if not ok or self._st.get(uid) is not st:  # failed, or the menu/another action replaced the state meanwhile
+            return True
+        head = f"Понял так: {p.understood}\nОбласть: {planner_ai.scope_text(p.scope)}."
+        if p.questions:
+            st["ai_prev"] = (orig, log, [q[:200] for q in p.questions[:5]])
+            st.pop("proposal", None)
+            await msg.answer(head + "\nНужно уточнить (ничего не изменено):\n" + "\n".join("• " + q for q in p.questions))
+            return True
+        st.pop("ai_prev", None)
+        nonce = secrets.token_hex(3)
+        if p.scope == "example":  # a past shipment is only ever remembered as a non-policy example, on request
+            st.update(example=text if not prev else orig, nonce=nonce)
+            st.pop("proposal", None)
+            await msg.answer(head + "\nПример прошлой поставки я могу сохранить в память только как пример: "
+                             "правилом он не станет и расчёт не меняет.",
+                             reply_markup=_kb([[_btn("Сохранить как пример", "ex", did, ver, nonce),
+                                                _btn("Отмена", "cn")]]))
+            return True
+        if not p.summary:
+            await msg.answer(head + "\nИзменений в условиях нет.")
+            return True
+        st.update(proposal=p.rules, nonce=nonce, touched=sorted(p.touched))
+        st.pop("memo", None)
+        st.pop("perm_ok", None)
+        buttons, extra = [], ""
+        if p.scope != "this_plan":
+            effect, removed = exp.effect_between(base_rules(await asyncio.to_thread(self.store.get, uid, did)), p.rules,
+                                               p.touched)
+            ok_mem, why = exp.persistable(p.scope, effect, removed)
+            if ok_mem:
+                st["memo"] = dict(category=p.scope, effect=effect, reason=p.reason, expires_on=p.expires_on)
+                label = exp.CATEGORIES[p.scope][1]
+                pick = p.scope == "product_preference" and not p.expires_on
+                extra = ("\nМожно применить только к этому плану или запомнить как " + label
+                         + {"once_exception": " (действует для этого плана)",
+                            "product_preference": "",
+                            "permanent_rule": " (для всех будущих планов, пока вы не отзовёте)"}[p.scope]
+                         + (f"; срок до {p.expires_on}" if p.expires_on else "") + ".")
+                if pick:  # the owner never named a term: it is only a proposal, chosen explicitly by button
+                    today = datetime.now(MSK).date()
+                    extra += ("\nСрок вы не называли. Моё предложение — "
+                              f"{exp.PREFERENCE_DAYS} дней (до {today + timedelta(days=exp.PREFERENCE_DAYS)}); "
+                              "выберите срок кнопкой или напишите нужную дату.")
+                    buttons += [_btn(f"Запомнить на {n} дн.", "ar", did, ver, nonce, str(n)) for n in exp.TERM_CHOICES]
+                    st["ai_prev"] = (orig, log, ["Срок не назван: напишите дату окончания или выберите кнопкой."])
+                else:
+                    buttons.append(_btn("Применить и запомнить", "ar", did, ver, nonce))
+            else:
+                extra = f"\nВ память это записать нельзя: {why}. Можно применить только к этому плану."
+        await msg.answer(head + "\nПредлагаемые изменения (пока не применены; количества, остатки, короба и вместимость "
+                         "проверит расчёт после «Применить»):\n" + "\n".join(p.summary) + extra,
+                         reply_markup=_kb([[_btn("Применить к этому плану" if buttons else "Применить", "ap", did, ver,
+                                                 nonce)] + buttons + [_btn("Отмена", "cn")]]))
+        return True
+
+    # callbacks -----------------------------------------------------------------------------------------------
+    async def handle_callback(self, cb):
+        msg, user = cb.message, cb.from_user
+        if msg is None or user is None or not self._owner(user.id, msg.chat.type):
+            await cb.answer("Доступ закрыт.", show_alert=True)
+            return
+        await cb.answer()
+        uid, ct = user.id, msg.chat.type
+        parts = (cb.data or "").split(":")
+        try:
+            if len(cb.data.encode()) > 64 or parts[0] != "pl":
+                raise ValueError
+            act, a = parts[1], parts[2:]
+            if act in ("op", "ln", "mem", "rc", "set", "cap", "pub", "ok", "ap", "ar", "ex", "sw", "up", "uk"):
+                if not (len(a) >= 2 and _ID.fullmatch(a[0]) and a[1].isdigit()):
+                    raise ValueError
+                a = [a[0], int(a[1])] + a[2:]
+            elif act not in ("list", "cn", "wh", "wc", "wn", "sp", "rv"):
+                raise ValueError
+        except (ValueError, IndexError, AttributeError):
+            await msg.answer("Кнопка устарела. Откройте «Мои планы».")
+            return
+        async with self._lock:
+            if not self._owner(uid, ct):
+                return
+            try:
+                await getattr(self, "_c_" + act)(uid, ct, msg, *a)
+            except Exception as e:
+                await msg.answer(_err(e))
+
+    async def _draft(self, uid, did, ver, latest=True):
+        d = await asyncio.to_thread(self.store.get, uid, did, None if latest else ver)
+        if latest and (d["version"] != ver or d.get("exported_version") is not None):
+            raise _Blocked("Эта версия устарела или уже выгружена. Откройте актуальный план в «Моих планах».")
+        return d
+
+    _c_list = _list
+
+    async def _c_cn(self, uid, ct, msg):
+        st = self._st.get(uid)
+        if st:
+            for k in ("proposal", "confirm", "confirm_up", "memo", "perm_ok", "example", "touched"):
+                st.pop(k, None)
+            if st["step"] in ("settings", "pickwh"):
+                self._st.pop(uid)
+        await msg.answer("Отменено, ничего не изменено.")
+
+    async def _c_wh(self, uid, ct, msg, idx):
+        st = self._st.get(uid)
+        if not st or st["step"] != "wh" or not idx.isdigit() or int(idx) >= len(st["whs"]):
+            await msg.answer("Кнопка устарела. Начните заново: «Новый план».")
+            return
+        await self._pick_wh(uid, msg, int(idx))
+
+    async def _c_wn(self, uid, ct, msg):
+        st = self._st.get(uid)
+        if not st or st["step"] != "wh":
+            await msg.answer("Кнопка устарела. Начните заново: «Новый план».")
+            return
+        await self._pick_wh(uid, msg, None)
+
+    async def _c_wc(self, uid, ct, msg, n):
+        if n not in ("20", "33"):
+            await msg.answer("Кнопка устарела.")
+            return
+        await self._make(uid, ct, msg, int(n))
+
+    async def _c_op(self, uid, ct, msg, did, ver):
+        await self._show(msg, await self._draft(uid, did, ver, latest=False))
+
+    async def _c_ln(self, uid, ct, msg, did, ver, page="0"):
+        d = await self._draft(uid, did, ver, latest=False)
+        text, page = lines_text(d, int(page) if page.isdigit() else 0)
+        n = -(-len(d["plan"]["lines"]) // PAGE)
+        nav = ([_btn("◀", "ln", did, ver, page - 1)] if page else []) + ([_btn("▶", "ln", did, ver, page + 1)]
+                                                                           if page + 1 < n else [])
+        await msg.answer(text, reply_markup=_kb([nav]) if nav else None)
+
+    async def _c_mem(self, uid, ct, msg, did, ver, page="0"):
+        d = await self._draft(uid, did, ver, latest=False)
+        p = d["plan"]
+
+        def work():
+            seen = {}
+            for day in (p["date"], None):  # alive on the plan's date or alive today: viewing/revoking never hinges on the date
+                seen.update({r["id"]: r for r in self.memory.applicable(plan_id=d["id"], on_date=day)})
+            keys = {ln[k] for ln in p["lines"] for k in ("wild", "article", "product") if ln.get(k)}
+            keys |= {e["target"] for e in p.get("experience") or () if e.get("scope") == "product"}  # excluded wilds
+            keys |= {r["target"] for r in self.memory.entries()  # any active product record stays revocable here
+                     if r["status"] == "confirmed" and r["scope"] == "product"}
+            for key in sorted(keys):
+                for day in (p["date"], None):
+                    seen.update({r["id"]: r for r in self.memory.applicable(product=key, plan_id=d["id"], on_date=day)})
+            try:  # what a recalculation would do with the records (for those the saved snapshot knows nothing about)
+                chosen = exp.select(self.memory.entries(), plan_id=d["id"], on_date=p["date"],
+                                    wilds={r["target"] for r in seen.values() if r["scope"] == "product"})
+                notes = exp.merge(base_rules(d), chosen, p.get("explicit_keys") or ())[1]
+            except ValueError:
+                notes = []
+            return list(seen.values()), {x["id"]: x for x in notes}
+        ok, got = await self._guarded(uid, ct, msg, lambda: (self._mem_ok(), work())[1])
+        if not ok:
+            return
+        recs, sim = got
+        info = exp.experience_lines(p.get("experience"), limit=5)[1:]  # bounded: pages stay under 4096
+        applied = {e["id"]: e for e in p.get("experience") or ()}
+        out = ["Опыт, учтённый в этой версии плана:"] + (info or ["• ничего не применялось"])
+        out.append("\nПамять помощника для этого плана (подтверждённые, не истёкшие):")
+        recs.sort(key=lambda r: r["id"])
+        n = max(1, -(-len(recs) // MEM_PAGE))
+        page = min(int(page) if str(page).isdigit() else 0, n - 1)
+        revoke = []
+        for r in recs[page * MEM_PAGE:(page + 1) * MEM_PAGE]:
+            live = exp.decode(r)
+            e = applied.get(r["id"])
+            why = lambda x: exp.short(x["note"].split(": ", 1)[-1], 100)  # noqa: E731
+            if r["kind"] == "case":
+                tag = "пример (не правило, расчёт не меняет)"
+            elif not live:
+                tag = "справочное правило (расчёт не меняет)"
+            elif e is not None:
+                tag = "действует в расчёте" if e["applied"] else f"не применено в этом плане ({why(e)})"
+            elif r["expires_on"] and r["expires_on"] < p["date"]:
+                tag = f"не действует на дату этого плана (срок до {r['expires_on']})"
+            elif r["id"] in sim:  # saved after this version was built: say what «Пересчитать» would do, not what it did
+                x = sim[r["id"]]
+                tag = ("не входила в эту версию, учтётся после «Пересчитать»" if x["applied"]
+                       else f"не применится после «Пересчитать» ({why(x)})")
+            else:
+                tag = "не входила в эту версию (подойдёт ли плану, покажет «Пересчитать»)"
+            out.append(f"• {tag}, {r['scope']}{' ' + exp.short(r['target'], 40) if r['target'] else ''}"
+                       f"{', до ' + r['expires_on'] if r['expires_on'] else ''}: {exp.short(r['text'].split(chr(10))[0], 80)}")
+            if live:
+                revoke.append([_btn("Отозвать: " + exp._summary(live["effect"])[:36], "rv", r["id"])])
+        if not recs:
+            out.append("Подходящих записей нет.")
+        elif n > 1:
+            out.append(f"Страница {page + 1} из {n}.")
+            revoke.append(([_btn("◀", "mem", did, ver, page - 1)] if page else [])
+                          + ([_btn("▶", "mem", did, ver, page + 1)] if page + 1 < n else []))
+        out.append("Правило с пометкой «действует в расчёте» меняет следующие расчёты; ваши настройки конкретного плана "
+                   "важнее запомненных числовых значений.")
+        await msg.answer("\n".join(out), reply_markup=_kb(revoke) if revoke else None)
+
+    async def _c_rc(self, uid, ct, msg, did, ver):
+        d = await self._draft(uid, did, ver)
+        await self._revise(uid, ct, msg, d, base_rules(d))
+
+    @staticmethod
+    def _locked(d):
+        """Exclusions that come from remembered rules only (they can be lifted only by revoking the memory entry)."""
+        base, out = base_rules(d), {"wilds": set(), "cabinets": set()}
+        for e in d["plan"].get("experience") or ():
+            if e["applied"]:
+                out["wilds"] |= {planner._norm(x) for x in e["effect"].get("excluded_wild", ())} - {
+                    planner._norm(x) for x in base["excluded_wild"]}
+                out["cabinets"] |= {planner._norm(x) for x in e["effect"].get("excluded_cabinets", ())} - {
+                    planner._norm(x) for x in base["excluded_cabinets"]}
+        return out
+
+    async def _revise(self, uid, ct, msg, d, rules, warehouse=..., touched=(), release=()):
+        p = d["plan"]
+        ok, new = await self._guarded(uid, ct, msg, self._build, uid, rules, p["date"],
+                                      p["warehouse"] if warehouse is ... else warehouse,
+                                      p.get("arrival_date"), d, tuple(touched), tuple(release), live=True)
+        if ok:
+            try:
+                await msg.answer("Пересчитано: сохранена новая неизменяемая версия (в таблицу ничего не записано).")
+                await self._show(msg, new)
+            except Exception:  # the version and any confirmed memory are already stored: never undo them, say so
+                await msg.answer(f"Версия {new['version']} плана {new['id']} сохранена, но показать её не удалось. "
+                                 "Откройте её в «Мои планы»; запомненные правила видны и отзываются в разделе «Память».")
+        return new if ok else None
+
+    async def _c_set(self, uid, ct, msg, did, ver):
+        await self._draft(uid, did, ver)
+        self._st[uid] = {"step": "settings", "id": did, "ver": ver}
+        await msg.answer(HELP)
+
+    async def _c_sw(self, uid, ct, msg, did, ver):
+        d = await self._draft(uid, did, ver)
+        if d["plan"]["warehouse"] is not None:
+            raise _Blocked("В этом плане склад уже выбран.")
+
+        def work():
+            self._mem_ok()
+            return self.sheets.snapshot()["warehouses"]
+        ok, whs = await self._guarded(uid, ct, msg, work)
+        if not ok:
+            return
+        if not whs:
+            await msg.answer("В таблице нет складов Wildberries.")
+            return
+        nonce = secrets.token_hex(3)
+        self._st[uid] = {"step": "pickwh", "id": did, "ver": ver, "whs": whs[:40], "nonce": nonce}
+        await msg.answer("Выберите склад для плана (будет сохранена новая версия, в таблицу ничего не записывается):",
+                         reply_markup=_kb([[_btn(w[:40], "sp", nonce, i)] for i, w in enumerate(self._st[uid]["whs"])]
+                                          + [[_btn("Отмена", "cn")]]))
+
+    async def _c_sp(self, uid, ct, msg, nonce="", idx=""):
+        st = self._st.get(uid)  # the buttons belong to ONE selection session (nonce), never to "whatever is open now"
+        if (not st or st["step"] != "pickwh" or st["nonce"] != nonce or not idx.isdigit()
+                or int(idx) >= len(st["whs"])):
+            await msg.answer("Кнопка устарела. Откройте план в «Моих планах».")
+            return
+        self._st.pop(uid)
+        d = await self._draft(uid, st["id"], st["ver"])
+        await self._revise(uid, ct, msg, d, base_rules(d), st["whs"][int(idx)])
+
+    async def _c_cap(self, uid, ct, msg, did, ver, n):
+        d = await self._draft(uid, did, ver)
+        if n not in ("20", "33"):
+            raise ValueError("Кнопка устарела.")
+        rules, summary = parse_command(f"Машина {n}", base_rules(d), context=d["plan"]["rules"])
+        nonce = secrets.token_hex(3)
+        self._st[uid] = {"step": "proposal", "id": did, "ver": ver, "proposal": rules, "nonce": nonce}
+        await msg.answer("Предлагаемые изменения (пока не применены):\n" + summary, reply_markup=_kb(
+            [[_btn("Применить", "ap", did, ver, nonce), _btn("Отмена", "cn")]]))
+
+    async def _c_ap(self, uid, ct, msg, did, ver, nonce=""):
+        st = self._st.get(uid)
+        if not st or st.get("nonce") != nonce or (st["id"], st["ver"]) != (did, ver) or "proposal" not in st:
+            await msg.answer("Предложение устарело или отменено. Ничего не изменено.")
+            return
+        rules, _ = st.pop("proposal"), st.pop("nonce")
+        touched = st.get("touched") or ()
+        self._st.pop(uid, None)
+        await self._revise(uid, ct, msg, await self._draft(uid, did, ver), rules, touched=touched)
+
+    async def _c_ar(self, uid, ct, msg, did, ver, nonce="", days=""):
+        """Apply to this plan AND remember (memory entries are written confirmed: this tap is the owner's confirmation)."""
+        st = self._st.get(uid)
+        if (not st or st.get("nonce") != nonce or (st["id"], st["ver"]) != (did, ver) or "proposal" not in st
+                or not st.get("memo")):
+            await msg.answer("Предложение устарело или отменено. Ничего не изменено.")
+            return
+        memo = st["memo"]
+        if memo["category"] == "product_preference" and not memo["expires_on"]:
+            if days not in map(str, exp.TERM_CHOICES):
+                await msg.answer("Выберите срок кнопкой или напишите дату окончания — без срока не сохраняю.")
+                return
+            memo = dict(memo, expires_on=(datetime.now(MSK).date() + timedelta(days=int(days))).isoformat())
+            st["memo"] = memo
+        if memo["category"] == "permanent_rule" and not st.get("perm_ok"):
+            st["perm_ok"] = True  # a permanent rule needs a second, explicit tap on a DIFFERENT button:
+            st["nonce"] = nonce = secrets.token_hex(3)  # the first button's data is now stale (no double-tap save)
+            await msg.answer("Постоянное правило будет действовать во ВСЕХ будущих планах, пока вы не отзовёте его в "
+                             "разделе «Память»: " + exp.short(exp._summary(memo["effect"]), 800) + ". Сохранить навсегда?",
+                             reply_markup=_kb([[_btn("Да, сохранить навсегда", "ar", did, ver, nonce),
+                                                _btn("Отмена", "cn")]]))
+            return
+        rules, touched = st.pop("proposal"), st.get("touched") or ()
+        for k in ("nonce", "memo", "perm_ok"):
+            st.pop(k, None)
+        self._st.pop(uid, None)
+        d = await self._draft(uid, did, ver)
+        entries = exp.memory_entries(memo["category"], memo["effect"], reason=memo["reason"], plan_id=did,
+                                     plan_date=d["plan"]["date"], today=datetime.now(MSK).date(),
+                                     expires_on=memo["expires_on"])
+
+        made = []
+
+        def withdraw():
+            """Revoke what was written. -> ids that are still active (or whose state cannot be read) afterwards."""
+            for i in made:  # never leave a decision active that the owner did not see applied
+                try:
+                    self.memory.revoke(i)
+                except Exception:
+                    try:
+                        self.memory.reject(i)  # a record that never got confirmed is inert; close it if possible
+                    except Exception:
+                        pass
+            try:
+                state = {r["id"]: r["status"] for r in self.memory.entries()}
+            except Exception:
+                return list(made)
+            made[:] = [i for i in made if state.get(i) == "confirmed"]
+            return list(made)
+
+        def stuck(ids):
+            return ("Отзыв записи НЕ удался: она осталась действующей и влияет на новые расчёты. Отзовите её вручную в "
+                    "разделе «Память».") if ids else ""
+
+        def remember(alive):
+            self._mem_ok()
+            with self._commit:  # owner/menu re-check atomically with the write
+                if not alive():
+                    raise _Blocked("Действие отменено.")
+                try:
+                    for e in entries:
+                        i = self.memory.propose(**e)
+                        made.append(i)
+                        self.memory.confirm(i)
+                except Exception:
+                    withdraw()
+                    raise
+            return list(made)
+        ok, ids = await self._guarded(uid, ct, msg, remember, live=True)
+        if not ok:
+            left = await asyncio.to_thread(withdraw)
+            if left:
+                await msg.answer(stuck(left))
+            return
+        new = await self._revise(uid, ct, msg, d, exp.without_effect(rules, memo["effect"], base_rules(d)), touched=touched,
+                                 release=[exp.fixed_id(f) for f in memo["effect"].get("fixed", ())])
+        if new is None:
+            left = await asyncio.to_thread(withdraw)  # the plan could not be rebuilt: the remembered decision is withdrawn again
+            await msg.answer("Запомнить не получилось: план с этим правилом не рассчитан. "
+                             + (stuck(left) if left else "Запись отозвана (статус проверен)."))
+            return
+        label = exp.CATEGORIES[memo["category"]][1]
+        await msg.answer(f"Запомнил ({label}): {exp.short(exp._summary(memo['effect']), 800)}. Записей: {len(ids)}"
+                         + (f"; действует до {entries[0]['expires_on']}" if entries[0]["expires_on"] else "; без срока")
+                         + ". Отозвать можно в разделе «Память».")
+
+    async def _c_ex(self, uid, ct, msg, did, ver, nonce=""):
+        st = self._st.get(uid)
+        if (not st or st.get("nonce") != nonce or (st["id"], st["ver"]) != (did, ver) or "example" not in st):
+            await msg.answer("Предложение устарело или отменено. Ничего не сохранено.")
+            return
+        text = st.pop("example")
+        st.pop("nonce", None)
+        self._st.pop(uid, None)
+        d = await self._draft(uid, did, ver, latest=False)
+        e = exp.example_entry(text, did, d["plan"]["date"])
+
+        def work():
+            self._mem_ok()
+            i = self.memory.propose(**e)
+            self.memory.confirm(i)
+        ok, _ = await self._guarded(uid, ct, msg, work)
+        if ok:
+            await msg.answer("Сохранил как пример прошлой поставки (не правило): расчёт он не меняет и сам правилом не станет.")
+
+    async def _c_rv(self, uid, ct, msg, rid):
+        def work():
+            self._mem_ok()
+            rec = next((r for r in self.memory.entries() if r["id"] == rid), None)
+            if rec is None or rec["status"] != "confirmed" or exp.decode(rec) is None:
+                raise _Blocked("Эта запись уже отозвана или не найдена.")
+            self.memory.revoke(rid)
+            now = next((r for r in self.memory.entries() if r["id"] == rid), None)
+            if now is None or now["status"] != "revoked":
+                raise _Blocked("Не удалось подтвердить отзыв записи: она может ещё действовать. Проверьте раздел «Память».")
+        ok, _ = await self._guarded(uid, ct, msg, work)
+        if ok:
+            await msg.answer("Запись отозвана. В уже сохранённых версиях планов ничего не меняется; новые расчёты и "
+                             "«Пересчитать» её больше не учитывают.")
+
+    @staticmethod
+    def _update_text(s, final=False):
+        def lst(items, fmt):
+            out = [fmt(x) for x in items[:8]]
+            return "\n".join(out) + (f"\n… и ещё {len(items) - 8}" if len(items) > 8 else "")
+        parts = [("Готово. " if final else "") + f"Обновление по листу: убрано строк «Не согласовано»: {len(s['removed'])}, "
+                 f"оставлено: {s['kept']}, добавлено новых в конец: {len(s['added'])}.",
+                 f"Загрузка машины {s['total_pallets']} из {s['capacity']} паллет."]
+        if s["removed"]:
+            parts.append("Убираю:\n" + lst(s["removed"], lambda r: f"– {r[0]} · {r[1]}" + (f" · {r[2]} шт" if r[2] else "")))
+        if s["added"]:
+            parts.append("Добавляю:\n" + lst(s["added"], lambda ln: f"+ {ln['article']} · {ln['cabinet']} · {ln['quantity']} шт "
+                                              f"({ln['pallets']} пал.)"))
+        return "\n".join(parts)
+
+    def _rules_fn(self, d):
+        """Rules for an update: the plan's own rules plus every remembered decision valid today (e.g. a wild the owner
+        has permanently excluded after the plan was made)."""
+        plan = d["plan"]
+
+        def fn(snap):
+            wilds = set(planner_ai.catalog(snap)["wilds"].values())
+            sel = exp.select(self.memory.entries(), plan_id=d["id"], on_date=plan["date"], wilds=wilds)
+            return exp.merge(base_rules(d), sel, set(plan.get("explicit_keys") or ()))[0]
+        return fn
+
+    async def _c_up(self, uid, ct, msg, did, ver):
+        d = await asyncio.to_thread(self.store.get, uid, did, ver)
+        if d.get("exported_version") != ver:
+            raise _Blocked("Сначала запишите этот план в тестовый лист.")
+        await msg.answer("Читаю тестовый лист…")
+
+        def work():
+            self._mem_ok()
+            return self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did), rules_fn=self._rules_fn(d))
+        s = await asyncio.to_thread(work)
+        if not s["removed"] and not s["added"]:
+            await msg.answer(f"В листе нет строк «Не согласовано», и добавлять нечего: загрузка {s['total_pallets']} из "
+                             f"{s['capacity']} паллет.")
+            return
+        self._st[uid] = {"step": "confirm", "confirm_up": (did, ver)}
+        await msg.answer(self._update_text(s) + "\n\nПеред записью источники будут перепроверены; пишу только в "
+                         "«Планирование FBO — ТЕСТ».",
+                         reply_markup=_kb([[_btn("Подтвердить обновление", "uk", did, ver), _btn("Отмена", "cn")]]))
+
+    async def _c_uk(self, uid, ct, msg, did, ver):
+        g = self._gen.get(uid, 0)
+        d = await asyncio.to_thread(self.store.get, uid, did, ver)
+        if (self._st.get(uid) or {}).get("confirm_up") != (did, ver) or d.get("exported_version") != ver:
+            await msg.answer("Сначала нажмите «Обновить по листу» у этого плана.")
+            return
+        self._st.pop(uid, None)
+        await msg.answer("Обновляю тестовый лист…")
+
+        def work():
+            if not self._owner(uid, ct) or self._gen.get(uid, 0) != g:
+                raise _Blocked("Обновление отменено.")
+            self._mem_ok()
+            fn = self._rules_fn(d)
+            pre = self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did), rules_fn=fn)
+            self.store.add_rejected(uid, did, pre["refused"])  # first: a retry after a lost response must not resurrect them
+            return self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did), apply=True, rules_fn=fn)
+        try:
+            s = await asyncio.to_thread(work)
+        except Exception as e:
+            if self._owner(uid, ct):
+                await msg.answer(_err(e))
+            return
+        if self._owner(uid, ct):
+            await msg.answer(self._update_text(s, final=True) + "\n" + s["url"])
+
+    async def _c_pub(self, uid, ct, msg, did, ver):
+        d = await self._draft(uid, did, ver)
+        if d["plan"]["warehouse"] is None:
+            raise _Blocked("Склад не выбран: сначала нажмите «Выбрать склад». Запись предварительного состава невозможна.")
+        self._st[uid] = {"step": "confirm", "confirm": (did, ver)}
+        await msg.answer(f"Записать план {did} v{ver} ({len(d['plan']['lines'])} строк) в лист «Планирование FBO — ТЕСТ»? "
+                         "Источники будут перепроверены перед записью; в «Отгрузка FBO» запись невозможна.",
+                         reply_markup=_kb([[_btn("Подтвердить запись", "ok", did, ver), _btn("Отмена", "cn")]]))
+
+    async def _c_ok(self, uid, ct, msg, did, ver):
+        g = self._gen.get(uid, 0)  # taken before any await: a menu exit during the awaits below must cancel the write
+        d = await asyncio.to_thread(self.store.get, uid, did, ver)
+        if d.get("exported_version") == ver:  # double click / repeat: never write twice
+            await msg.answer("Уже записано в тестовый лист: " + d["export_url"])
+            return
+        if (self._st.get(uid) or {}).get("confirm") != (did, ver) or d["version"] != d["latest_version"]:
+            await msg.answer("Сначала нажмите «Записать в тестовый лист» у актуальной версии.")
+            return
+        if d["plan"]["warehouse"] is None:
+            await msg.answer("Склад не выбран: запись невозможна.")
+            return
+        self._st.pop(uid, None)
+        await msg.answer("Перепроверяю источники и записываю в тестовый лист…")
+
+        def work():
+            self._mem_ok()
+            if not self._owner(uid, ct) or self._gen.get(uid, 0) != g:  # last check right before the write
+                raise _Blocked("Запись отменена.")
+            url = self.sheets.publish(d)
+            try:
+                self.store.mark_exported(uid, did, ver, url)
+            except Exception:
+                return url, False
+            return url, True
+        try:
+            url, saved = await asyncio.to_thread(work)
+        except SourceChangedError as e:
+            if self._owner(uid, ct):
+                await msg.answer(str(e) + " Нажмите «Пересчитать».")
+        except Exception as e:  # PublishUncertainError text tells how to retry safely
+            if self._owner(uid, ct):
+                await msg.answer(_err(e))
+        else:
+            if self._owner(uid, ct):
+                await msg.answer("Готово. План записан только в тестовый лист:\n" + url + (
+                    "" if saved else "\nОтметку о выгрузке сохранить не удалось: повторите запись той же версии — "
+                                    "она проверит маркеры и не создаст дубликатов."))
