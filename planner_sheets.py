@@ -254,9 +254,11 @@ def _cells(did, ver, plan, ln):
             _c("Правила плана"): _sv(rules)}
 
 
-def _guard(reqs, tid, r0, r1):
+def _guard(reqs, tid, r0, r1, hi=None):
     """Every write destination and copy source must be the test sheet, cells only inside the rows inserted at [r0, r1).
-    The original sheet is never a source or destination of a write (formulas are written as verified text)."""
+    The original sheet is never a source or destination of a write (formulas are written as verified text).
+    hi: cells (not rows) may extend to this row when stale service cells below the new rows are wiped."""
+    hi = r1 if hi is None else max(r1, hi)
     for r in reqs:
         (kind, b), = r.items()
         dst = {"appendDimension": b, "insertDimension": b.get("range"), "copyPaste": b.get("destination"),
@@ -266,7 +268,7 @@ def _guard(reqs, tid, r0, r1):
                 or (kind == "insertDimension"
                     and (dst.get("dimension"), dst.get("startIndex"), dst.get("endIndex")) != ("ROWS", r0, r1))
                 or (kind in ("copyPaste", "updateCells")
-                    and not r0 <= dst.get("startRowIndex", -1) < dst.get("endRowIndex", -1) <= r1)):
+                    and not r0 <= dst.get("startRowIndex", -1) < dst.get("endRowIndex", -1) <= hi)):
             raise PlannerSheetsError("Внутренняя проверка: запись вне тестового листа запрещена")
 
 
@@ -423,7 +425,12 @@ class PlannerSheets:
         def g(i, n):
             return _cell(rows[i], cols[_c(n)])
 
-        data = [i for i in range(1, len(rows)) if any(not planner._blank(c) and c is not False for c in rows[i])]
+        mcols = {cols[_c(m)] for m in META}
+
+        def typed(i):  # a row holds data when a visible input column does; leftover service columns alone are debris
+            return any(not planner._blank(c) and c is not False for k, c in enumerate(rows[i]) if k not in mcols)
+        data = [i for i in range(1, len(rows)) if typed(i)]
+        anyrow = [i for i in range(1, len(rows)) if any(not planner._blank(c) and c is not False for c in rows[i])]
         mine = [i for i in data if planner._ident(g(i, "ID плана")) == did]
         if not mine:
             raise PlannerSheetsError("Строк этого плана нет в тестовом листе: сначала запишите план.")
@@ -468,7 +475,7 @@ class PlannerSheets:
 
             def region(r0, r1, a, b):
                 return {"sheetId": tid, "startRowIndex": r0, "endRowIndex": r1, "startColumnIndex": a, "endColumnIndex": b}
-            last, start = data[-1] + 1, 1 + len(kept)
+            last, start = max(anyrow[-1], data[-1]) + 1, 1 + len(kept)
             end = start + len(added)
             reqs = [{"appendDimension": {"sheetId": tid, "dimension": "ROWS", "length": end - rc}}] if end > rc else []
             for j, src in enumerate(kept):
@@ -542,8 +549,15 @@ class PlannerSheets:
                               for k in ("lines", "rules", "date", "warehouse", "arrival_date")):
             raise SourceChangedError("Сохранённый план не совпадает с пересчётом по текущим данным. Пересчитайте план.")
 
-        last = len(rows)
-        while last > 1 and all(planner._blank(c) or c is False for c in rows[last - 1]):  # empty checkboxes are not data
+        mcols = {cols[_c(m)] for m in META}
+
+        def typed(r):  # leftover service columns (ID, version, ...) of a plan the owner already cleared are debris, not data
+            return any(not planner._blank(c) and c is not False for k, c in enumerate(r) if k not in mcols)
+        tail = len(rows)
+        while tail > 1 and all(planner._blank(c) or c is False for c in rows[tail - 1]):  # empty checkboxes are not data
+            tail -= 1
+        last = tail
+        while last > 1 and not typed(rows[last - 1]):
             last -= 1
         if any(isinstance(c, str) and c.startswith("=") and not _scalar(c) for r in rows[1:] for c in r):
             raise PlannerSheetsError("В тестовом листе есть формулы сложнее простой арифметики; "
@@ -560,7 +574,7 @@ class PlannerSheets:
         # Empty sheet (no data rows): write into the existing blank rows. An insert at row 2 would push every
         # open-ended header formula range ($L$2:$L ...) below the new rows, and the formulas would stop seeing them.
         # Otherwise: grid needs a row at `start`; insert n fresh rows there (rows typed meanwhile shift down, preserved).
-        direct = last == 1
+        direct = last == 1 or tail > last  # debris below the data: overwrite those rows instead of inserting above them
         if direct:
             reqs = [{"appendDimension": {"sheetId": tid, "dimension": "ROWS", "length": end - rc}}] if end > rc else []
         else:
@@ -596,6 +610,10 @@ class PlannerSheets:
             dated = "userEnteredFormat" in per[0][key]
             reqs.append({"updateCells": {"range": area(c, c + 1), "rows": [{"values": [p[key]]} for p in per],
                                          "fields": "userEnteredValue" + ",userEnteredFormat.numberFormat" * dated}})
-        _guard(reqs, tid, start, end)
+        if tail > last and tail > end:  # service-column debris left below the new rows
+            for c in sorted(mcols):
+                reqs.append({"updateCells": {"range": area(c, c + 1, r0=end, r1=tail), "fields": "userEnteredValue",
+                                             "rows": [{"values": [{}]} for _ in range(tail - end)]}})
+        _guard(reqs, tid, start, end, tail)
         self._api("POST", ":batchUpdate", body={"requests": reqs})
         return self._link(tid, start + 1)

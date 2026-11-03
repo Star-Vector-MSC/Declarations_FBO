@@ -216,6 +216,24 @@ class GatewayTest(unittest.TestCase):
         ins = self.s.posts[0]["requests"][0]["insertDimension"]["range"]
         self.assertEqual(ins["startIndex"], 2)  # right below the last real row, not below the checkbox tail
 
+    def test_service_column_debris_of_a_cleared_plan_does_not_push_the_new_plan_down(self):
+        t = self.s.tabs[ps.T_TARGET]
+        h = [str(c) for c in t[0]]
+        idc, vc = h.index("ID плана"), h.index("Версия плана")
+        hc, rc_ = h.index("Снимок данных"), h.index("Правила плана")
+        base = len(t)
+        for _ in range(6):  # the owner cleared the visible columns of an old plan; its ID/version cells remain
+            row = [""] * (max(idc, vc, hc, rc_) + 1)
+            row[idc], row[vc], row[hc], row[rc_] = "54ca697358c3", 4, "h", "{}"
+            t.append(row)
+        self.gw.publish(self.draft)
+        reqs = self.s.posts[0]["requests"]
+        self.assertFalse(any("insertDimension" in r for r in reqs))
+        starts = {r["updateCells"]["range"]["startRowIndex"] for r in reqs if "updateCells" in r}
+        self.assertIn(base, starts)  # written right below the last real row, over the debris
+        cleared = [r["updateCells"]["range"] for r in reqs if "updateCells" in r and r["updateCells"]["range"]["startRowIndex"] > base]
+        self.assertTrue(any(c["startColumnIndex"] == idc for c in cleared))  # leftover ID cells below are wiped
+
     def test_empty_sheet_is_written_in_place_without_inserting_rows(self):
         t = self.s.tabs[ps.T_TARGET]
         del t[1:]
