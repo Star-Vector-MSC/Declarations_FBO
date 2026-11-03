@@ -12,7 +12,8 @@ GROWTH, STABLE, GENTLE, SHARP, UNCERTAIN = "growth", "stable", "gentle_decline",
 LABELS = {GROWTH: "рост", STABLE: "стабильно", GENTLE: "плавное снижение", SHARP: "резкое падение",
           UNCERTAIN: "неопределённо"}
 PARAMS = {"min_points": 5, "growth": 1.25, "stable_low": 0.85, "sharp": 0.5, "sharp3": 0.4, "cv_max": 0.6,
-          "cv_gentle": 0.5, "spike_share": 0.5, "decline_cap_days": 7, "max_stale_days": 2}
+          "cv_gentle": 0.5, "spike_share": 0.5, "decline_cap_days": 7, "max_stale_days": 2,
+          "drop1": 0.4, "drop2": 0.6, "drop3": 0.6}
 _HDR = re.compile(r"\s*(\d{1,2})\.(\d{1,2})\s*")
 _EPOCH = date(1899, 12, 30)
 
@@ -107,6 +108,11 @@ def classify(vals, params=None):
     cv = statistics.pstdev(xs) / float(ma)
     spike = max(xs) / sum(xs)
     info = {"ratio7": round(r, 2), "ratio3": None if r3 is None else round(r3, 2), "cv": round(cv, 2)}
+    # sharp drop of the last 1-3 days against the 7 days before them: do not ship regardless of the weekly ratio
+    for n, key in ((1, "drop1"), (2, "drop2"), (3, "drop3")):
+        recent, prior = _mean(vals[-n:]), _mean(vals[-n - 7:-n])
+        if recent is not None and prior and recent <= prior * P[key] and (n > 1 or sum(x is not None for x in vals[-n - 7:-n]) >= 5):
+            return {"state": SHARP, "why": f"последние {n} дн. упали до ×{float(recent / prior):.2f} к предыдущим 7", **info}
     if r <= P["sharp"] or (r3 is not None and r3 <= P["sharp3"] and r < P["stable_low"]):
         return {"state": SHARP, "why": f"последние 7 дн. к предыдущим ×{r:.2f}", **info}
     if r >= P["growth"]:
@@ -114,6 +120,8 @@ def classify(vals, params=None):
             return {"state": UNCERTAIN, "why": f"рост ×{r:.2f} не подтверждён: всплеск/колебания", **info}
         return {"state": GROWTH, "why": f"последние 7 дн. к предыдущим ×{r:.2f}", **info}
     if r < P["stable_low"]:
+        if r3 is not None and r3 >= 1:
+            return {"state": STABLE, "why": f"неделя ×{r:.2f}, но последние 3 дня уже не ниже прошлой недели", **info}
         if cv > P["cv_gentle"]:
             return {"state": UNCERTAIN, "why": f"снижение ×{r:.2f} при сильных колебаниях", **info}
         return {"state": GENTLE, "why": f"последние 7 дн. к предыдущим ×{r:.2f}", **info}
@@ -121,16 +129,9 @@ def classify(vals, params=None):
 
 
 def horizon(state, target, maxd, params=None):
-    """Policy (docs/demand-policy.md) -> (target, max) in days, or None = no automatic replenishment.
-    Growth aims at the owner's maximum; gentle decline caps both at 7; uncertain keeps the owner's rules."""
-    cap = {**PARAMS, **(params or {})}["decline_cap_days"]
-    if state == SHARP:
-        return None
-    if state == GROWTH:
-        return maxd, maxd
-    if state == GENTLE:
-        return min(target, cap), min(maxd, cap)
-    return target, maxd
+    """Same policy as planner._horizon: (target, max) days or None = do not ship."""
+    r = planner._horizon({"state": state}, target, maxd)
+    return None if r[0] is None else r
 
 
 def analyse(orders, article):

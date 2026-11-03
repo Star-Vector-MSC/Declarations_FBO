@@ -12,6 +12,7 @@ import planner
 import planner_sheets as ps
 from planner_storage import DraftConflict, DraftNotFound, DraftStore
 
+planner.DEMAND_MODE = "advisory"  # these tests check the sheet gateway, not the demand policy
 IDS = {ps.T_TEST: 1, ps.T_PACK: 2, ps.T_ORIG: 100, ps.T_TARGET: 777}
 TH = (["wild", "Артикул", "Название магазина", "Название товара", "Свободный остаток сервис", "Остаток на (дней)"]
       + ["средние продажи " + x for x in ("3 дня", "7 дней", "14 дней", "30 дней")]

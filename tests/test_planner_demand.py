@@ -71,6 +71,11 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(self.st([10] * 7 + [8] * 7), D.GENTLE)
         self.assertEqual(self.st([10] * 7 + [3] * 7), D.SHARP)
 
+    def test_recent_drop_and_recovery(self):
+        self.assertEqual(self.st([10] * 7 + [10] * 4 + [10, 10, 2]), D.SHARP)  # last day collapsed
+        self.assertEqual(self.st([10] * 7 + [10] * 5 + [4, 4]), D.SHARP)  # last two days
+        self.assertEqual(self.st([10] * 7 + [8, 8, 8, 8, 8, 8, 12]), D.STABLE)  # weekly dip, but already recovering
+
     def test_uncertain(self):
         self.assertEqual(self.st([10] * 10), D.UNCERTAIN)  # short history
         self.assertEqual(self.st([None] * 7 + [10] * 7), D.UNCERTAIN)  # a week is mostly blank, not zero
@@ -111,18 +116,21 @@ class PlanTest(unittest.TestCase):
         g = self.build("growth", "apply")["lines"][0]
         self.assertGreaterEqual(g["quantity"], base["quantity"])
         self.assertLessEqual(g["forecast_after"], 13 + 1e-9)
-        d = self.build("gentle_decline", "apply")["lines"][0]
-        self.assertLessEqual(d["forecast_after"], 7 + 1e-9)
-        self.assertTrue(d["demand"]["applied"])
+        self.assertEqual(self.build("gentle_decline", "apply")["lines"], [])
+        self.assertLessEqual(g["forecast_after"], 11 + 1e-9)
+        self.assertLessEqual(base["forecast_after"], 8 + 1e-9)
+        self.assertLessEqual(self.build("uncertain", "apply")["lines"][0]["forecast_after"], 8 + 1e-9)
+        self.assertTrue(g["demand"]["applied"])
 
-    def test_missing_article_in_demand_is_uncertain_and_keeps_rules(self):
+    def test_missing_article_in_demand_is_uncertain_flat_horizon(self):
         s = snap([T("w1", "A1", fc=2)], [PK("w1")])
         s["demand"] = {"ok": True, "problems": [], "by_article": {}}
         base = P.build_plan(snap([T("w1", "A1", fc=2)], [PK("w1")]), {}, "2026-10-28", "WH", "2026-10-30")
-        for mode in ("advisory", "apply"):
-            r = P.build_plan(s, {}, "2026-10-28", "WH", "2026-10-30", demand_mode=mode, min_line_qty=0, floor_qty=0)
-            self.assertEqual(r["lines"][0]["quantity"], base["lines"][0]["quantity"])
-            self.assertEqual(r["lines"][0]["demand"]["state"], "uncertain")
+        adv = P.build_plan(s, {}, "2026-10-28", "WH", "2026-10-30", demand_mode="advisory", min_line_qty=0, floor_qty=0)
+        self.assertEqual(adv["lines"][0]["quantity"], base["lines"][0]["quantity"])
+        r = P.build_plan(s, {}, "2026-10-28", "WH", "2026-10-30", demand_mode="apply", min_line_qty=0, floor_qty=0)
+        self.assertLessEqual(r["lines"][0]["forecast_after"], 8 + 1e-9)
+        self.assertEqual(r["lines"][0]["demand"]["state"], "uncertain")
 
     def test_problems_become_warnings_and_bad_mode_rejected(self):
         s = snap([T("w1", "A1", fc=2)], [PK("w1")])

@@ -171,22 +171,28 @@ def _table(rows, spec, name):
     return out
 
 
+DEMAND_MODE = "apply"  # tests of unrelated layers switch it to "advisory"
+GROWTH_DAYS, FLAT_DAYS, SPREAD_DAYS = 10, 7, 1  # owner 2026-11-03: growth 10±1 days, flat/unclear 7±1, decline -> none
+
+
 def _horizon(dm, T, M):
-    """Policy of docs/demand-policy.md -> (target, max) days or (None, None) = no automatic replenishment."""
+    """Owner's policy (docs/demand-policy.md) -> (target, max) days or (None, None) = do not ship.
+    Steady growth: 10±1 days; flat or unclear: 7±1; decline without recovery or a sharp drop of the last 1-3 days: none.
+    Never above the owner's own limits T/M. No demand data at all (dm is None): the owner's rules unchanged."""
     st = dm["state"] if dm else None
-    if st == "sharp_decline":
+    if st is None:
+        return T, M
+    if st in ("sharp_decline", "gentle_decline"):
         return None, None
-    if st == "growth":
-        return M, M
-    if st == "gentle_decline":
-        return min(T, 7), min(M, 7)
-    return T, M
+    base = GROWTH_DAYS if st == "growth" else FLAT_DAYS
+    return min(T, base), min(M, base + SPREAD_DAYS)
 
 
-def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, demand_mode="advisory",
+def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, demand_mode=None,
                min_line_qty=MIN_LINE_QTY, min_rating=MIN_RATING, exclude=(), min_cover=MIN_COVER, floor_qty=FLOOR_LINE_QTY):
-    """demand_mode: "advisory" shows the demand state per line and never changes a quantity (default: the state
-    thresholds are not yet validated, see docs/demand-policy.md); "apply" also limits horizons by that state."""
+    """demand_mode: "apply" (default) limits the stock horizon by the demand state (see _horizon); "advisory" only
+    shows the state per line and never changes a quantity."""
+    demand_mode = DEMAND_MODE if demand_mode is None else demand_mode
     if demand_mode not in ("advisory", "apply"):
         raise ValueError("demand_mode must be advisory or apply")
     r = validate_rules(rules)
@@ -342,7 +348,7 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
             continue
         x["_T"], x["_M"] = _horizon(demand_of(x), T, M) if demand_mode == "apply" else (T, M)
         if x["_T"] is None:
-            warn.append(f"{x['article']}/{x['cabinet']}: demand state {_DEMAND_LABELS['sharp_decline']}; "
+            warn.append(f"{x['article']}/{x['cabinet']}: demand state {_DEMAND_LABELS.get((demand_of(x) or {}).get('state'), '')}; "
                         "no automatic replenishment")
         elif x["forecast"] < x["_T"]:
             cands.append(x)
