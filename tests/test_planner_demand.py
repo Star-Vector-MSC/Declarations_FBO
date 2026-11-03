@@ -66,10 +66,16 @@ class ClassifyTest(unittest.TestCase):
         return D.classify(vals)["state"]
 
     def test_states(self):
-        self.assertEqual(self.st([10] * 7 + [10] * 7), D.STABLE)
-        self.assertEqual(self.st([10] * 7 + [14] * 7), D.GROWTH)
-        self.assertEqual(self.st([10] * 7 + [8] * 7), D.GENTLE)
-        self.assertEqual(self.st([10] * 7 + [3] * 7), D.SHARP)
+        self.assertEqual(self.st([10] * 30), D.STABLE)
+        self.assertEqual(self.st([10 + i * 0.4 for i in range(30)]), D.GROWTH)
+        self.assertEqual(self.st([20 - i * 0.35 for i in range(30)]), D.GENTLE)
+        self.assertEqual(self.st([30] * 23 + [10] * 7), D.SHARP)  # collapsed to a third of the period's level
+
+    def test_whole_series_not_two_weeks(self):
+        # the owner's case: a month-long slide 130 -> 10, last two weeks look flat at the bottom
+        v = [130, 120, 137, 98, 44, 45, 47, 53, 42, 34, 29, 29, 30, 16, 19, 23, 19, 18, 17, 7, 5, 9, 14, 11, 23, 10, 10, 13, 10]
+        self.assertIn(self.st(v), (D.GENTLE, D.SHARP))
+        self.assertEqual(self.st(v[-14:]), D.STABLE)  # the same bottom without the history is flat
 
     def test_recent_drop_and_recovery(self):
         self.assertEqual(self.st([10] * 7 + [10] * 4 + [10, 10, 2]), D.SHARP)  # last day collapsed
@@ -80,7 +86,7 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(self.st([10] * 10), D.UNCERTAIN)  # short history
         self.assertEqual(self.st([None] * 7 + [10] * 7), D.UNCERTAIN)  # a week is mostly blank, not zero
         self.assertEqual(self.st([10] * 7 + [0] * 7), D.UNCERTAIN)  # zeros may mean no stock
-        self.assertEqual(self.st([10] * 7 + [1, 1, 1, 1, 1, 1, 100]), D.UNCERTAIN)  # single spike is not growth
+        self.assertNotEqual(self.st([10] * 23 + [1, 1, 1, 1, 1, 1, 100]), D.GROWTH)  # single spike is not growth
 
     def test_uses_only_given_history(self):
         v = [10] * 14

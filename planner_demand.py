@@ -13,7 +13,7 @@ LABELS = {GROWTH: "рост", STABLE: "стабильно", GENTLE: "плавн�
           UNCERTAIN: "неопределённо"}
 PARAMS = {"min_points": 5, "growth": 1.25, "stable_low": 0.85, "sharp": 0.5, "sharp3": 0.4, "cv_max": 0.6,
           "cv_gentle": 0.5, "spike_share": 0.5, "decline_cap_days": 7, "max_stale_days": 2,
-          "drop1": 0.4, "drop2": 0.6, "drop3": 0.6}
+          "trend": 0.3, "drop1": 0.4, "drop2": 0.6, "drop3": 0.6}
 _HDR = re.compile(r"\s*(\d{1,2})\.(\d{1,2})\s*")
 _EPOCH = date(1899, 12, 30)
 
@@ -90,8 +90,19 @@ def _mean(xs):
     return (sum(xs) / len(xs)) if xs else None
 
 
+def _trend(vals):
+    """Robust (Theil-Sen) slope over ALL known days -> relative change across the whole period (fraction of the
+    period's mean level), so one spike or one bad day does not decide the direction."""
+    pts = [(i, float(v)) for i, v in enumerate(vals) if v is not None]
+    sl = sorted((y2 - y1) / (i2 - i1) for k, (i1, y1) in enumerate(pts) for i2, y2 in pts[k + 1:])
+    level = sum(y for _, y in pts) / len(pts)
+    return (statistics.median(sl) * (pts[-1][0] - pts[0][0]) / level) if sl and level else 0.0, level
+
+
 def classify(vals, params=None):
-    """vals: completed daily orders, oldest -> newest (None = unknown). -> {"state", "why", "ratio7", ...}."""
+    """vals: completed daily orders, oldest -> newest (None = unknown). The direction comes from the whole daily
+    series (all days given, normally 30): robust trend over the period, the current level (last 7 days) against the
+    period's own average, and the last 1-3 days separately. -> {"state", "why", ...}."""
     P = {**PARAMS, **(params or {})}
     if vals is None or len(vals) < 14:
         return {"state": UNCERTAIN, "why": "истории меньше 14 дней"}
@@ -101,31 +112,33 @@ def classify(vals, params=None):
     ma, mb = _mean(a), _mean(b)
     if mb == 0 or ma == 0:
         return {"state": UNCERTAIN, "why": "нулевые заказы за неделю: отсутствие товара не доказывает спрос"}
+    change, level = _trend(vals)
+    lvl = float(ma) / level  # current level against the whole period's average
     r = float(ma / mb)
     m3, p3 = _mean(vals[-3:]), _mean(vals[-10:-7])
     r3 = float(m3 / p3) if m3 is not None and p3 else None
     xs = [float(x) for x in a if x is not None]
     cv = statistics.pstdev(xs) / float(ma)
     spike = max(xs) / sum(xs)
-    info = {"ratio7": round(r, 2), "ratio3": None if r3 is None else round(r3, 2), "cv": round(cv, 2)}
-    # sharp drop of the last 1-3 days against the 7 days before them: do not ship regardless of the weekly ratio
-    for n, key in ((1, "drop1"), (2, "drop2"), (3, "drop3")):
-        recent, prior = _mean(vals[-n:]), _mean(vals[-n - 7:-n])
-        if recent is not None and prior and recent <= prior * P[key] and (n > 1 or sum(x is not None for x in vals[-n - 7:-n]) >= 5):
-            return {"state": SHARP, "why": f"последние {n} дн. упали до ×{float(recent / prior):.2f} к предыдущим 7", **info}
-    if r <= P["sharp"] or (r3 is not None and r3 <= P["sharp3"] and r < P["stable_low"]):
-        return {"state": SHARP, "why": f"последние 7 дн. к предыдущим ×{r:.2f}", **info}
-    if r >= P["growth"]:
+    n = len([v for v in vals if v is not None])
+    info = {"change": round(change, 2), "level": round(lvl, 2), "ratio7": round(r, 2),
+            "ratio3": None if r3 is None else round(r3, 2), "cv": round(cv, 2), "days": n}
+    pct = f"{'≤' if change < -1 else ''}{max(-100, round(change * 100)):+d}%"  # change of the trend line over the period
+    span = f"за {n} дн. тренд {pct}, последние 7 дн. = {lvl * 100:.0f}% от среднего"
+    # sharp drop of the last 1-3 days against the 7 days before them: do not ship regardless of the trend
+    for k, key in ((1, "drop1"), (2, "drop2"), (3, "drop3")):
+        recent, prior = _mean(vals[-k:]), _mean(vals[-k - 7:-k])
+        if recent is not None and prior and recent <= prior * P[key] and (k > 1 or sum(x is not None for x in vals[-k - 7:-k]) >= 5):
+            return {"state": SHARP, "why": f"последние {k} дн. упали до ×{float(recent / prior):.2f} к предыдущим 7", **info}
+    if (change <= -P["trend"] and lvl <= P["stable_low"]) or lvl <= P["sharp"] or r <= P["sharp"]:
+        if r >= P["growth"] and r3 is not None and r3 >= 1 and spike <= P["spike_share"]:
+            return {"state": UNCERTAIN, "why": f"падение ({span}), но последняя неделя выросла ×{r:.2f}", **info}
+        return {"state": SHARP if lvl <= P["sharp"] else GENTLE, "why": f"падение: {span}", **info}
+    if change >= P["trend"] and lvl >= 1:
         if spike > P["spike_share"] or cv > P["cv_max"] or (r3 is not None and r3 < 1):
-            return {"state": UNCERTAIN, "why": f"рост ×{r:.2f} не подтверждён: всплеск/колебания", **info}
-        return {"state": GROWTH, "why": f"последние 7 дн. к предыдущим ×{r:.2f}", **info}
-    if r < P["stable_low"]:
-        if r3 is not None and r3 >= 1:
-            return {"state": STABLE, "why": f"неделя ×{r:.2f}, но последние 3 дня уже не ниже прошлой недели", **info}
-        if cv > P["cv_gentle"]:
-            return {"state": UNCERTAIN, "why": f"снижение ×{r:.2f} при сильных колебаниях", **info}
-        return {"state": GENTLE, "why": f"последние 7 дн. к предыдущим ×{r:.2f}", **info}
-    return {"state": STABLE, "why": f"последние 7 дн. к предыдущим ×{r:.2f}", **info}
+            return {"state": UNCERTAIN, "why": f"рост ({span}) не подтверждён: всплеск/колебания", **info}
+        return {"state": GROWTH, "why": f"рост: {span}", **info}
+    return {"state": STABLE, "why": f"ровно: {span}", **info}
 
 
 def horizon(state, target, maxd, params=None):
