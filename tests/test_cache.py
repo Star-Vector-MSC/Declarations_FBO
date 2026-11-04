@@ -116,6 +116,8 @@ class CacheTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as error:
                 asyncio.run(service.refresh())
         self.assertNotIn('private details', str(error.exception))
+        self.assertIn('OSError на этапе', str(error.exception))
+        self.assertIn('private details', (self.store.path.parent / 'refresh_error.log').read_text(encoding='utf-8'))
         self.assertEqual(self.store.info()['files'], 1)
         self.assertEqual(self.store.info()['last_error'], 'OSError')
 

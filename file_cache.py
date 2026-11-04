@@ -5,6 +5,7 @@ import json
 import shutil
 import sqlite3
 import tempfile
+import traceback
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
@@ -235,17 +236,21 @@ class CacheService:
     def __init__(self, store=None):
         self.store = store or CacheStore()
         self.lock = asyncio.Lock()
+        self.stage = ''
 
     def refresh_sync(self):
         from export_templates import export
+        self.stage = 'Google-таблицы (ключ сервисного аккаунта, доступ к таблице)'
         sheets = Sheets(KEY)
         live = all_records(sheets.read(SHIPMENTS))
         groups = pending_groups(live)
         records = [r for goods in groups.values() for r in goods]
+        self.stage = 'таблица приходов и расчёт (PostgreSQL)'
         prepare(records, load_receipts(sheets.read(RECEIPTS)), now().date())
         with tempfile.TemporaryDirectory(prefix='wb-cache-') as temp:
             temp = Path(temp)
             write_plan(records, None, now().date(), temp/'plan')
+            self.stage = 'сборка Excel-файлов (PostgreSQL, шаблон)'
             if records:
                 export(temp/'plan'/'plan.json', Path.home()/'Downloads', temp/'files', database=True, base_template=BASE_TEMPLATE)
                 sources = json.loads((temp/'files'/'sources.json').read_text(encoding='utf-8'))
@@ -254,6 +259,7 @@ class CacheService:
             else:
                 sources, reports = {'identities': {}}, []
             # Do not resurrect a checkbox or changed goods during a slow build.
+            self.stage = 'повторное чтение таблицы отгрузок'
             latest = all_records(sheets.read(SHIPMENTS))
             current = pending_groups(latest)
             entries = []
@@ -268,17 +274,29 @@ class CacheService:
                 entries.append((*key, report['Кабинет'], goods[0]['date'],
                     json.dumps(goods, ensure_ascii=False), json.dumps(ids, ensure_ascii=False),
                     blob, report['Причина']))
+            self.stage = 'запись в локальную базу'
             self.store.publish(entries, latest)
         return self.store.info()
 
     async def refresh(self):
         async with self.lock:
+            self.stage = 'запуск'
             try:
                 return await asyncio.to_thread(self.refresh_sync)
             except Exception as exc:
+                # Only the stage and exception class are shown: the message may hold private data.
+                # The full traceback goes to a local file for whoever has access to the machine.
+                reason = f'{type(exc).__name__} на этапе «{self.stage}»'
+                try:
+                    log = self.store.path.parent / 'refresh_error.log'
+                    with log.open('a', encoding='utf-8') as handle:
+                        handle.write(f'{now().isoformat()} {reason}\n{traceback.format_exc()}\n')
+                except OSError:
+                    pass
                 with self.store.connect() as db:
                     db.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)', ('last_error', type(exc).__name__))
-                raise RuntimeError('Не удалось обновить базу. Предыдущие файлы сохранены; проверьте доступ к источникам.') from None
+                raise RuntimeError('Не удалось обновить базу. Предыдущие файлы сохранены; проверьте доступ к источникам.\n'
+                                   f'Причина: {reason}.') from None
 
     async def prune(self):
         async with self.lock:
