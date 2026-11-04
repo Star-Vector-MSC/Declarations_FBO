@@ -190,7 +190,7 @@ def make_workbook(base, records, path):
 
 
 def export(plan_path, archive_folder, output, catalog_path=None, base_template=None,
-           database=False, barcode_field='barcode', use_archive=False):
+           database=False, barcode_field='barcode', use_archive=False, extra_catalog=None):
     plan = json.loads(plan_path.read_text(encoding='utf-8'))
     if output.exists():
         raise ValueError('Папка результата уже существует; укажите новую папку')
@@ -199,6 +199,13 @@ def export(plan_path, archive_folder, output, catalog_path=None, base_template=N
         raise ValueError('Выберите один источник данных: БД или CSV')
     catalog = read_database_catalog(plan['records'], barcode_field) if database else (
         read_catalog_csv(catalog_path) if catalog_path else {})
+    # Manually entered barcodes fill only what the database does not know yet; the database wins.
+    for entry in extra_catalog or []:
+        known = any(normalize(item['cabinet']) == normalize(entry['cabinet'])
+                    and item['supply_id'] == entry['supply_id'] and item.get('origin') != 'MANUAL'
+                    for item in catalog.get(entry['nm_id'], []))
+        if not known:
+            catalog.setdefault(entry['nm_id'], []).append(entry)
     sources = sorted(archive_folder.glob('template*.xlsx'))
     if base_template is None:
         if sources:

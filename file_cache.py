@@ -102,6 +102,10 @@ class CacheStore:
                 workbook BLOB, reason TEXT NOT NULL,
                 PRIMARY KEY(cabinet_key, supply));
             CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS manual_identities (
+                cabinet_key TEXT NOT NULL, supply TEXT NOT NULL, nm_id TEXT NOT NULL,
+                vendor_code TEXT NOT NULL, barcode TEXT NOT NULL, created_at TEXT NOT NULL,
+                PRIMARY KEY(cabinet_key, supply, nm_id));
         ''')
         try:
             with connection:
@@ -120,10 +124,39 @@ class CacheStore:
         with self.connect() as db:
             db.execute('DELETE FROM files')
             db.executemany('INSERT INTO files VALUES (?,?,?,?,?,?,?,?)', entries)
+            # Manual barcodes live only while their supply is still waiting in the base.
+            db.execute('''DELETE FROM manual_identities WHERE NOT EXISTS (
+                SELECT 1 FROM files f WHERE f.cabinet_key = manual_identities.cabinet_key
+                AND f.supply = manual_identities.supply)''')
             for key, value in [('updated_at', now().isoformat()), ('last_error', ''),
                                ('status_dates', json.dumps(sorted({r['date'] for r in navigation}))),
                                ('unassigned_rows', str(unassigned))]:
                 db.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)', (key, value))
+
+    def waiting_goods(self, supply):
+        """Goods of a supply whose Excel is not built yet: {cabinet_key: (cabinet, goods)}."""
+        with self.connect() as db:
+            rows = db.execute('SELECT cabinet_key, cabinet, records FROM files '
+                              'WHERE supply=? AND workbook IS NULL', (str(supply),)).fetchall()
+        return {r['cabinet_key']: (r['cabinet'], json.loads(r['records'])) for r in rows}
+
+    def save_manual(self, cabinet_key, supply, nm_id, vendor_code, barcode):
+        with self.connect() as db:
+            db.execute('INSERT OR REPLACE INTO manual_identities VALUES (?,?,?,?,?,?)',
+                       (cabinet_key, str(supply), str(nm_id), vendor_code, barcode, now().isoformat()))
+
+    def manual_nm_ids(self, cabinet_key, supply):
+        with self.connect() as db:
+            return {r[0] for r in db.execute('SELECT nm_id FROM manual_identities '
+                                             'WHERE cabinet_key=? AND supply=?', (cabinet_key, str(supply)))}
+
+    def manual_catalog(self):
+        with self.connect() as db:
+            rows = db.execute('SELECT m.*, f.cabinet FROM manual_identities m JOIN files f '
+                              'ON f.cabinet_key = m.cabinet_key AND f.supply = m.supply').fetchall()
+        return [dict(cabinet=r['cabinet'], supply_id=r['supply'], nm_id=r['nm_id'],
+                     vendor_code=r['vendor_code'], barcode=r['barcode'],
+                     source='Telegram: введено вручную', source_row='', origin='MANUAL') for r in rows]
 
     def info(self):
         with self.connect() as db:
@@ -252,7 +285,8 @@ class CacheService:
             write_plan(records, None, now().date(), temp/'plan')
             self.stage = 'сборка Excel-файлов (PostgreSQL, шаблон)'
             if records:
-                export(temp/'plan'/'plan.json', Path.home()/'Downloads', temp/'files', database=True, base_template=BASE_TEMPLATE)
+                export(temp/'plan'/'plan.json', Path.home()/'Downloads', temp/'files', database=True, base_template=BASE_TEMPLATE,
+                       extra_catalog=self.store.manual_catalog())
                 sources = json.loads((temp/'files'/'sources.json').read_text(encoding='utf-8'))
                 with (temp/'files'/REPORT).open(encoding='utf-8-sig', newline='') as handle:
                     reports = list(csv.DictReader(handle, delimiter=';'))

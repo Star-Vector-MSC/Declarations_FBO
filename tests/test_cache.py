@@ -44,6 +44,37 @@ class CacheTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.store.materialize(supply_id='999')
 
+    def test_manual_identity_is_kept_while_supply_waits_and_dropped_after(self):
+        goods = [record(supply='777')]
+        waiting = ('shop', '777', 'Shop', goods[0]['date'], json.dumps(goods), '[]', None, 'Нет баркода')
+        self.store.publish([waiting], goods)
+        self.assertEqual(list(self.store.waiting_goods('777')), ['shop'])
+        self.store.save_manual('shop', '777', 456, 'wild399', '2044564667550')
+        self.store.publish([waiting], goods)  # a refresh keeps it
+        catalog = self.store.manual_catalog()
+        self.assertEqual([(c['supply_id'], c['nm_id'], c['barcode'], c['cabinet']) for c in catalog],
+                         [('777', '456', '2044564667550', 'Shop')])
+        self.store.publish([entry(self.goods)], self.goods)  # supply gone from the base
+        self.assertEqual(self.store.manual_catalog(), [])
+
+    def test_manual_identity_builds_exact_match_but_database_wins(self):
+        from export_templates import identify
+        goods = dict(record(supply='777'), state='READY', vendor_code='')
+        manual = dict(cabinet='Shop', supply_id='777', nm_id='456', vendor_code='wild399',
+                      barcode='2044564667550', source='manual', source_row='', origin='MANUAL')
+        result = identify(goods, {}, {'456': [manual]})
+        self.assertEqual((result['barcode'], result['vendor_code'], result['origin']),
+                         ('2044564667550', 'wild399', 'MANUAL'))
+        with self.assertRaises(ValueError):  # a wrong seller article is still rejected
+            identify(goods, {}, {'456': [dict(manual, vendor_code='wild1593')]})
+
+    def test_manual_identity_message_format(self):
+        match = app.MANUAL_IDENTITY.fullmatch('Баркод 2044564667550 артикул wild1593')
+        self.assertEqual(match.groups(), ('2044564667550', 'wild1593', None))
+        match = app.MANUAL_IDENTITY.fullmatch('баркод 2044564667550 артикул wild1593D wb 451222034')
+        self.assertEqual(match.groups(), ('2044564667550', 'wild1593D', '451222034'))
+        self.assertIsNone(app.MANUAL_IDENTITY.fullmatch('баркод 12 артикул wild1'))
+
     def test_failed_publish_rolls_back_old_files(self):
         with self.assertRaises(Exception):
             self.store.publish([('broken',)], [])

@@ -20,7 +20,7 @@ from aiogram.types import (BotCommand, FSInputFile, KeyboardButton, Message, Rep
                            CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup)
 from dotenv import dotenv_values
 
-from wb_declarations import PROJECT, KEY, SHIPMENTS, Sheets, parse_date, normalize
+from wb_declarations import PROJECT, KEY, SHIPMENTS, Sheets, parse_date, normalize, integer, base_vendor
 from completion import save_batch, load_batch, Checklist, BATCHES
 from file_cache import CacheService, cleanup_delivery
 from planner_ui import PlannerController, ENTRY as PLANNER_ENTRY
@@ -208,11 +208,15 @@ async def send_chunks(message, text):
         await message.answer(part)
 
 
+MANUAL_IDENTITY = re.compile(r'баркод\s+(\d{8,14})\s+артикул\s+(\S+?)(?:\s+wb\s+(\d+))?', re.IGNORECASE)
+
+
 def create_dispatcher():
     dispatcher = Dispatcher()
     delivery_slots = asyncio.Semaphore(3)
     checklist_lock = asyncio.Lock()
     navigation = {}
+    last_supply = {}  # user id -> the plain supply number requested last (context for manual barcode input)
     planner_ui = PlannerController()  # lazy: no storage, memory or Google access until the first planner action
 
     async def show_navigation(message, mode, records, stage, cabinet=None, selected=None, page=0):
@@ -405,6 +409,51 @@ def create_dispatcher():
                 if folder is not None:
                     await asyncio.to_thread(cleanup_delivery, folder)
 
+    async def manual_identity(message, match):
+        """«баркод 2044… артикул wild1593 [wb 4512…]» for a supply the database does not know yet."""
+        supply = last_supply.get(message.from_user.id)
+        if not supply:
+            await message.answer('Сначала пришлите номер поставки, затем баркод и артикул.')
+            return
+        store = cache_service().store
+        waiting = await asyncio.to_thread(store.waiting_goods, supply)
+        if not waiting:
+            await message.answer('Эта поставка не ждёт данных: файл уже собран или её нет в базе. '
+                                 'Нажмите «Обновить базу».')
+            return
+        if len(waiting) > 1:
+            await message.answer('Этот номер есть в нескольких кабинетах — ручной ввод для него не поддерживается.')
+            return
+        (cabinet_key, (cabinet, goods)), = waiting.items()
+        barcode, vendor, wb_article = match.group(1), match.group(2), match.group(3)
+        have = await asyncio.to_thread(store.manual_nm_ids, cabinet_key, supply)
+        open_lines = [g for g in goods if str(integer(g['nm_id'])) not in have]
+        if wb_article:
+            open_lines = [g for g in goods if str(integer(g['nm_id'])) == wb_article]
+        if len(open_lines) != 1:
+            options = ', '.join(f'{integer(g["nm_id"])} ({g["wild"]})' for g in goods if str(integer(g['nm_id'])) not in have)
+            await message.answer('В поставке несколько товаров. Добавьте артикул WB: '
+                                 f'баркод {barcode} артикул {vendor} wb <артикул WB>.\nТовары: {options}')
+            return
+        line = open_lines[0]
+        try:
+            if base_vendor(vendor) != base_vendor(line['wild']):
+                raise ValueError
+        except ValueError:
+            await message.answer(f'Артикул продавца «{vendor}» не соответствует wild из плана ({line["wild"]}). '
+                                 'Введите точный артикул продавца из WB.')
+            return
+        await asyncio.to_thread(store.save_manual, cabinet_key, supply, integer(line['nm_id']), vendor, barcode)
+        await message.answer(f'Принято: {cabinet}, поставка {supply}, артикул WB {integer(line["nm_id"])}, '
+                             f'баркод {barcode}, артикул продавца {vendor}. Данные введены вручную и не '
+                             'проверены по базе — сверьте файл перед загрузкой. Пересобираю файл…')
+        try:
+            await cache_service().refresh()
+        except RuntimeError as exc:
+            await message.answer(str(exc))
+            return
+        await deliver(message, supply_id=supply)
+
     @dispatcher.message(Command('files'))
     async def files(message: Message):
         if not await authorized(message):
@@ -583,7 +632,10 @@ def create_dispatcher():
             await message.answer('Выберите способ получения файлов.', reply_markup=declarations_keyboard())
         elif text.startswith('Кабинет: '):
             await deliver(message, cabinet=text.removeprefix('Кабинет: ').strip())
+        elif MANUAL_IDENTITY.fullmatch(text):
+            await manual_identity(message, MANUAL_IDENTITY.fullmatch(text))
         elif re.fullmatch(r'\d{1,20}', text):
+            last_supply[message.from_user.id] = str(integer(text))
             await deliver(message, supply_id=text)
         elif text in ('Ближайшая отгрузка', 'Сегодня', 'Завтра'):
             selected = None if text == 'Ближайшая отгрузка' else (
