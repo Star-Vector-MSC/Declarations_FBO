@@ -289,6 +289,7 @@ class CacheService:
                 reason = f'{type(exc).__name__} на этапе «{self.stage}»'
                 try:
                     log = self.store.path.parent / 'refresh_error.log'
+                    log.parent.mkdir(exist_ok=True)
                     with log.open('a', encoding='utf-8') as handle:
                         handle.write(f'{now().isoformat()} {reason}\n{traceback.format_exc()}\n')
                 except OSError:

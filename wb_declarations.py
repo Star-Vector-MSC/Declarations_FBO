@@ -174,6 +174,19 @@ def choose_vendor_dt(vendor, receipts, stock, as_of):
     return dt, [{**row, 'component': source, 'per_kit': 1} for row in used]
 
 
+def cabinet_columns(headers):
+    """Return (cabinet, product title) column indexes of the shipments sheet.
+
+    The cabinet is the first "Название магазина". The product title is either the second
+    "Название магазина" (old layout) or "Название предмета" (current layout).
+    """
+    shops = [i for i, h in enumerate(headers) if normalize(h) == 'название магазина']
+    if not shops or len(shops) > 2:
+        raise ValueError('Expected cabinet and product title columns')
+    product = shops[1] if len(shops) == 2 else index(headers, 'Название предмета')
+    return shops[0], product
+
+
 def shipment_queue(rows, selected_date, as_of, cabinet=None, supply_id=None, include_checked=False):
     headers = rows[0]
     columns = {k: index(headers, h) for k, h in {
@@ -181,10 +194,7 @@ def shipment_queue(rows, selected_date, as_of, cabinet=None, supply_id=None, inc
         'status': 'Статус отгрузки', 'wild': 'wild', 'nm_id': 'Артикул',
         'checked': 'Чек лист Декларация', 'free_stock': 'Свободный остаток',
         'quantity': 'Количество'}.items()}
-    # The sheet contains two headers named "Название магазина"; the first is the cabinet.
-    cabinets = [i for i, h in enumerate(headers) if normalize(h) == 'название магазина']
-    if len(cabinets) != 2:
-        raise ValueError('Expected cabinet and product title columns')
+    cabinets = cabinet_columns(headers)
     queue = []
     for n, row in enumerate(rows[1:], 2):
         if normalize(value_at(row, columns['status'])) != 'одобрено':

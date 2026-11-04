@@ -8,7 +8,7 @@ from urllib.parse import quote
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from wb_declarations import PROJECT, KEY, SHIPMENTS, integer, normalize, index, value_at, parse_date
+from wb_declarations import PROJECT, KEY, SHIPMENTS, integer, normalize, index, value_at, parse_date, cabinet_columns
 
 BATCHES = PROJECT / 'runs' / 'telegram_batches'
 
@@ -24,9 +24,10 @@ def sheet_records(rows):
         'supply_id': 'Номер поставки', 'nm_id': 'Артикул', 'quantity': 'Количество',
         'date': 'Дата отгрузки (склад)', 'checked': 'Чек лист Декларация',
         'status': 'Статус отгрузки'}.items()}
-    cabinets = [i for i, h in enumerate(headers) if normalize(h) == 'название магазина']
-    if len(cabinets) != 2:
-        raise ValueError('Не удалось определить столбец кабинета.')
+    try:
+        cabinets = cabinet_columns(headers)
+    except ValueError:
+        raise ValueError('Не удалось определить столбец кабинета.') from None
     result = []
     for number, row in enumerate(rows[1:], 2):
         record = {k: value_at(row, col) for k, col in columns.items()}

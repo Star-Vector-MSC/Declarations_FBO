@@ -29,6 +29,14 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(selected, date(2026, 10, 25))
         self.assertEqual([r['supply_id'] for r in rows], ['2', '3'])
 
+    def test_renamed_product_title_column_still_works(self):
+        rows = self.rows()
+        rows[0][-1] = 'Название предмета'
+        _, queue = shipment_queue(rows, None, date(2026, 10, 22), cabinet='МагазинА', include_checked=True)
+        self.assertEqual([(r['cabinet'], r['product']) for r in queue], [('МагазинА', 'Товар')] * 2)
+        records, _ = completion.sheet_records(rows)
+        self.assertEqual({r['cabinet'] for r in records}, {'Другой', 'МагазинА'})
+
     def test_explicit_supply_can_be_requested_again_after_confirmation(self):
         selected, rows = shipment_queue(self.rows(), None, date(2026, 10, 22),
                                        supply_id='3', include_checked=True)
