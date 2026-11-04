@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import re
+import time
 from collections import defaultdict
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -76,10 +77,25 @@ class Sheets:
             str(key), scopes=['https://www.googleapis.com/auth/spreadsheets.readonly'])
         self.session = AuthorizedSession(credentials)
 
+    def get(self, url, attempts=3, **kwargs):
+        """GET with a few retries: the big shipments sheet takes ~45 s, so one slow reply must not fail a refresh."""
+        import requests
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self.session.get(url, **kwargs)
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                if attempt == attempts:
+                    raise
+                continue
+            if response.status_code in (429, 500, 502, 503, 504) and attempt < attempts:
+                time.sleep(3 * attempt)
+                continue
+            return response
+
     def read(self, source):
         spreadsheet, gid = source
         base = f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet}'
-        response = self.session.get(base, params={
+        response = self.get(base, params={
             'fields': 'sheets.properties(sheetId,title,gridProperties)'}, timeout=40)
         if response.status_code != 200:
             raise ValueError(f'Cannot read spreadsheet {spreadsheet}: HTTP {response.status_code}')
@@ -88,7 +104,7 @@ class Sheets:
         if props is None:
             raise ValueError(f'Sheet gid {gid} not found')
         title = props['title'].replace("'", "''")
-        response = self.session.get(base + '/values/' + quote(f"'{title}'", safe=''), timeout=60)
+        response = self.get(base + '/values/' + quote(f"'{title}'", safe=''), timeout=150)
         if response.status_code != 200:
             raise ValueError(f'Cannot read sheet gid {gid}: HTTP {response.status_code}')
         return response.json().get('values', [])

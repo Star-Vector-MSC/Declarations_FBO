@@ -13,6 +13,18 @@ import completion
 from wb_declarations import shipment_queue
 
 
+def unittest_side_effects(*items):
+    """A fake GET that raises exceptions and returns responses in the given order."""
+    queue = list(items)
+
+    def call(*args, **kwargs):
+        item = queue.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+    return call
+
+
 class SelectionTests(unittest.TestCase):
     def rows(self):
         return [
@@ -28,6 +40,18 @@ class SelectionTests(unittest.TestCase):
                                        cabinet='МАГАЗИНА', include_checked=True)
         self.assertEqual(selected, date(2026, 10, 25))
         self.assertEqual([r['supply_id'] for r in rows], ['2', '3'])
+
+    def test_sheets_read_retries_a_timeout_and_a_server_error(self):
+        import requests
+        from wb_declarations import Sheets
+        sheets = Sheets.__new__(Sheets)
+        sheets.session = SimpleNamespace(get=unittest_side_effects(
+            requests.exceptions.ReadTimeout(), SimpleNamespace(status_code=503), SimpleNamespace(status_code=200)))
+        with patch('wb_declarations.time.sleep'):
+            self.assertEqual(sheets.get('url').status_code, 200)
+        sheets.session = SimpleNamespace(get=unittest_side_effects(*[requests.exceptions.ReadTimeout()] * 3))
+        with self.assertRaises(requests.exceptions.ReadTimeout):
+            sheets.get('url')
 
     def test_renamed_product_title_column_still_works(self):
         rows = self.rows()
