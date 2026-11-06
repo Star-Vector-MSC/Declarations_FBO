@@ -1,6 +1,7 @@
 name: Tests
 on: [push, pull_request]
-# Least privilege: the workflow token is read-only, so a misconfigured or compromised step cannot push or change the repository.
+# Least privilege: the workflow token is read-only, so a misconfigured or compromised step
+# cannot push or change the repository.
 permissions:
   contents: read
 jobs:
