@@ -772,6 +772,25 @@ class UpdateFromSheetTests(UiBase):
         self.assertTrue(self.sheets.reconciled[-1][2])
         self.assertEqual(self.sheets.rules_seen["capacity"], 20)
 
+    async def test_update_confirmation_of_a_cancelled_proposal_is_dead_even_for_the_same_machine(self):
+        did, ver, m2 = await self.exported()
+        c, m3 = cb(buttons(m2)["Обновить по листу"])
+        await self.ctl.handle_callback(c)
+        old = buttons(m3)["Подтвердить обновление"]
+        c, _ = cb("pl:cn")
+        await self.ctl.handle_callback(c)
+        c, m4 = cb(buttons(m2)["Обновить по листу"])  # a new proposal for the same machine (sources may have changed)
+        await self.ctl.handle_callback(c)
+        new = buttons(m4)["Подтвердить обновление"]
+        self.assertNotEqual(old, new)
+        c, m5 = cb(old)
+        await self.ctl.handle_callback(c)
+        self.assertIn("Сначала нажмите", said(m5))
+        self.assertFalse(any(x[2] for x in self.sheets.reconciled))
+        c, m6 = cb(new)
+        await self.ctl.handle_callback(c)
+        self.assertTrue(self.sheets.reconciled[-1][2])
+
     async def test_up_before_export_is_refused(self):
         m, b = await self.plan()
         did, ver = b["Состав"].split(":")[2:4]

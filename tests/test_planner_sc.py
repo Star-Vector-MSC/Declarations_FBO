@@ -313,6 +313,29 @@ class ScUiTest(UiBase):
         await self.ctl.handle_callback(c)
         self.assertTrue(self.sheets.drop_seen[-1][1])
 
+    async def test_a_cancelled_replacement_confirmation_stays_dead_after_a_new_preview(self):
+        d0, m3 = await self.exported_check(nowh=True)
+        c, m4 = cb(buttons(m3)["Заменить 1 стр. под Коледино"])
+        await self.ctl.handle_callback(c)
+        old = buttons(m4)["Подтвердить замену"]
+        c, _ = cb("pl:cn")
+        await self.ctl.handle_callback(c)
+        c, m5 = cb(buttons(m3)["Заменить 1 стр. под Коледино"])  # preview again
+        await self.ctl.handle_callback(c)
+        new = buttons(m5)["Подтвердить замену"]
+        self.assertNotEqual(old, new)
+        writes = len([x for x in self.sheets.drop_seen if x[1]])
+        c, m6 = cb(old)
+        await self.ctl.handle_callback(c)
+        self.assertIn("устарело или отменено", said(m6))
+        self.assertEqual(len([x for x in self.sheets.drop_seen if x[1]]), writes)
+        c, m7 = cb(new)  # the current one works exactly once
+        await self.ctl.handle_callback(c)
+        self.assertEqual(len([x for x in self.sheets.drop_seen if x[1]]), writes + 1)
+        c, m8 = cb(new)
+        await self.ctl.handle_callback(c)
+        self.assertEqual(len([x for x in self.sheets.drop_seen if x[1]]), writes + 1)
+
     async def test_replacement_under_another_warehouse_than_the_exported_plans_is_refused(self):
         import planner_ui as ui
         d0, _ = await self.exported_check()  # this plan is saved with its own warehouse

@@ -1096,20 +1096,20 @@ class PlannerController:
         await msg.answer("Считаю замену…")
         ok, s = await self._guarded(uid, ct, msg, self._sc_reconcile, uid, d, st["wh"], False)
         if ok:
-            st["armed"] = True  # the confirm button works only after this preview and only until Cancel
+            st["armed"] = tok = secrets.token_hex(3)  # a new one-time token per preview: older buttons stay dead
             await msg.answer(self._update_text(s) + f"\n\nСклад «{st['wh']}» проставлю во всех строках. В лист пишу только после "
                              "подтверждения.", reply_markup=_kb(
-                [[_btn("Подтвердить замену", "rk", did, ver, nonce), _btn("Отмена", "cn")]]))
+                [[_btn("Подтвердить замену", "rk", did, ver, nonce, tok), _btn("Отмена", "cn")]]))
 
-    async def _c_rk(self, uid, ct, msg, did, ver, nonce=""):
+    async def _c_rk(self, uid, ct, msg, did, ver, nonce="", tok=""):
         st = self._sc_session(uid, did, ver, nonce)
         if not st:
             await msg.answer("Кнопка устарела. Нажмите «Проверить склады» ещё раз.")
             return
-        if not st.get("armed"):
+        if not tok or st.get("armed") != tok:
             await msg.answer("Подтверждение устарело или отменено. Посмотрите замену ещё раз и подтвердите.")
             return
-        st["armed"] = False  # one use: a retry needs a new preview
+        st.pop("armed")  # one use: a retry needs a new preview
         d = await self._sc_plan(uid, did, ver, "x")
         await msg.answer("Обновляю лист…")
         ok, s = await self._guarded(uid, ct, msg, self._sc_reconcile, uid, d, st["wh"], True)
@@ -1379,17 +1379,18 @@ class PlannerController:
                              f"{s['capacity']} паллет. Можно добить до другой машины.",
                              reply_markup=_kb([[_btn(f"Добить до машины {other} паллет", "up", did, ver, other)]]))
             return
-        self._st[uid] = {"step": "confirm", "confirm_up": (did, ver, int(s["capacity"]))}
+        tok = secrets.token_hex(3)  # one-time token of THIS proposal: a cancelled or older button cannot apply a new calculation
+        self._st[uid] = {"step": "confirm", "confirm_up": (did, ver, int(s["capacity"]), tok)}
         await msg.answer(self._update_text(s) + "\n\nПеред записью источники будут перепроверены; пишу только в "
                          "«Планирование FBO — ТЕСТ».",
-                         reply_markup=_kb([[_btn("Подтвердить обновление", "uk", did, ver, s["capacity"]), _btn("Отмена", "cn")],
+                         reply_markup=_kb([[_btn("Подтвердить обновление", "uk", did, ver, s["capacity"], tok), _btn("Отмена", "cn")],
                                            [_btn(f"Добить до машины {other} паллет", "up", did, ver, other)]]))
 
-    async def _c_uk(self, uid, ct, msg, did, ver, cap=None):
+    async def _c_uk(self, uid, ct, msg, did, ver, cap=None, tok=""):
         cap = self._cap_arg(cap)
         g = self._gen.get(uid, 0)
         d = await asyncio.to_thread(self.store.get, uid, did, ver)
-        if (self._st.get(uid) or {}).get("confirm_up") != (did, ver, cap) or d.get("exported_version") != ver:
+        if (self._st.get(uid) or {}).get("confirm_up") != (did, ver, cap, tok) or d.get("exported_version") != ver:
             await msg.answer("Сначала нажмите «Обновить по листу» у этого плана.")
             return
         self._st.pop(uid, None)
