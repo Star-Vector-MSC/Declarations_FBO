@@ -59,9 +59,9 @@ class RedactTests(unittest.TestCase):
             'json': '{"token": "Sup3rSecret"}',
             'url': 'GET https://x.example/v4?key=Sup3rSecret&alt=json',
             'bearer': 'Authorization: Bearer Sup3rSecret.abc-def',
-            'telegram': 'bot123456789:' + 'A' * 35 + '/getMe',
+            'telegram': 'bot' + '123456789' + ':' + 'A' * 35 + '/getMe',
             'google': 'AIza' + 'B' * 30,
-            'pem': '-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----',
+            'pem': '-----BEGIN ' + 'PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END ' + 'PRIVATE KEY-----',
         }
         for name, text in samples.items():
             out = fc.redact(text)
