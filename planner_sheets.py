@@ -52,6 +52,9 @@ class PublishUncertainError(PlannerSheetsError):
     pass
 
 
+STATUS_NEW = "Согласовать"  # the bot proposes; the owner sets «Одобрено» / «Не согласовано» himself
+
+
 def _c(name, occ=0):
     return planner._norm(name), occ
 
@@ -219,7 +222,8 @@ def _draft(d):
         did, ver, plan = d["id"], d["version"], d["plan"]
         lines, cap = plan["lines"], plan["rules"]["capacity"]
         ok = bool(isinstance(did, str) and _HEX12.fullmatch(did) and type(ver) is int and ver > 0
-                  and isinstance(plan["source_hash"], str) and isinstance(plan["warehouse"], str))
+                  and isinstance(plan["source_hash"], str)
+                  and (plan["warehouse"] is None or isinstance(plan["warehouse"], str)))
         _serial(plan["date"]), _serial(plan.get("arrival_date"))
         total = Fraction(0)
         for ln in lines:
@@ -244,7 +248,7 @@ def _cells(did, ver, plan, ln):
     sd, arr, rules = _serial(plan["date"]), _serial(plan.get("arrival_date")), _canon(plan["rules"])
     return {_c("Дата отгрузки (склад)"): _dv(sd), _c("Сборка товара (Склад)"): _dv(sd - 1),
             _c("Плановая дата прибытия авто на вб"): _dv(arr),
-            _c("Склад Wildberries"): _sv(plan["warehouse"]), _c("Статус отгрузки"): _sv("Одобрено"),
+            _c("Склад Wildberries"): _sv(plan["warehouse"]), _c("Статус отгрузки"): _sv(STATUS_NEW),
             _c("wild"): _sv(ln["wild"]), _c("Артикул"): _art(ln["article"]),
             _c("Название магазина"): _sv(ln["cabinet"]), _c("Название предмета"): _sv(ln["product"]),
             _c("Тип поставки"): _sv("Монопаллета"), _c("К отгрузке"): _nv(ln["quantity"]),
@@ -438,7 +442,11 @@ class PlannerSheets:
             raise PlannerSheetsError("В тестовом листе есть строки не этого плана. Обновление по листу работает, когда "
                                      "в листе один план: уберите лишние строки.")
         refused = [i for i in mine if _s(g(i, "Статус отгрузки")) == "Не согласовано"]
-        kept = [i for i in mine if i not in set(refused)]
+        # «Пересмотреть»: the line leaves the plan, but the pair is NOT blacklisted: the bot may propose it again
+        # under the current rules (e.g. it was refused only for its quantity).
+        redo = [i for i in mine if _s(g(i, "Статус отгрузки")) == "Пересмотреть"]
+        dropped = refused + redo
+        kept = [i for i in mine if i not in set(dropped)]
 
         def ident(i):
             return str(planner._ident(g(i, "Артикул"))), str(planner._ident(g(i, "Название магазина")))
@@ -454,17 +462,18 @@ class PlannerSheets:
         rules = dict(rules_fn(fresh) if rules_fn else plan["rules"])  # rules_fn: saved rules + what memory knows today
         rules["fixed"] = fixed
         try:
-            new = planner.build_plan(fresh, rules, plan["date"], plan["warehouse"], plan.get("arrival_date"), exclude=excl)
+            new = planner.build_plan(fresh, rules, plan["date"], plan["warehouse"], plan.get("arrival_date"), exclude=excl,
+                                     allowed_wilds=plan.get("allowed_wilds"))
         except ValueError as e:
             raise PlannerSheetsError("Не удалось пересчитать состав: " + str(e)[:200]) from None
         added = [ln for ln in new["lines"] if not ln["fixed"]]
-        summary = {"removed": [(*ident(i), planner._num(g(i, "К отгрузке"))) for i in refused], "kept": len(kept),
-                   "added": added, "total_pallets": new["total_pallets"], "capacity": plan["rules"]["capacity"],
+        summary = {"removed": [(*ident(i), planner._num(g(i, "К отгрузке"))) for i in dropped], "kept": len(kept),
+                   "added": added, "total_pallets": new["total_pallets"], "capacity": rules["capacity"],
                    "warnings": new["warnings"][:5], "refused": sorted(excl)}
         summary["removed"] = [(a, c, None if q is None else int(q)) for a, c, q in summary["removed"]]
         if not apply:
             return summary
-        if refused or added:
+        if dropped or added:
             tc = [i for i, c in enumerate(rows[0]) if not planner._blank(c) and not (isinstance(c, str) and c.startswith("="))]
             runs = []
             for i in tc:
@@ -486,7 +495,9 @@ class PlannerSheets:
                 reqs += [{"updateCells": {"range": region(start, last, a, b), "fields": "userEnteredValue",
                                           "rows": [{"values": [{} for _ in range(b - a)]} for _ in range(last - start)]}}
                          for a, b in runs]
-            per = [_cells(did, ver, plan, ln) for ln in added]
+            sheet_wh = {_s(g(i, "Склад Wildberries")) for i in mine} - {None, ""}  # every row of the plan, not only the kept ones
+            wh = plan["warehouse"] if plan["warehouse"] is not None else (next(iter(sheet_wh)) if len(sheet_wh) == 1 else None)
+            per = [_cells(did, ver, dict(plan, warehouse=wh), ln) for ln in added]
             for key in (per[0] if per else {}):
                 c = cols[key]
                 dated = "userEnteredFormat" in per[0][key]
@@ -501,6 +512,90 @@ class PlannerSheets:
             self._api("POST", ":batchUpdate", body={"requests": reqs})
         summary["url"] = self._link(tid, 2)
         return summary
+
+    def set_warehouse(self, draft, warehouse):
+        """A plan written without a warehouse: fill ONLY the «Склад Wildberries» cell of that plan's rows. Refuses when the
+        rows are not exactly this exported version, or already carry another warehouse. Returns the link."""
+        did, ver, plan = _draft(draft)
+        if not isinstance(warehouse, str) or not warehouse.strip():
+            raise PlannerSheetsError("Склад не указан")
+        ids = self._meta()
+        tid = ids[T_TARGET]["sheetId"]
+        rows = self._values((T_TARGET,), "FORMULA")[0]
+        if not rows:
+            raise PlannerSheetsError("В тестовом листе нет заголовков")
+        head = self._values((T_TARGET,), "UNFORMATTED_VALUE", head=True)[0] or [[]]
+        cols = _bind(_heads(head[0], rows[0]), ORIGINAL + META, T_TARGET)
+        mine = [i for i in range(1, len(rows)) if planner._ident(_cell(rows[i], cols[_c("ID плана")])) == did]
+        if not mine:
+            raise PlannerSheetsError("Строк этого плана нет в тестовом листе: сначала запишите план.")
+        if any(planner._num(_cell(rows[i], cols[_c("Версия плана")])) != ver for i in mine):
+            raise PublishConflictError("В листе другая версия этого плана; склад не проставлен")
+        if warehouse not in self._read()[0]["warehouses"]:
+            raise SourceChangedError("Такого склада сейчас нет в таблице. Выберите склад заново.")
+        wcol = cols[_c("Склад Wildberries")]
+        current = {_cmp(_cell(rows[i], wcol)) for i in mine}
+        if current == {("s", warehouse.strip())}:
+            return self._link(tid, mine[0] + 1)  # repeat after a lost response: nothing to write
+        if current != {None}:
+            raise PublishConflictError("У строк плана в листе уже указан склад (или он разный); "
+                                       "бот его не меняет")
+        reqs = [{"updateCells": {"range": {"sheetId": tid, "startRowIndex": i, "endRowIndex": i + 1,
+                                           "startColumnIndex": wcol, "endColumnIndex": wcol + 1},
+                                 "rows": [{"values": [_sv(warehouse.strip())]}], "fields": "userEnteredValue"}}
+                for i in mine]
+        _guard(reqs, tid, min(mine), max(mine) + 1)
+        self._api("POST", ":batchUpdate", body={"requests": reqs})
+        return self._link(tid, mine[0] + 1)
+
+    def set_date(self, draft, ship_date, arrival_date=None):
+        """A plan already in the sheet: move ONLY its date cells (shipment, assembly = day before, and the arrival date
+        when the plan has one) to ship_date / arrival_date. The plan's current dates are `draft["plan"]`. A cell the owner
+        edited by hand is left alone (assembly, arrival) or refuses the change (shipment). Returns the link."""
+        did, ver, plan = _draft(draft)
+        old_sd, new_sd = _serial(plan["date"]), _serial(ship_date)
+        old_ar, new_ar = _serial(plan.get("arrival_date")), _serial(arrival_date)
+        if new_sd is None or (arrival_date is not None and new_ar < new_sd):
+            raise PlannerSheetsError("Некорректная дата отгрузки")
+        ids = self._meta()
+        tid = ids[T_TARGET]["sheetId"]
+        rows = self._values((T_TARGET,), "FORMULA")[0]
+        if not rows:
+            raise PlannerSheetsError("В тестовом листе нет заголовков")
+        head = self._values((T_TARGET,), "UNFORMATTED_VALUE", head=True)[0] or [[]]
+        cols = _bind(_heads(head[0], rows[0]), ORIGINAL + META, T_TARGET)
+        mine = [i for i in range(1, len(rows)) if planner._ident(_cell(rows[i], cols[_c("ID плана")])) == did]
+        if not mine:
+            raise PlannerSheetsError("Строк этого плана нет в тестовом листе: сначала запишите план.")
+        if any(planner._num(_cell(rows[i], cols[_c("Версия плана")])) != ver for i in mine):
+            raise PublishConflictError("В листе другая версия этого плана; дата не изменена")
+
+        def num(v):
+            return None if v is None else ("n", Fraction(v))
+        plans = ((_c("Дата отгрузки (склад)"), old_sd, new_sd, True),
+                 (_c("Сборка товара (Склад)"), old_sd - 1, new_sd - 1, False))
+        if old_ar is not None:
+            plans += ((_c("Плановая дата прибытия авто на вб"), old_ar, new_ar, False),)
+        reqs = []
+        for key, old, new, strict in plans:
+            col = cols[key]
+            for i in mine:
+                cur = _cmp(_cell(rows[i], col))
+                if cur == num(new):
+                    continue
+                if cur != num(old):
+                    if strict:
+                        raise PublishConflictError("У строк плана в листе стоит другая дата отгрузки (не та, что в плане); "
+                                                   "бот её не меняет. Поправьте дату в листе вручную.")
+                    continue
+                reqs.append({"updateCells": {"range": {"sheetId": tid, "startRowIndex": i, "endRowIndex": i + 1,
+                                                       "startColumnIndex": col, "endColumnIndex": col + 1},
+                                             "rows": [{"values": [_dv(new)]}],
+                                             "fields": "userEnteredValue,userEnteredFormat.numberFormat"}})
+        if reqs:
+            _guard(reqs, tid, min(mine), max(mine) + 1)
+            self._api("POST", ":batchUpdate", body={"requests": reqs})
+        return self._link(tid, mine[0] + 1)
 
     def publish(self, draft):
         did, ver, plan = _draft(draft)
@@ -539,10 +634,11 @@ class PlannerSheets:
             return self._link(tid, mine[0] + 1)
 
         fresh, orig = self._read()
-        if plan["warehouse"] not in fresh["warehouses"]:
+        if plan["warehouse"] is not None and plan["warehouse"] not in fresh["warehouses"]:
             raise SourceChangedError("Склад плана больше не найден в исходных данных. Пересчитайте план и сохраните новую версию.")
         try:
-            new = planner.build_plan(fresh, plan["rules"], plan["date"], plan["warehouse"], plan.get("arrival_date"))
+            new = planner.build_plan(fresh, plan["rules"], plan["date"], plan["warehouse"], plan.get("arrival_date"),
+                                     allowed_wilds=plan.get("allowed_wilds"))
         except ValueError:
             new = None
         if new is None or any(_canon(new[k]) != _canon(plan.get(k))

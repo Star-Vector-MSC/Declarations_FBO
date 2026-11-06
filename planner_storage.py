@@ -5,7 +5,7 @@ import re
 import secrets
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 DEFAULT_DB_PATH = os.path.join("data", "planner_drafts.sqlite3")
 _ID = re.compile(r"[0-9a-f]{12}")
@@ -19,6 +19,14 @@ CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY, version INTEGER NOT NULL
   exported_at TEXT NOT NULL, FOREIGN KEY(id, version) REFERENCES versions(id, version));
 CREATE TABLE IF NOT EXISTS rejected(id TEXT NOT NULL, article TEXT NOT NULL, cabinet TEXT NOT NULL,
   created_at TEXT NOT NULL, PRIMARY KEY(id, article, cabinet));
+CREATE TABLE IF NOT EXISTS date_changes(id TEXT NOT NULL, version INTEGER NOT NULL, ship_date TEXT NOT NULL,
+  arrival_date TEXT, created_at TEXT NOT NULL, FOREIGN KEY(id, version) REFERENCES versions(id, version));
+CREATE TABLE IF NOT EXISTS plan_limits(id TEXT NOT NULL, version INTEGER NOT NULL, warehouse TEXT NOT NULL, wilds TEXT NOT NULL,
+  created_at TEXT NOT NULL, FOREIGN KEY(id, version) REFERENCES versions(id, version));
+CREATE TRIGGER IF NOT EXISTS plan_limits_no_u BEFORE UPDATE ON plan_limits BEGIN SELECT RAISE(ABORT, 'immutable'); END;
+CREATE TRIGGER IF NOT EXISTS plan_limits_no_d BEFORE DELETE ON plan_limits BEGIN SELECT RAISE(ABORT, 'immutable'); END;
+CREATE TRIGGER IF NOT EXISTS date_changes_no_u BEFORE UPDATE ON date_changes BEGIN SELECT RAISE(ABORT, 'immutable'); END;
+CREATE TRIGGER IF NOT EXISTS date_changes_no_d BEFORE DELETE ON date_changes BEGIN SELECT RAISE(ABORT, 'immutable'); END;
 CREATE TRIGGER IF NOT EXISTS versions_no_u BEFORE UPDATE ON versions BEGIN SELECT RAISE(ABORT, 'immutable'); END;
 CREATE TRIGGER IF NOT EXISTS versions_no_d BEFORE DELETE ON versions BEGIN SELECT RAISE(ABORT, 'immutable'); END;
 CREATE TRIGGER IF NOT EXISTS exports_no_u BEFORE UPDATE ON exports BEGIN SELECT RAISE(ABORT, 'immutable'); END;
@@ -92,7 +100,16 @@ class DraftStore:
             raise DraftNotFound(_NF)
         ex = con.execute("SELECT version, url, exported_at FROM exports WHERE id=?", (did,)).fetchone() or (None,) * 3
         mine = ex[0] == v
-        return {"id": did, "version": v, "owner_id": owner, "plan": json.loads(row[0]), "created_at": row[1],
+        plan = json.loads(row[0])
+        dc = con.execute("SELECT ship_date, arrival_date FROM date_changes WHERE id=? AND version=? "
+                         "ORDER BY rowid DESC LIMIT 1", (did, v)).fetchone()
+        if dc:  # a date changed after the export: the stored version stays as built, the latest date is laid over it
+            plan = dict(plan, date_built=plan.get("date_built", plan["date"]), date=dc[0], arrival_date=dc[1])
+        lim = con.execute("SELECT warehouse, wilds FROM plan_limits WHERE id=? AND version=? ORDER BY rowid DESC LIMIT 1",
+                          (did, v)).fetchone()
+        if lim:  # the pick of an exported plan was limited afterwards (to the wilds a warehouse accepts)
+            plan = dict(plan, allowed_wilds=json.loads(lim[1]), allowed_for=lim[0])
+        return {"id": did, "version": v, "owner_id": owner, "plan": plan, "created_at": row[1],
                 "latest_version": latest, "exported_version": ex[0], "export_url": ex[1] if mine else None,
                 "exported_at": ex[2] if mine else None}
 
@@ -116,6 +133,35 @@ class DraftStore:
                 raise DraftConflict("Черновик уже изменён; откройте последнюю версию")
             con.execute(_INS, (did, cur["version"] + 1, owner, body, _now()))
             return self._get(con, owner, did)
+
+    def change_date(self, owner, did, version, ship_date, arrival_date=None):
+        """Change the shipment date of an EXPORTED version (its rows already stand in the sheet, so a new version is not
+        possible). Appends to a history; get() shows the latest date. Idempotent for the same dates."""
+        owner = _owner(owner)
+        iso = [date.fromisoformat(x).isoformat() for x in (ship_date, arrival_date) if x is not None]
+        if len(iso) == 2 and iso[1] < iso[0]:
+            raise ValueError("arrival_date must not be before shipment_date")
+        with self._tx(True) as con:
+            d = self._get(con, owner, did, version)
+            if d["exported_version"] != d["version"]:
+                raise DraftConflict("Дату выгруженного плана можно менять только у выгруженной версии")
+            if (d["plan"]["date"], d["plan"].get("arrival_date")) != (ship_date, arrival_date):
+                con.execute("INSERT INTO date_changes VALUES (?,?,?,?,?)", (did, d["version"], ship_date, arrival_date, _now()))
+            return self._get(con, owner, did, version)
+
+    def set_limit(self, owner, did, version, warehouse, wilds):
+        """Limit what later updates of an EXPORTED version may add to the wilds a warehouse accepts. Append-only."""
+        owner = _owner(owner)
+        if not isinstance(warehouse, str) or not warehouse.strip() or not all(isinstance(w, str) for w in wilds):
+            raise ValueError("warehouse and wilds are required")
+        body = json.dumps(sorted(set(wilds)), ensure_ascii=False)
+        with self._tx(True) as con:
+            d = self._get(con, owner, did, version)
+            if d["exported_version"] != d["version"]:
+                raise DraftConflict("Ограничение подбора для выгруженного плана ставится только у выгруженной версии")
+            if (d["plan"].get("allowed_for"), json.dumps(d["plan"].get("allowed_wilds"), ensure_ascii=False)) != (warehouse, body):
+                con.execute("INSERT INTO plan_limits VALUES (?,?,?,?,?)", (did, d["version"], warehouse, body, _now()))
+            return self._get(con, owner, did, version)
 
     def get(self, owner, did, version=None):
         owner = _owner(owner)

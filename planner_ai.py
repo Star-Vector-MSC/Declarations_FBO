@@ -82,6 +82,21 @@ def find_codex():
     return None
 
 
+# The Codex CLI is a separate process that talks to an external service: it gets only what it needs to start and to
+# find its own ChatGPT login, never the bot's secrets (Telegram token, database and Google credentials, API keys).
+_ENV_ALLOWED = frozenset((
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "USERPROFILE", "HOME", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "TEMP", "TMP", "TMPDIR", "USERNAME",
+    "USER", "LOGNAME", "OS", "LANG", "CODEX_HOME", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "SSL_CERT_FILE",
+    "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"))
+_ENV_PREFIXES = ("LC_", "XDG_")
+
+
+def _child_env(environ=None):
+    return {k: v for k, v in (os.environ if environ is None else environ).items()
+            if k.upper() in _ENV_ALLOWED or k.upper().startswith(_ENV_PREFIXES)}
+
+
 def _failure(stderr):
     s = (stderr or "").casefold()
     if any(x in s for x in ("usage limit", "rate limit", "quota", "limit reached", "too many requests", "429")):
@@ -98,7 +113,7 @@ def run_codex(prompt, timeout=TIMEOUT, runner=subprocess.run, finder=find_codex)
     codex = finder()
     if not codex:
         raise AIUnavailable("Codex CLI не найден на компьютере бота; ИИ-разбор недоступен (платный API не используется).")
-    env = {k: v for k, v in os.environ.items() if k not in ("OPENAI_API_KEY", "CODEX_API_KEY")}
+    env = _child_env()
     try:  # only the ChatGPT subscription login is acceptable; a saved API-key login would be billed per token
         st = runner([*codex, "login", "status"], capture_output=True, text=True, encoding="utf-8", timeout=30, env=env)
     except subprocess.TimeoutExpired:
