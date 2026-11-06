@@ -158,10 +158,120 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(t[1][:3], ["ручная", "", "=1+1"])
         self.assertEqual([t[2][COL("Артикул")], t[3][COL("Артикул")]], ["A1", 12345])
         self.assertEqual(t[2][COL("Тип поставки")], "Монопаллета")
-        self.assertEqual(t[2][COL("Статус отгрузки")], "Одобрено")
+        self.assertEqual(t[2][COL("Статус отгрузки")], "Согласовать")
         self.assertEqual(t[2][COL("Сборка товара (Склад)")], t[2][COL("Дата отгрузки (склад)")] - 1)
         self.assertEqual(t[2][COL("К отгрузке")], 48)
         self.assertEqual(t[2][COL("Название предмета")], self.draft["plan"]["lines"][0]["product"])
+
+    def nowh(self):
+        d = copy.deepcopy(self.draft)
+        d["plan"]["warehouse"] = None
+        return d
+
+    def test_publish_without_warehouse_then_fill_only_that_cell(self):
+        d = self.nowh()
+        self.gw.publish(d)
+        t = self.s.tabs[ps.T_TARGET]
+        w = COL("Склад Wildberries")
+        self.assertEqual([t[2][w], t[3][w]], ["", ""])
+        self.assertEqual(self.gw.publish(d), self.gw.publish(d))  # idempotent
+        self.assertEqual(len(self.s.posts), 1)
+        before = copy.deepcopy(t)
+        url = self.gw.set_warehouse(d, "Коледино")
+        self.assertIn("gid=777", url)
+        self.assertEqual([t[2][w], t[3][w]], ["Коледино", "Коледино"])
+        after = copy.deepcopy(t)
+        for r in (2, 3):  # nothing else in the rows changed
+            before[r][w] = after[r][w]
+        self.assertEqual(before, after)
+        posts = len(self.s.posts)
+        self.gw.set_warehouse(d, "Коледино")  # repeat: nothing written
+        self.assertEqual(len(self.s.posts), posts)
+        with self.assertRaises(ps.PublishConflictError):  # another warehouse is already there
+            self.gw.set_warehouse(d, "Казань")
+
+    def test_set_warehouse_refuses_foreign_unknown_or_other_version(self):
+        d = self.nowh()
+        with self.assertRaises(ps.PlannerSheetsError):  # not written yet
+            self.gw.set_warehouse(d, "Коледино")
+        self.gw.publish(d)
+        with self.assertRaises(ps.SourceChangedError):
+            self.gw.set_warehouse(d, "Нет такого")
+        with self.assertRaises(ps.PublishConflictError):
+            self.gw.set_warehouse(dict(d, version=2), "Коледино")
+        self.assertEqual(len(self.s.posts), 1)
+
+    def test_set_date_moves_only_date_cells_and_is_idempotent(self):
+        d = self.draft
+        with self.assertRaises(ps.PlannerSheetsError):  # not written yet
+            self.gw.set_date(d, "2026-11-09")
+        self.gw.publish(d)
+        t = self.s.tabs[ps.T_TARGET]
+        sd, asm = COL("Дата отгрузки (склад)"), COL("Сборка товара (Склад)")
+        old = t[2][sd]
+        before = copy.deepcopy(t)
+        url = self.gw.set_date(d, "2026-11-09")
+        self.assertIn("gid=777", url)
+        self.assertEqual([t[2][sd], t[3][sd]], [old + 7] * 2)
+        self.assertEqual([t[2][asm], t[3][asm]], [old + 6] * 2)
+        after = copy.deepcopy(t)
+        for r in (2, 3):  # nothing else in the rows changed
+            for c in (sd, asm):
+                before[r][c] = after[r][c]
+        self.assertEqual(before, after)
+        posts = len(self.s.posts)
+        moved = json.loads(json.dumps(d))
+        moved["plan"]["date"] = "2026-11-09"  # what the store shows after the change
+        self.gw.set_date(moved, "2026-11-09")  # repeat: nothing written
+        self.gw.set_date(d, "2026-11-09")  # repeat from the old date after a lost bot-side save: nothing written
+        self.assertEqual(len(self.s.posts), posts)
+
+    def test_set_date_respects_hand_edits_and_arrival(self):
+        d = {"id": "abcdef012345", "version": 1, "plan": json.loads(json.dumps(
+            planner.build_plan(self.gw.snapshot(), {}, "2026-11-02", "Коледино", "2026-11-04")))}
+        self.gw.publish(d)
+        t = self.s.tabs[ps.T_TARGET]
+        sd, asm, arr = COL("Дата отгрузки (склад)"), COL("Сборка товара (Склад)"), COL("Плановая дата прибытия авто на вб")
+        t[2][asm] -= 1  # the warehouse moved assembly by hand
+        t[3][arr] += 1  # and the arrival of one row
+        keep = (t[2][asm], t[3][arr])
+        self.gw.set_date(d, "2026-11-09", "2026-11-11")
+        self.assertEqual((t[2][asm], t[3][arr]), keep)
+        self.assertEqual([t[2][arr], t[3][asm]], [t[2][sd] + 2, t[3][sd] - 1])
+        t[3][sd] += 5  # a hand-edited shipment date is never overwritten
+        with self.assertRaises(ps.PublishConflictError):
+            self.gw.set_date(dict(d, plan=dict(d["plan"], date="2026-11-09", arrival_date="2026-11-11")), "2026-11-12", "2026-11-14")
+
+    def test_set_date_refuses_other_version_and_bad_dates(self):
+        self.gw.publish(self.draft)
+        with self.assertRaises(ps.PublishConflictError):
+            self.gw.set_date(dict(self.draft, version=2), "2026-11-09")
+        with self.assertRaises(ps.PlannerSheetsError):
+            self.gw.set_date(self.draft, "2026-11-09", "2026-11-01")  # arrival before shipment
+        self.assertEqual(len(self.s.posts), 1)
+
+    def test_store_change_date_overlay_history_and_guards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = DraftStore(os.path.join(tmp, "d.sqlite3"))
+            d = st.create(7, self.draft["plan"])
+            with self.assertRaises(DraftConflict):  # not exported: a new version is the way
+                st.change_date(7, d["id"], 1, "2026-11-09")
+            st.mark_exported(7, d["id"], 1, "https://docs.google.com/x")
+            n = st.change_date(7, d["id"], 1, "2026-11-09")
+            self.assertEqual((n["plan"]["date"], n["plan"]["date_built"], n["version"]), ("2026-11-09", "2026-11-02", 1))
+            self.assertEqual(st.change_date(7, d["id"], 1, "2026-11-09")["plan"]["date"], "2026-11-09")  # idempotent
+            self.assertEqual(st.get(7, d["id"])["plan"]["lines"], d["plan"]["lines"])
+            st.change_date(7, d["id"], 1, "2026-11-12")
+            self.assertEqual(st.get(7, d["id"])["plan"]["date"], "2026-11-12")
+            self.assertEqual(st.get(7, d["id"])["plan"]["date_built"], "2026-11-02")
+            with closing(sqlite3.connect(st.db_path)) as con:
+                self.assertEqual(con.execute("SELECT COUNT(*) FROM date_changes").fetchone()[0], 2)
+                with self.assertRaises(sqlite3.DatabaseError):
+                    con.execute("UPDATE date_changes SET ship_date='2000-01-01'")
+            with self.assertRaises(DraftNotFound):  # another owner sees nothing
+                st.change_date(8, d["id"], 1, "2026-11-09")
+            with self.assertRaises(ValueError):
+                st.change_date(7, d["id"], 1, "2026-11-12", "2026-11-01")
 
     def test_lost_response_replay_after_source_moved(self):
         self.s.fail = True
@@ -439,11 +549,38 @@ class ReconcileTest(unittest.TestCase):
         r = self.gw.reconcile(self.draft, apply=True)
         t = self.s.tabs[ps.T_TARGET]
         self.assertEqual([self.art(1), self.art(2)], [12345, "A3"])  # kept row first, new one at the end
-        self.assertEqual(t[1][COL("Статус отгрузки")], "Одобрено")
+        self.assertEqual(t[1][COL("Статус отгрузки")], "Согласовать")
         self.assertEqual(t[1][list(ps.ORIGINAL + ps.META).index("ID плана")], self.draft["id"])
         self.assertFalse(any("deleteDimension" in x for p in self.s.posts for x in p["requests"]))  # row 2 anchors formulas
         self.assertIn(("A1", "Каб"), r["refused"])
         self.assertEqual(len([x for x in t[1:] if any(c not in ("", None) for c in x)]), 2)
+
+    def test_warehouse_chosen_in_the_sheet_survives_revising_every_row(self):
+        d = copy.deepcopy(self.draft)
+        d["plan"]["warehouse"] = None  # the plan was saved without a warehouse; set_warehouse filled the sheet cells
+        for i in (1, 2):
+            self.mark(i, "Пересмотреть")
+        r = self.gw.reconcile(d, apply=True)
+        self.assertEqual(r["kept"], 0)
+        self.assertTrue(r["added"])
+        t = self.s.tabs[ps.T_TARGET]
+        filled = [row[COL("Склад Wildberries")] for row in t[1:] if any(c not in ("", None) for c in row)]
+        self.assertEqual(filled, ["Коледино"] * len(r["added"]))
+
+    def test_different_warehouses_in_the_rows_stop_the_update_before_any_write(self):
+        for saved in (None, "Коледино"):  # a plan saved without a warehouse and one saved with it
+            d = copy.deepcopy(self.draft)
+            d["plan"]["warehouse"] = saved
+            t = self.s.tabs[ps.T_TARGET]
+            t[2][COL("Склад Wildberries")] = "Казань"  # the owner changed one row by hand
+            for i in (1, 2):
+                self.mark(i, "Пересмотреть")
+            before, posts = copy.deepcopy(t), len(self.s.posts)
+            for apply in (False, True):
+                with self.assertRaises(ps.PlannerSheetsError) as e:
+                    self.gw.reconcile(d, apply=apply)
+                self.assertIn("разные склады", str(e.exception))
+            self.assertEqual((t, len(self.s.posts)), (before, posts))  # the sheet is untouched
 
     def test_refused_goods_are_not_proposed_again(self):
         self.s.tabs[ps.T_TEST].append(["W3", "A3", "Каб", "Товар3", 1000, 5, 10, 10, 10, 10, 2, 2, 60])
@@ -458,6 +595,17 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual([ln["article"] for ln in self.gw.reconcile(self.draft)["added"]], ["A3"])
         r = self.gw.reconcile(self.draft, rules_fn=lambda snap: {**self.draft["plan"]["rules"], "excluded_wild": ["W3"]})
         self.assertEqual(r["added"], [])  # a wild excluded after the plan was made is not added back
+
+    def test_plan_limit_to_confirmed_wilds_decides_what_replaces_a_refused_row(self):
+        self.s.tabs[ps.T_TEST].append(["W3", "A3", "Каб", "Товар3", 1000, 5, 10, 10, 10, 10, 2, 2, 60])
+        self.s.tabs[ps.T_PACK].append(["W3", 1, 1, 10, 40])
+        self.mark(1, "Пересмотреть")
+        limited = json.loads(json.dumps(self.draft))
+        limited["plan"]["allowed_wilds"] = ["w2"]  # only W2 is accepted by the warehouse: neither W1 (revised) nor W3 may come in
+        r = self.gw.reconcile(limited)
+        self.assertEqual(([(a, c) for a, c, _ in r["removed"]], r["kept"], r["added"]), ([("A1", "Каб")], 1, []))
+        limited["plan"]["allowed_wilds"] = ["w2", "w3"]
+        self.assertEqual([ln["article"] for ln in self.gw.reconcile(limited)["added"]], ["A3"])
 
     def test_foreign_rows_and_bad_quantity_are_refused(self):
         self.s.tabs[ps.T_TARGET].append(["ручная"])
