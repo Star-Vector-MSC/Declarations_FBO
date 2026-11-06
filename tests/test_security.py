@@ -75,8 +75,8 @@ class RedactTests(unittest.TestCase):
 
     def test_secret_values_come_from_env_file_and_environment_by_name_only(self):
         with tempfile.TemporaryDirectory() as folder:
-            (Path(folder) / '.env').write_text('PGPASSWORD=hunter2hunter2\nTELEGRAM_BOT_TOKEN=tgtokentgtoken\n'
-                                               'TELEGRAM_ALLOWED_USER_ID=424242\nPLAIN=notsecretvalue\n', encoding='utf-8')
+            (Path(folder) / '.env').write_text(('PGPASSWORD=hunter2hunter2\nTELEGRAM_BOT_TOKEN=tgtokentgtoken\n'
+                                               'TELEGRAM_ALLOWED_USER_ID=424242\nPLAIN=notsecretvalue\n'), encoding='utf-8')
             with patch.object(fc, 'PROJECT', Path(folder)), patch.dict(os.environ, {'SOME_API_KEY': 'envkey-9999'}, clear=True):
                 found = fc.secret_values()
         for expected in ('hunter2hunter2', 'tgtokentgtoken', 'envkey-9999'):
@@ -104,17 +104,58 @@ class RedactTests(unittest.TestCase):
         try:
             raise ValueError('password=Sup3rSecret')
         except ValueError as exc:
-            with patch.object(fc, 'redact', side_effect=RuntimeError('boom')):
+            with patch.object(fc, 'secret_values', return_value=[]), \
+                    patch.object(fc, 'redact', side_effect=RuntimeError('boom')):
                 text = fc.safe_traceback(exc)
         self.assertNotIn('Sup3rSecret', text)
         self.assertIn('ValueError', text)
+
+    def test_unreadable_env_file_falls_back_to_stack_without_messages(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / '.env').write_text('DB_PASSWORD=x7Q\n', encoding='utf-8')
+            try:
+                raise RuntimeError('authentication failed for x7Q')
+            except RuntimeError as exc:
+                with patch.object(fc, 'PROJECT', Path(folder)), patch.dict(os.environ, {}, clear=True), \
+                        patch.object(fc, 'dotenv_values', side_effect=PermissionError('denied')):
+                    text = fc.safe_traceback(exc)
+        self.assertNotIn('x7Q', text)
+        self.assertNotIn('authentication failed', text)
+        self.assertIn('RuntimeError', text)
+
+    def test_missing_env_file_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(fc, 'PROJECT', Path(folder)), patch.dict(os.environ, {'DB_PASSWORD': 'x7Q'}, clear=True):
+                self.assertEqual(fc.secret_values(), ['x7Q'])
+
+    def test_short_credentials_are_hidden_but_short_host_settings_are_not_guessed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / '.env').write_text('PASSWORD=x7Q\nPGPORT=5432\nDATABASE_URL=pg\n', encoding='utf-8')
+            with patch.object(fc, 'PROJECT', Path(folder)), patch.dict(os.environ, {}, clear=True):
+                found = fc.secret_values()
+                try:
+                    raise RuntimeError('authentication failed for x7Q on port 5432')
+                except RuntimeError as exc:
+                    text = fc.safe_traceback(exc)
+        self.assertIn('x7Q', found)
+        self.assertNotIn('5432', found)
+        self.assertNotIn('x7Q', text)
+
+    def test_bare_key_and_quoted_values_with_spaces_are_hidden_whole(self):
+        for text in ('request failed: key=synthetic-123', 'secret_key=synthetic-123', 'cfg {"api_key": "synthetic-123"}',
+                     "password='synthetic secret value'", 'password="synthetic secret value"'):
+            out = fc.redact(text)
+            for leaked in ('synthetic-123', 'synthetic', 'secret value'):
+                self.assertNotIn(leaked, out, text)
+            self.assertIn(fc.HIDDEN, out)
 
     def test_refresh_error_log_never_contains_the_secret(self):
         with tempfile.TemporaryDirectory() as folder:
             store = FakeStore(Path(folder) / 'cache.sqlite3')
             service = fc.CacheService(store)
             error = OSError('could not connect: postgresql://reader:Sup3rSecret@db/wb')
-            with patch.object(service, 'refresh_sync', side_effect=error):
+            with patch.object(service, 'refresh_sync', side_effect=error), \
+                    patch.object(fc, 'secret_values', return_value=['Sup3rSecret']):
                 with self.assertRaises(RuntimeError) as raised:
                     asyncio.run(service.refresh())
             log = (Path(folder) / 'refresh_error.log').read_text(encoding='utf-8')

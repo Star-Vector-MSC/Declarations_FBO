@@ -40,24 +40,27 @@ SECRET_PATTERNS = [
     (re.compile(r'(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]+'), 'Bearer ' + HIDDEN),
     (re.compile(r'(?<!\d)\d{6,}:[A-Za-z0-9_-]{30,}'), HIDDEN),
     (re.compile(r'\bAIza[0-9A-Za-z_-]{20,}'), HIDDEN),
-    (re.compile(r'''(?i)((?:password|passwd|pwd|token|api[_-]?key|secret|access[_-]?token|client[_-]?secret)'''
-                r'''["']?\s*[=:]\s*["']?)[^\s&"',;)]+'''), r'\1' + HIDDEN),
-    (re.compile(r'''(?i)([?&](?:key|token|access_token|api_key)=)[^\s&"']+'''), r'\1' + HIDDEN),
+    # name=value / "name": "value" for any parameter whose name contains password, passwd, pwd, token, secret or key;
+    # a quoted value is hidden whole, spaces included.
+    (re.compile(r'''(?i)((?:password|passwd|pwd|token|secret|key)["']?\s*[=:]\s*)'''
+                r'''(?:"[^"]*"|'[^']*'|[^\s&"',;)]+)'''), r'\1' + HIDDEN),
 ]
 
 
 def secret_values():
-    """Secret values from the process environment and the project .env (the values themselves are never logged)."""
+    """Secret values from the process environment and the project .env (the values themselves are never logged).
+    A .env that exists but cannot be read raises: safe_traceback then logs class names and frames only."""
     pairs = list(os.environ.items())
-    try:
-        pairs += [(k, v) for k, v in dotenv_values(PROJECT / '.env', interpolate=False).items() if v]
-    except Exception:
-        pass
+    env_file = PROJECT / '.env'
+    if env_file.exists():
+        pairs += [(k, v) for k, v in dotenv_values(env_file, interpolate=False).items() if v]
     found = set()
     for name, value in pairs:
+        value = (value or '').strip()
         if not value or not SECRET_NAMES.search(name):
             continue
-        if len(value) >= (4 if SECRET_WORDS.search(name) else 6):
+        # Credentials are hidden whatever their length; host/user-type PG* settings only when long enough to be unambiguous.
+        if len(value) >= (1 if SECRET_WORDS.search(name) or re.search('DATABASE_URL|DSN', name, re.I) else 6):
             found.update((value, quote(value, safe='')))
     return sorted(found, key=len, reverse=True)
 
