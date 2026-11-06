@@ -48,7 +48,8 @@ class FakeSheets:
         self.date_calls = getattr(self, "date_calls", []) + [(draft["id"], draft["version"], ship_date, arrival_date)]
         return "https://docs.google.com/spreadsheets/d/x/edit#gid=1&range=A3"
 
-    def reconcile(self, draft, rejected_before=(), apply=False, rules_fn=None):
+    def reconcile(self, draft, rejected_before=(), apply=False, rules_fn=None, drop_wilds=()):
+        self.drop_seen = getattr(self, "drop_seen", []) + [(tuple(drop_wilds), apply, draft["plan"].get("allowed_wilds"))]
         if rules_fn:
             self.rules_seen = rules_fn(self.snapshot())  # the controller builds it from the plan + memory
         self.reconciled = getattr(self, "reconciled", []) + [(draft["id"], tuple(rejected_before), apply)]
@@ -212,7 +213,7 @@ class DateChangeTests(UiBase):
         m = await self.ask(d0, "01.12.2030")
         self.assertEqual(getattr(self.sheets, "date_calls", []), [])  # nothing is written before the confirmation
         self.assertEqual(self.ctl.store.get(OWNER, d0["id"])["plan"]["date"], d0["plan"]["date"])
-        self.assertIn("Количества и прогнозы не пересчитываются", said(m))
+        self.assertIn("Количества не пересчитываются", said(m))
         c, _ = cb(buttons(m)["Подтвердить"], m)
         await self.ctl.handle_callback(c)
         self.assertEqual(self.sheets.date_calls, [(d0["id"], 1, "2030-12-01", None)])

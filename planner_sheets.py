@@ -413,7 +413,7 @@ class PlannerSheets:
     def _link(self, tid, row):
         return f"https://docs.google.com/spreadsheets/d/{self._config()[0]}/edit#gid={tid}&range=A{row}"
 
-    def reconcile(self, draft, rejected_before=(), apply=False, rules_fn=None):
+    def reconcile(self, draft, rejected_before=(), apply=False, rules_fn=None, drop_wilds=()):
         """After the owner marked rows «Не согласовано» in the test sheet: drop those rows, keep the rest and append new
         lines to fill the machine. apply=False only computes the summary. Rows are compacted by copying cells upwards
         and clearing the tail: a row is never deleted, because deleting row 2 breaks the header formulas ($K$2 -> #REF!)."""
@@ -444,7 +444,9 @@ class PlannerSheets:
         refused = [i for i in mine if _s(g(i, "Статус отгрузки")) == "Не согласовано"]
         # «Пересмотреть»: the line leaves the plan, but the pair is NOT blacklisted: the bot may propose it again
         # under the current rules (e.g. it was refused only for its quantity).
-        redo = [i for i in mine if _s(g(i, "Статус отгрузки")) == "Пересмотреть"]
+        dropw = {planner._norm(w) for w in drop_wilds}  # rows the bot is asked to replace (e.g. a warehouse does not take the wild)
+        redo = [i for i in mine if i not in set(refused)
+                and (_s(g(i, "Статус отгрузки")) == "Пересмотреть" or planner._norm(g(i, "wild")) in dropw)]
         dropped = refused + redo
         kept = [i for i in mine if i not in set(dropped)]
 

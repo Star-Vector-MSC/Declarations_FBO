@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import planner as P
 import planner_sc as sc
 import test_planner as tp
-from test_planner_integration import OWNER, SNAP, UiBase, buttons, cb, said
+from test_planner_integration import OWNER, SNAP, UiBase, buttons, cb, msg, said
 
 T0 = datetime(2026, 11, 6, 9, 0, tzinfo=timezone.utc)
 HIST = [("wild1", "Коледино", "2026-10-20", 3), ("wild1", "Казань", "2026-10-05", 1), ("wild2", "коледино ", "2026-10-25", 2)]
@@ -115,8 +115,7 @@ class ScUiTest(UiBase):
     async def test_whole_pool_warehouse_from_history(self):
         m = await self.open_check()
         t = said(m)
-        self.assertIn("Весь пул можно отправить на: Коледино.", t)
-        self.assertIn("не гарантия", t)
+        self.assertIn("Весь пул принимают: Коледино.", t)
         self.assertEqual(len(self.fetches), 1)
         c, m2 = cb(buttons(m)["Обновить историю"])
         await self.ctl.handle_callback(c)
@@ -128,7 +127,7 @@ class ScUiTest(UiBase):
     async def test_wilds_without_data_are_listed_and_owner_answer_closes_the_gap(self):
         self.hist = [r for r in HIST if r[0] == "wild1"]
         m = await self.open_check()
-        self.assertIn("данных нет: wild2", said(m))
+        self.assertIn("Не подтверждены: wild2", said(m))
         self.assertNotIn("Весь пул можно", said(m))
         c, m2 = cb(buttons(m)["Ввести данные из кабинета"])
         await self.ctl.handle_callback(c)
@@ -143,7 +142,7 @@ class ScUiTest(UiBase):
         m3.text = "wild2d2: коледино"
         self.assertTrue(await self.ctl.handle_message(m3))
         self.assertIn("Сохранил:\nwild2: Коледино", said(m3))
-        self.assertIn("Весь пул можно отправить на: Коледино.", said(m3))
+        self.assertIn("Весь пул принимают: Коледино.", said(m3))
         self.assertIsNone(self.ctl._st.get(OWNER))
 
     async def test_database_down_uses_old_snapshot_or_says_so(self):
@@ -157,7 +156,7 @@ class ScUiTest(UiBase):
         c, m2 = cb(buttons(m)["Обновить историю"])
         await self.ctl.handle_callback(c)
         self.assertIn("Использую прежний снимок", said(m2))
-        self.assertIn("Весь пул можно отправить на: Коледино.", said(m2))
+        self.assertIn("Весь пул принимают: Коледино.", said(m2))
 
     async def partial(self):
         self.hist = [("wild1", "Коледино", "2026-10-20", 3)]  # wild2 was never shipped anywhere
@@ -170,10 +169,9 @@ class ScUiTest(UiBase):
     async def test_partial_warehouse_offers_replacement_dates_and_data_request(self):
         d0, m1 = await self.partial()
         t, b = said(m1), buttons(m1)
-        self.assertIn("Если заменить под «Коледино»: строк 2 → 1", t)
-        self.assertIn("Срочные wild без подтверждения", t)
-        self.assertIn("wild2", t.split("Срочные wild без подтверждения")[1])
-        for name in ("Заменить под Коледино", "Раньше, 20 паллет", "Позже, добить машину", "Ввести данные из кабинета"):
+        self.assertIn("Лучший: Коледино — 1 из 2. Не подтверждены: wild2.", t)
+        self.assertIn("Замена: строк 2 → 1", t)
+        for name in ("Заменить под Коледино", "Раньше, 20 паллет", "Добить машину позже", "Ввести данные из кабинета"):
             self.assertIn(name, b)
         self.assertTrue(all(len(v.encode()) <= 64 for v in b.values()))
         self.assertEqual(self.ctl.store.get(OWNER, d0["id"])["version"], 1)  # looking stores nothing
@@ -196,6 +194,22 @@ class ScUiTest(UiBase):
         self.assertIn("устарела", said(m4))
         self.assertEqual(self.ctl.store.get(OWNER, d0["id"])["version"], 3)
 
+    async def test_data_entry_and_cancel_do_not_kill_the_check_buttons(self):
+        d0, m1 = await self.partial()
+        b = buttons(m1)
+        c, m2 = cb(b["Ввести данные из кабинета"])
+        await self.ctl.handle_callback(c)
+        c, m3 = cb("pl:cn")
+        await self.ctl.handle_callback(c)
+        self.assertIn("Проверить склады", buttons(m3))  # cancelling the entry leads back to the check
+        c, m4 = cb(b["Раньше, 20 паллет"])
+        await self.ctl.handle_callback(c)
+        self.assertNotIn("устарела", said(m4))
+        self.assertIn("машина 20 паллет", said(m4))
+        c, m5 = cb(b["Заменить под Коледино"])
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.store.get(OWNER, d0["id"])["version"], 2)
+
     async def test_earlier_dates_with_20_pallets(self):
         d0, m1 = await self.partial()
         c, m2 = cb(buttons(m1)["Раньше, 20 паллет"])
@@ -215,7 +229,7 @@ class ScUiTest(UiBase):
 
     async def test_later_dates_keep_current_lines(self):
         d0, m1 = await self.partial()
-        c, m2 = cb(buttons(m1)["Позже, добить машину"])
+        c, m2 = cb(buttons(m1)["Добить машину позже"])
         await self.ctl.handle_callback(c)
         t, b = said(m2), buttons(m2)
         self.assertIn("текущие строки остаются", t)
@@ -232,9 +246,20 @@ class ScUiTest(UiBase):
                             for k in kept))
         self.assertEqual({ln["wild"] for ln in d1["plan"]["lines"]}, {"wild1"})
 
-    async def exported_check(self):
+    async def plan_without_warehouse(self):
+        m = msg("Новый план")
+        await self.ctl.handle_message(m)
+        m.text = "Завтра"
+        await self.ctl.handle_message(m)
+        c, _ = cb(buttons(m)["Пока без склада"], m)
+        await self.ctl.handle_callback(c)
+        c, _ = cb(buttons(m)["33 паллет"], m)
+        await self.ctl.handle_callback(c)
+        return m, buttons(m)
+
+    async def exported_check(self, nowh=False):
         self.hist = [("wild1", "Коледино", "2026-10-20", 3)]
-        m, b = await self.plan()
+        m, b = await (self.plan_without_warehouse() if nowh else self.plan())
         d0 = self.ctl.store.list(OWNER, 1)[0]
         c, m1 = cb(b["Записать в тестовый лист"])
         await self.ctl.handle_callback(c)
@@ -244,41 +269,51 @@ class ScUiTest(UiBase):
         await self.ctl.handle_callback(c)
         return d0, m3
 
-    async def test_exported_plan_limit_then_rows_to_review(self):
-        d0, m3 = await self.exported_check()
+    async def test_exported_plan_replaces_rows_in_one_flow(self):
+        self.sheets.warehouse_calls = []
+        d0, m3 = await self.exported_check(nowh=True)
         t, b = said(m3), buttons(m3)
-        self.assertIn("План уже в листе", t)
+        self.assertIn("Строки к замене:", t)
         self.assertNotIn("Раньше, 20 паллет", b)  # rows already in the sheet cannot be shrunk to a smaller machine
         self.assertNotIn("Заменить под Коледино", b)
-        c, m4 = cb(b["Ограничить подбор: Коледино"])
+        c, m4 = cb(b["Заменить 1 стр. под Коледино"])
         await self.ctl.handle_callback(c)
+        self.assertEqual(self.sheets.drop_seen, [(("wild2",), False, ["wild1"])])  # preview: the unconfirmed wild is dropped
+        self.assertEqual(self.ctl.store.get(OWNER, d0["id"])["plan"].get("allowed_wilds"), None)  # nothing saved by a preview
+        self.assertIn("Подтвердить замену", buttons(m4))
+        c, m5 = cb(buttons(m4)["Подтвердить замену"])
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.sheets.drop_seen[-1], (("wild2",), True, ["wild1"]))
+        self.assertEqual(self.sheets.warehouse_calls, [(d0["id"], 1, "Коледино")])  # the warehouse lands in every row
+        self.assertIn("Склад «Коледино» проставлен", said(m5))
         d1 = self.ctl.store.get(OWNER, d0["id"])
         self.assertEqual((d1["version"], d1["plan"]["allowed_wilds"], d1["plan"]["allowed_for"]), (1, ["wild1"], "Коледино"))
         self.assertEqual(d1["exported_version"], 1)
-        self.assertIn("Пересмотреть", said(m4))
-        self.assertIn("wild2", said(m4))  # the row without confirmation is named
-        self.assertEqual(self.ctl.store.get(OWNER, d0["id"], 1)["plan"]["lines"], d0["plan"]["lines"])
-        c, m5 = cb(b["Ограничить подбор: Коледино"])  # a second press of the same button: session is gone
+        self.assertIn("Проверить склады", buttons(m5))
+        c, m6 = cb(buttons(m4)["Подтвердить замену"])  # the same confirmation again: the session is spent
         await self.ctl.handle_callback(c)
-        self.assertIn("устарела", said(m5))
+        self.assertIn("устарела", said(m6))
 
     async def test_exported_plan_later_date_goes_through_the_sheet_confirmation(self):
         self.sheets.date_calls = []
         d0, m3 = await self.exported_check()
-        c, m4 = cb(buttons(m3)["Позже, добить машину"])
+        c, m4 = cb(buttons(m3)["Добить машину позже"])
         await self.ctl.handle_callback(c)
         picks = [v for k, v in buttons(m4).items() if "/33" in k]
         self.assertEqual(len(picks), 7)
         c, m5 = cb(picks[0])
         await self.ctl.handle_callback(c)
-        self.assertIn("Сменить дату отгрузки плана", said(m5))
+        self.assertIn("Дата отгрузки", said(m5))
+        self.assertIn("→", said(m5))
         self.assertEqual(self.sheets.date_calls, [])  # nothing is written before the confirmation
         c, m6 = cb(buttons(m5)["Подтвердить"])
         await self.ctl.handle_callback(c)
         self.assertEqual(len(self.sheets.date_calls), 1)
         d1 = self.ctl.store.get(OWNER, d0["id"])
         self.assertGreater(d1["plan"]["date"], d0["plan"]["date"])
-        self.assertIn("Обновить по листу", said(m6))
+        d2 = self.ctl.store.get(OWNER, d0["id"])
+        self.assertEqual((d2["plan"]["allowed_wilds"], d2["plan"]["allowed_for"]), (["wild1"], "Коледино"))  # later additions limited
+        self.assertIn("Обновить по листу", buttons(m6))
 
     async def test_store_limit_overlay_is_append_only_and_exported_only(self):
         d0, m3 = await self.exported_check()
