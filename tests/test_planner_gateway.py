@@ -582,6 +582,18 @@ class ReconcileTest(unittest.TestCase):
                 self.assertIn("разные склады", str(e.exception))
             self.assertEqual((t, len(self.s.posts)), (before, posts))  # the sheet is untouched
 
+    def test_warehouse_typed_into_all_rows_differs_from_the_saved_one_stops_the_update(self):
+        t = self.s.tabs[ps.T_TARGET]
+        for i in (1, 2):
+            t[i][COL("Склад Wildberries")] = "Казань"  # the plan was saved with «Коледино»
+            self.mark(i, "Пересмотреть")
+        before, posts = copy.deepcopy(t), len(self.s.posts)
+        for apply in (False, True):
+            with self.assertRaises(ps.PlannerSheetsError) as e:
+                self.gw.reconcile(self.draft, apply=apply)
+            self.assertIn("склад", str(e.exception))
+        self.assertEqual((t, len(self.s.posts)), (before, posts))
+
     def test_refused_goods_are_not_proposed_again(self):
         self.s.tabs[ps.T_TEST].append(["W3", "A3", "Каб", "Товар3", 1000, 5, 10, 10, 10, 10, 2, 2, 60])
         self.s.tabs[ps.T_PACK].append(["W3", 1, 1, 10, 40])

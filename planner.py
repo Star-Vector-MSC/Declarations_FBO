@@ -407,6 +407,8 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
             else:
                 shares = set()
             # a pallet share in whole boxes: the box multiples next to share*pallet (half of 600 with box 40 -> 280/320)
+            # Intended: a pallet that is not a whole number of boxes cannot be shipped exactly, so the nearest box multiples are
+            # the result (pallet 1000 / box 60 -> 960 or 1020); dropping the line instead would lose the goods.
             cuts = {Fraction(box * f(sh * pal / box)) for sh in shares for f in (math.floor, math.ceil)}
             rounded = [int(c) for c in cuts if c.denominator == 1 and 0 < c <= lim and c % box == 0]
             if rounded:

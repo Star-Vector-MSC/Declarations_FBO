@@ -122,6 +122,14 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual((ln["quantity"], ln["pallets"]), (1000, 1.0))
         self.assertIn("whole pallets", ln["reason"])
 
+    def test_pallet_not_made_of_whole_boxes_rounds_to_the_nearest_box_multiple(self):
+        # pallet 1000 / box 60: exactly 1 pallet cannot be shipped; the owner rule is "next to the share, in whole boxes"
+        res = self.plan([T("W1", "A", fc=0, s=(167,) * 4)], [PK("W1", 60, 1000)], target_days=10, max_days=11)
+        (ln,) = res["lines"]
+        self.assertEqual(ln["quantity"] % 60, 0)
+        self.assertIn(ln["quantity"], (960, 1020))  # the box multiples next to 1 pallet, never a partial box
+        self.assertIn("whole pallets (rounded)", ln["reason"])
+
     def test_shared_stock_and_conflicting_budgets(self):
         rows = [T("W1", "A", "C1", 100, s=(8,) * 4, fc=0), T("W1", "A", "C2", 100, s=(8,) * 4, fc=0),
                 T("W2", "B", "C1", 100), T("W2", "B", "C2", 90)]

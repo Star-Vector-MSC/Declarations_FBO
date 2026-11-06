@@ -616,6 +616,8 @@ class PlannerController:
                 st.pop(k, None)
             if st["step"] in ("settings", "pickwh", "newdate", "scdata"):
                 self._st.pop(uid)
+        for sess in self._scs.get(uid, {}).values():  # Cancel withdraws every shown replacement confirmation
+            sess.pop("armed", None)
         back = [[_btn("Проверить склады", "sc", st["id"], st["ver"])]] if st and st.get("step") == "scdata" else None
         await msg.answer("Отменено, ничего не изменено.", reply_markup=_kb(back) if back else None)
 
@@ -1069,6 +1071,9 @@ class PlannerController:
 
     def _sc_reconcile(self, uid, d, wh, apply):  # worker thread
         self._mem_ok()
+        if d["plan"]["warehouse"] not in (None, wh):  # the rows would keep the old warehouse while the owner confirmed another
+            raise _Blocked(f"План записан на склад «{d['plan']['warehouse']}»: замену под другой склад («{wh}») не делаю, "
+                           "чтобы не отправить новый состав не на тот склад. Постройте новый план под этот склад.")
         dl, allowed, drop = self._sc_swap(uid, d, wh)
         if apply:
             self.store.set_limit(uid, d["id"], d["version"], wh, allowed)  # later updates keep the limit
@@ -1091,6 +1096,7 @@ class PlannerController:
         await msg.answer("Считаю замену…")
         ok, s = await self._guarded(uid, ct, msg, self._sc_reconcile, uid, d, st["wh"], False)
         if ok:
+            st["armed"] = True  # the confirm button works only after this preview and only until Cancel
             await msg.answer(self._update_text(s) + f"\n\nСклад «{st['wh']}» проставлю во всех строках. В лист пишу только после "
                              "подтверждения.", reply_markup=_kb(
                 [[_btn("Подтвердить замену", "rk", did, ver, nonce), _btn("Отмена", "cn")]]))
@@ -1100,6 +1106,10 @@ class PlannerController:
         if not st:
             await msg.answer("Кнопка устарела. Нажмите «Проверить склады» ещё раз.")
             return
+        if not st.get("armed"):
+            await msg.answer("Подтверждение устарело или отменено. Посмотрите замену ещё раз и подтвердите.")
+            return
+        st["armed"] = False  # one use: a retry needs a new preview
         d = await self._sc_plan(uid, did, ver, "x")
         await msg.answer("Обновляю лист…")
         ok, s = await self._guarded(uid, ct, msg, self._sc_reconcile, uid, d, st["wh"], True)
@@ -1369,7 +1379,7 @@ class PlannerController:
                              f"{s['capacity']} паллет. Можно добить до другой машины.",
                              reply_markup=_kb([[_btn(f"Добить до машины {other} паллет", "up", did, ver, other)]]))
             return
-        self._st[uid] = {"step": "confirm", "confirm_up": (did, ver)}
+        self._st[uid] = {"step": "confirm", "confirm_up": (did, ver, int(s["capacity"]))}
         await msg.answer(self._update_text(s) + "\n\nПеред записью источники будут перепроверены; пишу только в "
                          "«Планирование FBO — ТЕСТ».",
                          reply_markup=_kb([[_btn("Подтвердить обновление", "uk", did, ver, s["capacity"]), _btn("Отмена", "cn")],
@@ -1379,7 +1389,7 @@ class PlannerController:
         cap = self._cap_arg(cap)
         g = self._gen.get(uid, 0)
         d = await asyncio.to_thread(self.store.get, uid, did, ver)
-        if (self._st.get(uid) or {}).get("confirm_up") != (did, ver) or d.get("exported_version") != ver:
+        if (self._st.get(uid) or {}).get("confirm_up") != (did, ver, cap) or d.get("exported_version") != ver:
             await msg.answer("Сначала нажмите «Обновить по листу» у этого плана.")
             return
         self._st.pop(uid, None)

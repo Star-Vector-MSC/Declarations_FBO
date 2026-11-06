@@ -442,7 +442,9 @@ class PlannerSheets:
             raise PlannerSheetsError("В тестовом листе есть строки не этого плана. Обновление по листу работает, когда "
                                      "в листе один план: уберите лишние строки.")
         sheet_wh = {_s(g(i, "Склад Wildberries")) for i in mine} - {None, ""}  # every row of the plan, not only the kept ones
-        if len(sheet_wh) > 1:  # also with a saved warehouse: a hand-edited row must not be silently overwritten
+        saved_wh = _s(plan["warehouse"]) if plan["warehouse"] is not None else None
+        # a warehouse the owner typed into the rows (one row or all of them) must never be silently overwritten
+        if len(sheet_wh) > 1 or (saved_wh and sheet_wh and sheet_wh != {saved_wh}):
             raise PlannerSheetsError("В строках плана разные склады (" + ", ".join(sorted(sheet_wh))[:150] + "): обновление "
                                      "остановлено, чтобы не стереть склад. Приведите склад в строках к одному и повторите.")
         refused = [i for i in mine if _s(g(i, "Статус отгрузки")) == "Не согласовано"]

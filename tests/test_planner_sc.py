@@ -294,6 +294,36 @@ class ScUiTest(UiBase):
         await self.ctl.handle_callback(c)
         self.assertIn("устарела", said(m6))
 
+    async def test_cancel_withdraws_the_shown_replacement_confirmation(self):
+        d0, m3 = await self.exported_check(nowh=True)
+        c, m4 = cb(buttons(m3)["Заменить 1 стр. под Коледино"])
+        await self.ctl.handle_callback(c)
+        confirm = buttons(m4)["Подтвердить замену"]
+        c, m5 = cb("pl:cn")
+        await self.ctl.handle_callback(c)
+        writes = len([x for x in self.sheets.drop_seen if x[1]])
+        c, m6 = cb(confirm)  # the old confirmation after Cancel
+        await self.ctl.handle_callback(c)
+        self.assertIn("устарело или отменено", said(m6))
+        self.assertEqual(len([x for x in self.sheets.drop_seen if x[1]]), writes)
+        self.assertIsNone(self.ctl.store.get(OWNER, d0["id"])["plan"].get("allowed_wilds"))
+        c, m7 = cb(buttons(m3)["Заменить 1 стр. под Коледино"])  # a new preview arms it again
+        await self.ctl.handle_callback(c)
+        c, m8 = cb(buttons(m7)["Подтвердить замену"])
+        await self.ctl.handle_callback(c)
+        self.assertTrue(self.sheets.drop_seen[-1][1])
+
+    async def test_replacement_under_another_warehouse_than_the_exported_plans_is_refused(self):
+        import planner_ui as ui
+        d0, _ = await self.exported_check()  # this plan is saved with its own warehouse
+        d = self.ctl.store.get(OWNER, d0["id"])
+        own = d["plan"]["warehouse"]
+        self.assertTrue(own)
+        for apply in (False, True):
+            with self.assertRaises(ui._Blocked):
+                self.ctl._sc_reconcile(OWNER, d, "Другой склад", apply)
+        self.assertIsNone(self.ctl.store.get(OWNER, d0["id"])["plan"].get("allowed_for"))  # nothing was saved
+
     async def test_exported_plan_later_date_goes_through_the_sheet_confirmation(self):
         self.sheets.date_calls = []
         d0, m3 = await self.exported_check()

@@ -53,7 +53,8 @@ class FakeSheets:
         if rules_fn:
             self.rules_seen = rules_fn(self.snapshot())  # the controller builds it from the plan + memory
         self.reconciled = getattr(self, "reconciled", []) + [(draft["id"], tuple(rejected_before), apply)]
-        s = {"removed": [("A1", "Каб", 48)], "kept": 1, "total_pallets": 1.5, "capacity": 33, "warnings": [],
+        cap = self.rules_seen["capacity"] if rules_fn else 33  # like the real gateway: the machine of the rules
+        s = {"removed": [("A1", "Каб", 48)], "kept": 1, "total_pallets": 1.5, "capacity": cap, "warnings": [],
              "added": [{"article": "A3", "cabinet": "Каб", "quantity": 40, "pallets": 1}],
              "refused": sorted({("A1", "Каб")} | set(rejected_before))}
         if apply:
@@ -749,6 +750,27 @@ class UpdateFromSheetTests(UiBase):
         c, m6 = cb(f"pl:up:{did}:{ver}:99", m5)  # only 20 / 33 are accepted
         await self.ctl.handle_callback(c)
         self.assertIn("устарела", said(m6))
+
+    async def test_update_confirmation_is_bound_to_the_machine_that_was_shown(self):
+        did, ver, m2 = await self.exported()
+        c, m3 = cb(buttons(m2)["Обновить по листу"])  # preview for 33 pallets
+        await self.ctl.handle_callback(c)
+        confirm33 = buttons(m3)["Подтвердить обновление"]
+        c, _ = cb("pl:cn")
+        await self.ctl.handle_callback(c)
+        c, m5 = cb(f"pl:up:{did}:{ver}:20")  # a new preview for 20 pallets
+        await self.ctl.handle_callback(c)
+        confirm20 = buttons(m5)["Подтвердить обновление"]
+        self.assertNotEqual(confirm33, confirm20)
+        self.assertFalse(any(x[2] for x in self.sheets.reconciled))
+        c, m6 = cb(confirm33)  # the cancelled 33-pallet confirmation must not work now
+        await self.ctl.handle_callback(c)
+        self.assertIn("Сначала нажмите", said(m6))
+        self.assertFalse(any(x[2] for x in self.sheets.reconciled))
+        c, m7 = cb(confirm20)
+        await self.ctl.handle_callback(c)
+        self.assertTrue(self.sheets.reconciled[-1][2])
+        self.assertEqual(self.sheets.rules_seen["capacity"], 20)
 
     async def test_up_before_export_is_refused(self):
         m, b = await self.plan()
