@@ -152,7 +152,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_success_uses_subscription_cli_read_only_without_api_keys(self):
         rec = {}
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "secret", "CODEX_API_KEY": "secret2", "KEEP": "1"}):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "secret", "CODEX_API_KEY": "secret2", "CODEX_HOME": "1"}):
             res = ai.run_codex("hi", runner=self.fake(answer=json.dumps(raw()), record=rec), finder=lambda: ["codex"])
         self.assertEqual(res["scope"], "this_plan")
         cmd, env = rec["cmd"], rec["kw"]["env"]
@@ -165,7 +165,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(cmd[cmd.index(f) - 1], "--disable")
         self.assertNotIn("OPENAI_API_KEY", env)
         self.assertNotIn("CODEX_API_KEY", env)
-        self.assertEqual(env["KEEP"], "1")
+        self.assertEqual(env["CODEX_HOME"], "1")  # the allowlist keeps what the CLI needs to find its login
 
     def test_exact_unavailable_reasons(self):
         cases = [(dict(rc=1, stderr="You've hit your usage limit"), "лимит подписки"),

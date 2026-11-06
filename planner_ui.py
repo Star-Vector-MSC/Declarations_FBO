@@ -350,7 +350,8 @@ class PlannerController:
             return False
         uid, ct = user.id, message.chat.type
         if text in LEAVE or text in OLD_BUTTONS:
-            self.reset(uid)
+            if self._owner(uid, ct):  # a stranger or a group message must not touch any planner state
+                self.reset(uid)
             return False
         if text in ENTRY:
             if not self._owner(uid, ct):

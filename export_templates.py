@@ -178,6 +178,8 @@ def make_workbook(base, records, path):
                       record['country']]
             for header, value in zip(HEADERS, values):
                 cell = sheet.cell(n, cols[header], value)
+                if isinstance(value, str):
+                    cell.data_type = 's'  # source text starting with '=' must stay text, never become a formula
                 cell._style = copy(styles[cols[header]])
                 if header in ('Баркод товара', 'Номер ДТ', 'Артикул продавца', 'Код страны происхождения'):
                     cell.number_format = '@'
