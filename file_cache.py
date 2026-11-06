@@ -13,7 +13,7 @@ from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from wb_declarations import (PROJECT, KEY, SHIPMENTS, RECEIPTS, BASE_TEMPLATE, Sheets, parse_date,
+from wb_declarations import (is_blank_placeholder, PROJECT, KEY, SHIPMENTS, RECEIPTS, BASE_TEMPLATE, Sheets, parse_date,
     normalize, integer, index, value_at, shipment_queue, load_receipts, prepare, write_plan)
 
 REPORT = 'СПИСОК_ФАЙЛОВ.csv'
@@ -38,8 +38,10 @@ def all_records(rows):
     col = index(rows[0], 'Дата отгрузки (склад)')
     dates = set()
     status = index(rows[0], 'Статус отгрузки')
+    supply = index(rows[0], 'Номер поставки')
     for row in rows[1:]:
-        if normalize(value_at(row, status)) == 'одобрено':
+        if (normalize(value_at(row, status)) == 'одобрено'
+                and not is_blank_placeholder(row, col, supply)):
             dates.add(parse_date(value_at(row, col)))
     result = []
     for date in sorted(dates):

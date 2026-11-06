@@ -40,6 +40,14 @@ class FakeSheets:
         self.published.append((draft["id"], draft["version"]))
         return "https://docs.google.com/spreadsheets/d/x/edit#gid=1&range=A3"
 
+    def set_warehouse(self, draft, warehouse):
+        self.warehouse_calls = getattr(self, "warehouse_calls", []) + [(draft["id"], draft["version"], warehouse)]
+        return "https://docs.google.com/spreadsheets/d/x/edit#gid=1&range=A3"
+
+    def set_date(self, draft, ship_date, arrival_date=None):
+        self.date_calls = getattr(self, "date_calls", []) + [(draft["id"], draft["version"], ship_date, arrival_date)]
+        return "https://docs.google.com/spreadsheets/d/x/edit#gid=1&range=A3"
+
     def reconcile(self, draft, rejected_before=(), apply=False, rules_fn=None):
         if rules_fn:
             self.rules_seen = rules_fn(self.snapshot())  # the controller builds it from the plan + memory
@@ -178,6 +186,99 @@ class WizardTests(UiBase):
         self.assertNotIn("Коледино", buttons(m))
 
 
+class DateChangeTests(UiBase):
+    async def exported(self):
+        m, b = await self.plan()
+        d0 = self.ctl.store.list(OWNER, 1)[0]
+        c, m1 = cb(b["Записать в тестовый лист"])
+        await self.ctl.handle_callback(c)
+        c, m2 = cb(buttons(m1)["Подтвердить запись"])
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.store.get(OWNER, d0["id"])["exported_version"], 1)
+        return d0
+
+    async def ask(self, d0, text):
+        c, m = cb(f"pl:dt:{d0['id']}:{d0['version']}")
+        await self.ctl.handle_callback(c)
+        self.assertIn("Дата отгрузки сейчас", said(m))
+        m.text = text
+        self.assertTrue(await self.ctl.handle_message(m))
+        return m
+
+    async def test_exported_plan_keeps_its_version_and_moves_date_in_sheet(self):
+        d0 = await self.exported()
+        keys = ui.PlannerController._keys(self.ctl, self.ctl.store.get(OWNER, d0["id"]))
+        self.assertIn("Изменить дату", [b.text for r in keys.inline_keyboard for b in r])
+        m = await self.ask(d0, "01.12.2030")
+        self.assertEqual(getattr(self.sheets, "date_calls", []), [])  # nothing is written before the confirmation
+        self.assertEqual(self.ctl.store.get(OWNER, d0["id"])["plan"]["date"], d0["plan"]["date"])
+        self.assertIn("Количества и прогнозы не пересчитываются", said(m))
+        c, _ = cb(buttons(m)["Подтвердить"], m)
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.sheets.date_calls, [(d0["id"], 1, "2030-12-01", None)])
+        d1 = self.ctl.store.get(OWNER, d0["id"])
+        self.assertEqual((d1["version"], d1["plan"]["date"], d1["plan"]["lines"]), (1, "2030-12-01", d0["plan"]["lines"]))
+        self.assertIn("Отгрузка 2030-12-01", said(m))
+        self.assertIn("Дата отгрузки изменена после записи", said(m))
+        self.assertIn("Обновить по листу", buttons(m))  # the plan stays the one being worked on
+        c, _ = cb(buttons(m)["Обновить по листу"], m)
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.sheets.rules_seen["capacity"], 33)
+        self.assertEqual(len(self.sheets.published), 1)
+
+    async def test_draft_gets_new_version_with_new_date_and_nothing_written(self):
+        m, b = await self.plan()
+        d0 = self.ctl.store.list(OWNER, 1)[0]
+        m = await self.ask(d0, "01.12.2030")
+        d1 = self.ctl.store.get(OWNER, d0["id"])
+        self.assertEqual((d1["version"], d1["plan"]["date"]), (2, "2030-12-01"))
+        self.assertEqual(self.ctl.store.get(OWNER, d0["id"], 1)["plan"]["date"], d0["plan"]["date"])  # history kept
+        self.assertEqual(self.sheets.published, [])
+        self.assertEqual(getattr(self.sheets, "date_calls", []), [])
+
+    async def test_same_past_bad_date_cancel_and_stale_confirmation_change_nothing(self):
+        d0 = await self.exported()
+        old = d0["plan"]["date"]
+        sy = old[8:] + "." + old[5:7] + "." + old[:4]
+        c, m = cb(f"pl:dt:{d0['id']}:1")
+        await self.ctl.handle_callback(c)
+        for text in ("01.01.2020", "31.02.2030"):
+            m.text = text
+            self.assertTrue(await self.ctl.handle_message(m), text)
+        m.text = "привет"
+        self.assertFalse(await self.ctl.handle_message(m))
+        m.text = sy  # the same date
+        self.assertTrue(await self.ctl.handle_message(m))
+        self.assertIn("Ничего не меняю", said(m))
+        m = await self.ask(d0, "01.12.2030")
+        yes = buttons(m)["Подтвердить"]
+        c, _ = cb("pl:cn", m)
+        await self.ctl.handle_callback(c)
+        c, m2 = cb(yes)
+        await self.ctl.handle_callback(c)
+        self.assertIn("устарело", said(m2))
+        c, m3 = cb(f"pl:dk:{d0['id']}:1:abcdef")
+        await self.ctl.handle_callback(c)
+        self.assertIn("устарело", said(m3))
+        self.assertEqual(getattr(self.sheets, "date_calls", []), [])
+        self.assertEqual(self.ctl.store.get(OWNER, d0["id"])["plan"]["date"], old)
+
+    async def test_store_failure_after_sheet_write_is_retryable(self):
+        d0 = await self.exported()
+        m = await self.ask(d0, "01.12.2030")
+        real = self.ctl.store.change_date
+        self.ctl.store.change_date = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk"))
+        c, _ = cb(buttons(m)["Подтвердить"], m)
+        await self.ctl.handle_callback(c)
+        self.assertIn("повторите", said(m))
+        self.assertEqual(len(self.sheets.date_calls), 1)
+        self.ctl.store.change_date = real
+        m = await self.ask(d0, "01.12.2030")  # the retry: the sheet call repeats harmlessly, the store now saves it
+        c, _ = cb(buttons(m)["Подтвердить"], m)
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.ctl.store.get(OWNER, d0["id"])["plan"]["date"], "2030-12-01")
+
+
 class PreliminaryPlanTests(UiBase):
     async def start(self):
         m = msg("Новый план")
@@ -198,25 +299,39 @@ class PreliminaryPlanTests(UiBase):
         await self.ctl.handle_callback(c)
         return m, buttons(m)
 
-    async def test_preliminary_plan_saved_without_warehouse_and_not_publishable(self):
+    async def test_preliminary_plan_saved_without_warehouse_and_publishable(self):
         for via_text in (False, True):
             m, b = await self.prelim(via_text)
             self.assertIn("Склад не выбран", said(m))
             self.assertIn("слотов", said(m))  # slots were NOT checked automatically; the note says so
             self.assertIn("Выбрать склад", b)
-            self.assertNotIn("Записать в тестовый лист", b)
+            self.assertIn("Записать в тестовый лист", b)
             d = self.ctl.store.list(OWNER, 1)[0]
             self.assertIsNone(d["plan"]["warehouse"])
             self.assertTrue(d["plan"]["lines"])
-            did, ver = d["id"], d["version"]
-            for act in ("pub",):  # forged callbacks cannot publish or confirm a plan without a warehouse
-                c, m2 = cb(f"pl:{act}:{did}:{ver}", m)
-                await self.ctl.handle_callback(c)
-                self.assertIn("Склад не выбран", said(m2))
-            c, m2 = cb(f"pl:ok:{did}:{ver}", m)
-            await self.ctl.handle_callback(c)
-            self.assertEqual(self.sheets.published, [])
-            self.assertIsNone(self.ctl.store.get(OWNER, did)["exported_version"])
+
+    async def test_write_without_warehouse_then_set_warehouse_in_sheet(self):
+        self.sheets.warehouse_calls = []
+        m, b = await self.prelim()
+        d0 = self.ctl.store.list(OWNER, 1)[0]
+        c, m1 = cb(b["Записать в тестовый лист"])
+        await self.ctl.handle_callback(c)
+        self.assertIn("останется пустой", said(m1))
+        c, m2 = cb(buttons(m1)["Подтвердить запись"])
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.sheets.published, [(d0["id"], 1)])
+        self.assertEqual(self.ctl.store.get(OWNER, d0["id"])["exported_version"], 1)
+        c, m3 = cb(buttons(m2)["Указать склад в листе"]) if "Указать склад в листе" in buttons(m2) else (None, None)
+        if c is None:  # the "done" message carries no keyboard: open the plan again
+            c, m3 = cb(f"pl:sw:{d0['id']}:1")
+        await self.ctl.handle_callback(c)
+        c, m4 = cb(buttons(m3)["Коледино"])
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.sheets.warehouse_calls, [(d0["id"], 1, "Коледино")])
+        self.assertIn("Коледино", said(m4))
+        d1 = self.ctl.store.get(OWNER, d0["id"])
+        self.assertEqual((d1["version"], d1["plan"]["warehouse"]), (1, None))  # the stored version is not rewritten
+        self.assertEqual(len(self.sheets.published), 1)
 
     async def test_warehouse_chosen_later_creates_new_version_then_publishes(self):
         m, b = await self.prelim()
@@ -618,6 +733,21 @@ class UpdateFromSheetTests(UiBase):
         c, m6 = cb(f"pl:uk:{did}:{ver}", m4)  # replay of the confirm button
         await self.ctl.handle_callback(c)
         self.assertIn("Сначала нажмите", said(m6))
+
+    async def test_update_can_fill_up_to_the_other_machine(self):
+        did, ver, m2 = await self.exported()
+        c, m4 = cb(buttons(m2)["Обновить по листу"], m2)
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.sheets.rules_seen["capacity"], 33)  # the plan's own machine by default
+        other = buttons(m4)["Добить до машины 20 паллет"]
+        self.assertEqual(other, f"pl:up:{did}:{ver}:20")
+        c, m5 = cb(other, m4)
+        await self.ctl.handle_callback(c)
+        self.assertEqual(self.sheets.rules_seen["capacity"], 20)  # preview computed for the chosen machine
+        self.assertFalse(any(x[2] for x in self.sheets.reconciled))
+        c, m6 = cb(f"pl:up:{did}:{ver}:99", m5)  # only 20 / 33 are accepted
+        await self.ctl.handle_callback(c)
+        self.assertIn("устарела", said(m6))
 
     async def test_up_before_export_is_refused(self):
         m, b = await self.plan()

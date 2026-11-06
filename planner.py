@@ -28,6 +28,8 @@ MIN_COVER = Fraction(1, 2)
 # A line below this many pieces and below half a pallet is not worth a shipment (owner rejected 12/24/40-pcs lines of
 # wilds with pallets of 240-320 pcs after earlier 20/40/60 ones; he did ship 54-100 pcs and half pallets of 72).
 FLOOR_LINE_QTY = 50
+# Leftover machine space may be topped up with a line of at most this share of a pallet (owner, 2026-11-05: "что-то на 0.1").
+TOPUP_MAX = Fraction(1, 10)
 _DEMAND_LABELS = {"growth": "рост", "stable": "стабильно", "gentle_decline": "плавное снижение",
                   "sharp_decline": "резкое падение", "uncertain": "неопределённо"}
 _PACK = {"wild": ("wild", 0, 1), "box": ("шт в коробе", 1, 2), "pallet": ("штук на палете", 1, 2)}
@@ -189,7 +191,8 @@ def _horizon(dm, T, M):
 
 
 def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, demand_mode=None,
-               min_line_qty=MIN_LINE_QTY, min_rating=MIN_RATING, exclude=(), min_cover=MIN_COVER, floor_qty=FLOOR_LINE_QTY):
+               min_line_qty=MIN_LINE_QTY, min_rating=MIN_RATING, exclude=(), min_cover=MIN_COVER, floor_qty=FLOOR_LINE_QTY,
+               allowed_wilds=None):
     """demand_mode: "apply" (default) limits the stock horizon by the demand state (see _horizon); "advisory" only
     shows the state per line and never changes a quantity."""
     demand_mode = DEMAND_MODE if demand_mode is None else demand_mode
@@ -361,7 +364,14 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
         elif x["fa"] < x["_T"]:
             cands.append(x)
     cands.sort(key=lambda x: (x["fa"], x["article"], x["cabinet"]))
+    # allowed_wilds (e.g. the wilds a warehouse is known to accept) narrows what may be proposed; `pool` keeps every wild
+    # that needed replenishment, most urgent first, so the caller can say which excluded ones are worth checking.
+    pool = list(dict.fromkeys(x["wild"] for x in cands))
+    allowed = None if allowed_wilds is None else {_norm(w) for w in allowed_wilds}
+    if allowed is not None:
+        cands = [x for x in cands if _norm(x["wild"]) in allowed]
 
+    crumbs = []
     for x in cands:
         T, M, low = x["_T"], x["_M"], x["_T"] * Fraction(7, 10)
         w, f, s7 = x["wild"], x["fa"], x["s7"]
@@ -387,11 +397,26 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
             k = (T - f) * s7 / box
             q = min({box * max(1, min(nb, n)) for n in (math.floor(k), math.ceil(k))}, key=score)
             how = "whole boxes"
+            # Owner rule (2026-11-05): above 1 pallet only whole pallets, above half a pallet only 0.5 or 1; the
+            # rounding goes up or down by what stays within stock / capacity / max_days (an overshoot rounds down).
+            pq = Fraction(q, pal)
+            if pq > 1:
+                shares = {Fraction(math.floor(pq)), Fraction(math.ceil(pq))}
+            elif pq > Fraction(1, 2):
+                shares = {Fraction(1, 2), Fraction(1)}
+            else:
+                shares = set()
+            # a pallet share in whole boxes: the box multiples next to share*pallet (half of 600 with box 40 -> 280/320)
+            cuts = {Fraction(box * f(sh * pal / box)) for sh in shares for f in (math.floor, math.ceil)}
+            rounded = [int(c) for c in cuts if c.denominator == 1 and 0 < c <= lim and c % box == 0]
+            if rounded:
+                q, how = min(rounded, key=score), "whole pallets (rounded)"
         need = math.ceil((T - f) * s7)  # what the line would add to reach the target
         room = min(budget[w] - used.get(w, 0), math.floor((cap - total) * pal))
         if room < need and q < need * min_cover:  # only crumbs fit (leftover machine space / stock): not worth a shipment
             warn.append(f"{x['article']}/{x['cabinet']}: only {q} of the needed {need} pcs fit "
                         "(machine space/free stock); skipped")
+            crumbs.append(x)  # may still top up the very end of the machine below
             continue
         if q < min_line_qty and Fraction(q, pal) < Fraction(1, 2):
             half = Fraction(pal, 2)
@@ -410,7 +435,21 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
             continue
         emit(x, q, f"regular: {how} toward {_f(T)} days", False)
 
-    return {"rules": r, "date": sd.isoformat(), "warehouse": None if warehouse is None else warehouse.strip(),
-            "arrival_date": ad.isoformat() if ad else None, "lines": lines, "warnings": warn,
-            "eligible_count": eligible, "total_pallets": _f(total), "remaining_pallets": _f(cap - total),
-            "source_hash": meta["source_hash"], "captured_at": meta["captured_at"]}
+    # Owner rule (2026-11-05): the leftover machine space may be topped up with a small line (floor_qty..0.1 pallet)
+    # even when it covers less than half of what the article needs. Same hard limits: stock, capacity, max_days.
+    for x in crumbs:
+        w, f, s7, T, M = x["wild"], x["fa"], x["s7"], x["_T"], x["_M"]
+        box, pal = pack[w]
+        lim = min(budget[w] - used.get(w, 0), math.floor((cap - total) * pal), math.floor((M - f) * s7))
+        q = min(lim, math.ceil((T - f) * s7)) // box * box
+        if q >= floor_qty and 0 < Fraction(q, pal) <= TOPUP_MAX:
+            warn.append(f"{x['article']}/{x['cabinet']}: tops up the leftover machine space with {q} pcs")
+            emit(x, q, f"top-up of leftover machine space toward {_f(T)} days", False)
+
+    out = {"rules": r, "date": sd.isoformat(), "warehouse": None if warehouse is None else warehouse.strip(),
+           "arrival_date": ad.isoformat() if ad else None, "lines": lines, "warnings": warn,
+           "eligible_count": eligible, "total_pallets": _f(total), "remaining_pallets": _f(cap - total),
+           "source_hash": meta["source_hash"], "captured_at": meta["captured_at"]}
+    if allowed is not None:
+        out["allowed_wilds"], out["pool_wilds"] = sorted(allowed), pool
+    return out
