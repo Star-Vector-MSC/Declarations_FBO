@@ -105,7 +105,7 @@ def read_database_catalog(records, barcode_field='barcode'):
         if barcode_field not in columns:
             raise ValueError('Поле баркода не найдено в wb_supplies_goods. Поля таблицы: ' + ', '.join(columns))
         # JSON lookup is parameterized; a configured field name is never interpolated into SQL.
-        query = '''SELECT wsg.id, wsg.nm_id, wsg.vendor_code, wsg.quantity,
+        query = '''SELECT wsg.id, wsg.nm_id, COALESCE(NULLIF(wsg.vendor_code, ''), a.vendor_code), wsg.quantity,
                           wsg.created_at, to_jsonb(wsg)->>%s AS barcode,
                           a.local_vendor_code, a.account
                    FROM wb_supplies_goods wsg
@@ -178,6 +178,8 @@ def make_workbook(base, records, path):
                       record['country']]
             for header, value in zip(HEADERS, values):
                 cell = sheet.cell(n, cols[header], value)
+                if isinstance(value, str):
+                    cell.data_type = 's'  # source text starting with '=' must stay text, never become a formula
                 cell._style = copy(styles[cols[header]])
                 if header in ('Баркод товара', 'Номер ДТ', 'Артикул продавца', 'Код страны происхождения'):
                     cell.number_format = '@'
