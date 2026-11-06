@@ -128,18 +128,20 @@ class RedactTests(unittest.TestCase):
             with patch.object(fc, 'PROJECT', Path(folder)), patch.dict(os.environ, {'DB_PASSWORD': 'x7Q'}, clear=True):
                 self.assertEqual(fc.secret_values(), ['x7Q'])
 
-    def test_short_credentials_are_hidden_but_short_host_settings_are_not_guessed(self):
+    def test_short_values_of_every_secret_named_variable_are_hidden(self):
         with tempfile.TemporaryDirectory() as folder:
-            (Path(folder) / '.env').write_text('PASSWORD=x7Q\nPGPORT=5432\nDATABASE_URL=pg\n', encoding='utf-8')
+            (Path(folder) / '.env').write_text('PASSWORD=x7Q\nPGUSER=u9\nDATABASE_URL=pg\n', encoding='utf-8')
             with patch.object(fc, 'PROJECT', Path(folder)), patch.dict(os.environ, {}, clear=True):
                 found = fc.secret_values()
                 try:
-                    raise RuntimeError('authentication failed for x7Q on port 5432')
+                    raise RuntimeError('authentication failed for x7Q as u9')
                 except RuntimeError as exc:
                     text = fc.safe_traceback(exc)
-        self.assertIn('x7Q', found)
-        self.assertNotIn('5432', found)
+        for short in ('x7Q', 'u9', 'pg'):
+            self.assertIn(short, found)
         self.assertNotIn('x7Q', text)
+        self.assertNotIn('u9', text)
+        self.assertIn('authentication failed', text)
 
     def test_bare_key_and_quoted_values_with_spaces_are_hidden_whole(self):
         for text in ('request failed: key=synthetic-123', 'secret_key=synthetic-123', 'cfg {"api_key": "synthetic-123"}',

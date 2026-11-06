@@ -32,7 +32,6 @@ def now():
 
 # Secret scrubbing for the local error log: the log is plain text on disk, so no credential may reach it.
 HIDDEN = '[скрыто]'
-SECRET_WORDS = re.compile(r'TOKEN|PASSWORD|PASSWD|SECRET|KEY|PRIVATE|CREDENTIAL', re.I)
 SECRET_NAMES = re.compile(r'TOKEN|PASSWORD|PASSWD|SECRET|KEY|PRIVATE|CREDENTIAL|DATABASE_URL|DSN|^PG', re.I)
 SECRET_PATTERNS = [
     (re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)', re.S), HIDDEN),
@@ -57,11 +56,8 @@ def secret_values():
     found = set()
     for name, value in pairs:
         value = (value or '').strip()
-        if not value or not SECRET_NAMES.search(name):
-            continue
-        # Credentials are hidden whatever their length; host/user-type PG* settings only when long enough to be unambiguous.
-        if len(value) >= (1 if SECRET_WORDS.search(name) or re.search('DATABASE_URL|DSN', name, re.I) else 6):
-            found.update((value, quote(value, safe='')))
+        if value and SECRET_NAMES.search(name):
+            found.update((value, quote(value, safe='')))  # hidden whatever the length: a short secret is still a secret
     return sorted(found, key=len, reverse=True)
 
 
