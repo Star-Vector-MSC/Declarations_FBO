@@ -406,7 +406,7 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
                 shares = {Fraction(1, 2), Fraction(1)}
             else:
                 shares = set()
-            # Owner rule (2026-11-06): the share is taken EXACTLY - whole pallets above one pallet (1, 2, 5 ... no tails),
+            # Owner decision (Ivan, 2026-11-06, over box multiples): the share is taken EXACTLY - whole pallets above one pallet (1, 2, 5 ... no tails),
             # half or whole between half a pallet and one - even if the pallet is not a whole number of boxes
             # (pallet 1000 / box 60 -> 1000, never 960 or 1020). A share that is not a whole number of pieces is skipped.
             cuts = {sh * pal for sh in shares}
