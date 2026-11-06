@@ -406,13 +406,16 @@ def build_plan(snapshot, rules, shipment_date, warehouse, arrival_date=None, dem
                 shares = {Fraction(1, 2), Fraction(1)}
             else:
                 shares = set()
-            # a pallet share in whole boxes: the box multiples next to share*pallet (half of 600 with box 40 -> 280/320)
-            # Intended: a pallet that is not a whole number of boxes cannot be shipped exactly, so the nearest box multiples are
-            # the result (pallet 1000 / box 60 -> 960 or 1020); dropping the line instead would lose the goods.
-            cuts = {Fraction(box * f(sh * pal / box)) for sh in shares for f in (math.floor, math.ceil)}
-            rounded = [int(c) for c in cuts if c.denominator == 1 and 0 < c <= lim and c % box == 0]
+            # Owner rule (2026-11-06): the share is taken EXACTLY - whole pallets above one pallet (1, 2, 5 ... no tails),
+            # half or whole between half a pallet and one - even if the pallet is not a whole number of boxes
+            # (pallet 1000 / box 60 -> 1000, never 960 or 1020). A share that is not a whole number of pieces is skipped.
+            cuts = {sh * pal for sh in shares}
+            rounded = [int(c) for c in cuts if c.denominator == 1 and 0 < c <= lim]
             if rounded:
                 q, how = min(rounded, key=score), "whole pallets (rounded)"
+                if q % box:  # the owner wants the exact pallet share; the data says the pallet is not made of whole boxes
+                    warn.append(f"{x['article']}/{x['cabinet']}: pallet {pal} pcs is not a whole number of boxes of {box}; "
+                                f"line of {q} pcs has a partial box, check the packing data")
         need = math.ceil((T - f) * s7)  # what the line would add to reach the target
         room = min(budget[w] - used.get(w, 0), math.floor((cap - total) * pal))
         if room < need and q < need * min_cover:  # only crumbs fit (leftover machine space / stock): not worth a shipment

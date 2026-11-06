@@ -122,13 +122,22 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual((ln["quantity"], ln["pallets"]), (1000, 1.0))
         self.assertIn("whole pallets", ln["reason"])
 
-    def test_pallet_not_made_of_whole_boxes_rounds_to_the_nearest_box_multiple(self):
-        # pallet 1000 / box 60: exactly 1 pallet cannot be shipped; the owner rule is "next to the share, in whole boxes"
-        res = self.plan([T("W1", "A", fc=0, s=(167,) * 4)], [PK("W1", 60, 1000)], target_days=10, max_days=11)
+    def test_pallet_shares_are_exact_even_when_the_pallet_is_not_made_of_whole_boxes(self):
+        # owner rule 2026-11-06: above one pallet only whole pallets (no tails), below one pallet 0.5 or 1
+        def run(box, pal, sales, max_days):
+            return bp(snap([T("W1", "A", fc=0, s=(sales,) * 4)], [PK("W1", box, pal)]),
+                      {"target_days": 10, "max_days": max_days}, "2026-10-28", "WH", "2026-10-30")
+        res = run(60, 1000, 167, 11)  # needs ~1.67 pallets, 2 would exceed max_days: one whole pallet, not 960 / 1020
         (ln,) = res["lines"]
-        self.assertEqual(ln["quantity"] % 60, 0)
-        self.assertIn(ln["quantity"], (960, 1020))  # the box multiples next to 1 pallet, never a partial box
+        self.assertEqual((ln["quantity"], ln["pallets"]), (1000, 1.0))
         self.assertIn("whole pallets (rounded)", ln["reason"])
+        self.assertTrue(any("not a whole number of boxes" in w for w in res["warnings"]))  # visible, not silent
+        (ln,) = run(60, 1000, 167, 14)["lines"]
+        self.assertEqual(ln["quantity"] % 1000, 0)  # whole pallets only, never a tail
+        (ln,) = run(40, 600, 60, 14)["lines"]  # ~0.7 pallet: half a pallet exactly (300), not the box neighbours 280 / 320
+        self.assertIn(ln["quantity"], (300, 600))
+        res = run(10, 1000, 167, 14)  # a normal pallet (whole boxes): no warning
+        self.assertFalse(any("not a whole number of boxes" in w for w in res["warnings"]))
 
     def test_shared_stock_and_conflicting_budgets(self):
         rows = [T("W1", "A", "C1", 100, s=(8,) * 4, fc=0), T("W1", "A", "C2", 100, s=(8,) * 4, fc=0),
