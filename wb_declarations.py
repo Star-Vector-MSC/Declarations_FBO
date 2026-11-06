@@ -58,6 +58,11 @@ def parse_date(value):
     raise ValueError(f'Invalid date: {value!r}')
 
 
+def is_blank_placeholder(row, date_col, supply_col):
+    """Approved-status row with neither date nor supply number: an empty template row."""
+    return not str(value_at(row, date_col)).strip() and not str(value_at(row, supply_col)).strip()
+
+
 def value_at(row, index):
     return row[index] if index < len(row) else ''
 
@@ -163,6 +168,12 @@ def choose_dt(receipts, stock, as_of):
         used.append({**receipt, 'arrival': receipt['arrival'].isoformat(), 'cumulative': total})
         if total >= stock:
             dt = str(receipt['dt']).strip()
+            if not dt:
+                # Owner rule: an empty DT is replaced by the freshest filled one of this wild.
+                donor = next((r for r in arrived if str(r['dt']).strip()), None)
+                if donor is not None:
+                    dt = str(donor['dt']).strip()
+                    used[-1]['dt_from_row'] = donor['row']
             if not re.fullmatch(r'\d{8}/\d{6}/\d{5,7}', dt):
                 raise ValueError(f'Missing or invalid DT at receipts row {receipt["row"]}')
             return dt, used
@@ -215,6 +226,8 @@ def shipment_queue(rows, selected_date, as_of, cabinet=None, supply_id=None, inc
     for n, row in enumerate(rows[1:], 2):
         if normalize(value_at(row, columns['status'])) != 'одобрено':
             continue
+        if is_blank_placeholder(row, columns['date'], columns['supply_id']):
+            continue
         if not include_checked and normalize(value_at(row, columns['checked'])) == 'true':
             continue
         if cabinet is not None and normalize(value_at(row, cabinets[0])) != normalize(cabinet):
@@ -243,7 +256,9 @@ def db_vendors(records):
     if not all(os.environ.get(name) for name in required):
         raise ValueError('Database requires secrets PGUSER, PGPASSWORD, PGDATABASE')
     # No DISTINCT: ambiguity must be visible, not hidden by an arbitrary selected row.
-    sql = '''SELECT wsg.id, wsg.nm_id, wsg.vendor_code, wsg.created_at,
+    # wsg.vendor_code can arrive empty for fresh supplies; article.vendor_code is the same
+    # exact seller article (identical on every filled row) and is always set.
+    sql = '''SELECT wsg.id, wsg.nm_id, COALESCE(NULLIF(wsg.vendor_code, ''), a.vendor_code), wsg.created_at,
                     a.local_vendor_code, a.account
              FROM wb_supplies_goods wsg
              LEFT JOIN article a ON a.nm_id = wsg.nm_id

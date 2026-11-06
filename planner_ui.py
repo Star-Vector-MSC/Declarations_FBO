@@ -2,6 +2,7 @@
 publish into «Планирование FBO — ТЕСТ». Storage, memory and Google clients are lazy; settings are fixed commands."""
 import asyncio
 import copy
+import functools
 import os
 import re
 import secrets
@@ -14,6 +15,8 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardBu
 import planner
 import planner_ai
 import planner_experience as exp
+import planner_sc
+from planner_sc import ScError
 from planner_sheets import MSK, PlannerSheets, PlannerSheetsError, SourceChangedError
 from planner_storage import DraftError, DraftStore
 
@@ -23,7 +26,7 @@ OLD_BUTTONS = ("Ближайшая отгрузка", "Обновить базу
                "Файлы по кабинету", "По номеру поставки")
 NO_WH = "склад не выбран"
 NO_WH_NOTE = ("Склад не выбран: это предварительный состав. Доступность слотов автоматически не проверялась "
-              "(такой проверки в боте нет), склад выберите сами. Запись в тестовый лист возможна только после выбора склада.")
+              "(такой проверки в боте нет), склад выберите сами. В тестовый лист можно записать и без склада, склад затем проставляется в листе кнопкой.")
 GENERIC = "Операция не выполнена. Повторите позже."
 MEM_DOWN = "Память помощника недоступна — создание и запись планов заблокированы, пока её не восстановят."
 HELP = ("Команды настроек (по одной в сообщении):\n"
@@ -51,7 +54,7 @@ class _Blocked(Exception):
 
 
 def _err(e):
-    if isinstance(e, (PlannerSheetsError, DraftError, _Blocked, planner_ai.AIUnavailable, planner_ai.AIRejected)):
+    if isinstance(e, (PlannerSheetsError, DraftError, ScError, _Blocked, planner_ai.AIUnavailable, planner_ai.AIRejected)):
         return str(e)
     if isinstance(e, ValueError):
         return "Не удалось построить план: " + str(e)[:300]
@@ -156,6 +159,10 @@ def preview_text(d):
              f"исключений wild {len(r['excluded_wild'])}, кабинетов {len(r['excluded_cabinets'])}, "
              f"обязательных строк {len(r['fixed'])}"]
     at = len(lines)
+    if p.get("allowed_wilds") is not None:
+        lines.append(f"Подбор ограничен wild, которые принимает склад «{p['warehouse']}» (подтверждено: {len(p['allowed_wilds'])}).")
+    if p.get("date_built"):
+        lines.append(f"Дата отгрузки изменена после записи в лист (была {p['date_built']}); количества и прогнозы посчитаны на старую дату.")
     if p["warehouse"] is None:
         lines.append(NO_WH_NOTE)
     if p["remaining_pallets"] and p["remaining_pallets"] > 0:
@@ -199,8 +206,9 @@ def lines_text(d, page):
 class PlannerController:
     """handle_message(message)->bool (True = consumed), handle_callback(callback), reset(owner)."""
 
-    def __init__(self, store=None, sheets=None, memory=None, is_owner=None, data_dir=None, ai=None):
+    def __init__(self, store=None, sheets=None, memory=None, is_owner=None, data_dir=None, ai=None, sc=None, sc_fetch=None):
         self._store, self._sheets, self._memory, self._ai = store, sheets, memory, ai
+        self._sc, self._sc_fetch = sc, sc_fetch
         self._is_owner, self._data_dir = is_owner, data_dir
         self._lock, self._st, self._gen = asyncio.Lock(), {}, {}
         self._commit = threading.Lock()  # serialises "check still wanted + store" with reset()
@@ -231,6 +239,12 @@ class PlannerController:
             self._memory = MemoryStore(os.path.join(self._dir(), "planner_memory.sqlite3"),
                                        os.path.join(self._dir(), "planner_memory-ledger.md"))
         return self._memory
+
+    @property
+    def sc(self):
+        if self._sc is None:
+            self._sc = planner_sc.ScStore(os.path.join(self._dir(), "planner_sc.sqlite3"))
+        return self._sc
 
     @property
     def ai(self):
@@ -264,19 +278,30 @@ class PlannerController:
         top = [[_btn("Состав", "ln", i, v, 0), _btn("Память", "mem", i, v)]]
         if d["version"] != d["latest_version"] or d.get("exported_version") is not None:
             upd = [[_btn("Обновить по листу", "up", i, v)]] if d.get("exported_version") == v else []
-            return _kb(top + upd + [[_btn("Мои планы", "list")]])
+            if d.get("exported_version") == v and d["plan"]["warehouse"] is None:
+                upd += [[_btn("Указать склад в листе", "sw", i, v)]]
+            if d.get("exported_version") == v:
+                upd += [[_btn("Изменить дату", "dt", i, v)]]
+            return _kb(top + upd + [[_btn("Проверить склады", "sc", i, v)], [_btn("Мои планы", "list")]])
         other = 20 if d["plan"]["rules"]["capacity"] == 33 else 33
-        last = ([_btn("Выбрать склад", "sw", i, v)] if d["plan"]["warehouse"] is None
-                else [_btn("Записать в тестовый лист", "pub", i, v)])
+        last = [_btn("Записать в тестовый лист", "pub", i, v)]
+        if d["plan"]["warehouse"] is None:
+            last = [_btn("Выбрать склад", "sw", i, v)] + last
         return _kb(top + [[_btn("Пересчитать", "rc", i, v), _btn("Настройки", "set", i, v)],
-                          [_btn(f"Машина {other} паллет", "cap", i, v, other)], last])
+                          [_btn(f"Машина {other} паллет", "cap", i, v, other), _btn("Изменить дату", "dt", i, v)],
+                          [_btn("Проверить склады", "sc", i, v)], last])
 
     async def _show(self, msg, d):
         await msg.answer(preview_text(d), reply_markup=self._keys(d))
 
-    def _build(self, uid, rules, day, wh, arrival=None, draft=None, touched=(), release=(), alive=None):  # worker thread
+    def _build(self, uid, rules, day, wh, arrival=None, draft=None, touched=(), release=(), alive=None, allowed=None,
+               dry=False, snap=None):  # worker thread
+        """dry=True returns the calculated plan without storing it (snap: an already read snapshot to reuse).
+        allowed: wilds the pick is limited to; a plan keeps its own list while its warehouse stays the same."""
         self._mem_ok()
-        snap = self.sheets.snapshot()
+        snap = snap if snap is not None else self.sheets.snapshot()
+        if allowed is None and draft and draft["plan"].get("warehouse") == wh:
+            allowed = draft["plan"].get("allowed_wilds")
         if wh is not None and wh not in snap["warehouses"]:
             raise _Blocked("Такого склада сейчас нет в таблице. Начните новый план.")
         wilds = set(planner_ai.catalog(snap)["wilds"].values())
@@ -290,8 +315,10 @@ class PlannerController:
         if prev is not None:  # a required line the owner added/changed in this plan is theirs: memory does not override it
             explicit |= exp.changed_fixed(prev, norm)
         effective, experience = exp.merge(rules, selected, explicit)
-        plan = planner.build_plan(snap, effective, day, wh, arrival)
+        plan = planner.build_plan(snap, effective, day, wh, arrival, allowed_wilds=allowed)
         plan["base_rules"], plan["experience"], plan["explicit_keys"] = norm, experience, sorted(explicit)
+        if dry:
+            return plan
         with self._commit:  # owner/menu re-check after the slow read, atomically with the store
             if alive is not None and not alive():
                 raise _Blocked("Действие отменено.")
@@ -323,7 +350,8 @@ class PlannerController:
             return False
         uid, ct = user.id, message.chat.type
         if text in LEAVE or text in OLD_BUTTONS:
-            self.reset(uid)
+            if self._owner(uid, ct):  # a stranger or a group message must not touch any planner state
+                self.reset(uid)
             return False
         if text in ENTRY:
             if not self._owner(uid, ct):
@@ -332,7 +360,7 @@ class PlannerController:
             async with self._lock:
                 return await (self._new(uid, message) if text == "Новый план" else self._list(uid, ct, message))
         st = self._st.get(uid)
-        if not st or st["step"] not in ("date", "wh", "cap", "settings", "pickwh"):
+        if not st or st["step"] not in ("date", "wh", "cap", "settings", "pickwh", "newdate", "scdata"):
             return False
         if st["step"] == "settings" and text.isdigit():
             return False  # supply numbers are never intercepted
@@ -367,7 +395,10 @@ class PlannerController:
         await msg.answer("Ваши последние планы:", reply_markup=_kb(rows))
         return True
 
-    async def _t_date(self, uid, ct, msg, text, st):
+    @staticmethod
+    async def _day_from(msg, text):
+        """(handled, day): a typed shipment date or «Сегодня/Завтра/Послезавтра»; text that is no date is not handled,
+        a bad or past date is answered here (handled, None)."""
         today, low = datetime.now(MSK).date(), text.casefold()
         shortcut = {"сегодня": 0, "завтра": 1, "послезавтра": 2}
         if low in shortcut:
@@ -377,12 +408,18 @@ class PlannerController:
                 day = date(int(text[6:]), int(text[3:5]), int(text[:2]))
             except ValueError:
                 await msg.answer("Такой даты нет. Формат ДД.ММ.ГГГГ.")
-                return True
+                return True, None
         else:
-            return False
+            return False, None
         if day < today:
             await msg.answer("Дата в прошлом. Напишите сегодняшнюю или будущую дату.")
-            return True
+            return True, None
+        return True, day
+
+    async def _t_date(self, uid, ct, msg, text, st):
+        handled, day = await self._day_from(msg, text)
+        if day is None:
+            return handled
 
         def work():
             self._mem_ok()
@@ -544,7 +581,7 @@ class PlannerController:
             if len(cb.data.encode()) > 64 or parts[0] != "pl":
                 raise ValueError
             act, a = parts[1], parts[2:]
-            if act in ("op", "ln", "mem", "rc", "set", "cap", "pub", "ok", "ap", "ar", "ex", "sw", "up", "uk"):
+            if act in ("op", "ln", "mem", "rc", "set", "cap", "pub", "ok", "ap", "ar", "ex", "sw", "up", "uk", "dt", "dk", "sc", "sr", "sm", "rw", "d2", "d3", "pd", "lw"):
                 if not (len(a) >= 2 and _ID.fullmatch(a[0]) and a[1].isdigit()):
                     raise ValueError
                 a = [a[0], int(a[1])] + a[2:]
@@ -574,7 +611,7 @@ class PlannerController:
         if st:
             for k in ("proposal", "confirm", "confirm_up", "memo", "perm_ok", "example", "touched"):
                 st.pop(k, None)
-            if st["step"] in ("settings", "pickwh"):
+            if st["step"] in ("settings", "pickwh", "newdate", "scdata"):
                 self._st.pop(uid)
         await msg.answer("Отменено, ничего не изменено.")
 
@@ -691,11 +728,12 @@ class PlannerController:
                     planner._norm(x) for x in base["excluded_cabinets"]}
         return out
 
-    async def _revise(self, uid, ct, msg, d, rules, warehouse=..., touched=(), release=()):
+    async def _revise(self, uid, ct, msg, d, rules, warehouse=..., touched=(), release=(), day=None, allowed=None):
         p = d["plan"]
-        ok, new = await self._guarded(uid, ct, msg, self._build, uid, rules, p["date"],
+        ok, new = await self._guarded(uid, ct, msg, functools.partial(self._build, allowed=allowed), uid, rules,
+                                      p["date"] if day is None else day.isoformat(),
                                       p["warehouse"] if warehouse is ... else warehouse,
-                                      p.get("arrival_date"), d, tuple(touched), tuple(release), live=True)
+                                      self._arrival_for(p, day), d, tuple(touched), tuple(release), live=True)
         if ok:
             try:
                 await msg.answer("Пересчитано: сохранена новая неизменяемая версия (в таблицу ничего не записано).")
@@ -711,9 +749,12 @@ class PlannerController:
         await msg.answer(HELP)
 
     async def _c_sw(self, uid, ct, msg, did, ver):
-        d = await self._draft(uid, did, ver)
+        d = await self._draft(uid, did, ver, latest=False)
+        in_sheet = d.get("exported_version") == ver  # written without a warehouse: only the sheet cells get filled
         if d["plan"]["warehouse"] is not None:
             raise _Blocked("В этом плане склад уже выбран.")
+        if not in_sheet and (d["version"] != d["latest_version"] or d.get("exported_version") is not None):
+            raise _Blocked("Эта версия устарела или уже выгружена. Откройте актуальный план в «Моих планах».")
 
         def work():
             self._mem_ok()
@@ -725,8 +766,10 @@ class PlannerController:
             await msg.answer("В таблице нет складов Wildberries.")
             return
         nonce = secrets.token_hex(3)
-        self._st[uid] = {"step": "pickwh", "id": did, "ver": ver, "whs": whs[:40], "nonce": nonce}
-        await msg.answer("Выберите склад для плана (будет сохранена новая версия, в таблицу ничего не записывается):",
+        self._st[uid] = {"step": "pickwh", "id": did, "ver": ver, "whs": whs[:40], "nonce": nonce, "sheet": in_sheet}
+        await msg.answer("Выберите склад: он будет проставлен в строках этого плана в тестовом листе (больше ничего не меняется):"
+                         if in_sheet else
+                         "Выберите склад для плана (будет сохранена новая версия, в таблицу ничего не записывается):",
                          reply_markup=_kb([[_btn(w[:40], "sp", nonce, i)] for i, w in enumerate(self._st[uid]["whs"])]
                                           + [[_btn("Отмена", "cn")]]))
 
@@ -737,8 +780,370 @@ class PlannerController:
             await msg.answer("Кнопка устарела. Откройте план в «Моих планах».")
             return
         self._st.pop(uid)
+        wh = st["whs"][int(idx)]
+        if st.get("sheet"):
+            await self._set_sheet_warehouse(uid, ct, msg, st["id"], st["ver"], wh)
+            return
         d = await self._draft(uid, st["id"], st["ver"])
-        await self._revise(uid, ct, msg, d, base_rules(d), st["whs"][int(idx)])
+        await self._revise(uid, ct, msg, d, base_rules(d), wh)
+
+    async def _set_sheet_warehouse(self, uid, ct, msg, did, ver, wh):
+        d = await self._draft(uid, did, ver, latest=False)
+        if d.get("exported_version") != ver or d["plan"]["warehouse"] is not None:
+            raise _Blocked("План уже не в состоянии «записан без склада». Откройте его в «Моих планах».")
+
+        def work():
+            self._mem_ok()
+            if not self._owner(uid, ct):
+                raise _Blocked("Запись отменена.")
+            return self.sheets.set_warehouse(d, wh)
+        ok, url = await self._guarded(uid, ct, msg, work)
+        if ok:
+            await msg.answer(f"Склад «{wh}» проставлен в строках плана в тестовом листе: {url}")
+
+    @staticmethod
+    def _arrival_for(plan, day):
+        """The plan's arrival date (if it has one) keeps its distance from the shipment when the shipment moves to `day`."""
+        arr = plan.get("arrival_date")
+        if day is None or arr is None:
+            return arr
+        return (date.fromisoformat(arr) + (day - date.fromisoformat(plan["date"]))).isoformat()
+
+    async def _c_dt(self, uid, ct, msg, did, ver):
+        d = await asyncio.to_thread(self.store.get, uid, did, ver)
+        sheet = d.get("exported_version") == ver
+        if not sheet and (d["version"] != d["latest_version"] or d.get("exported_version") is not None):
+            raise _Blocked("Эта версия устарела. Откройте актуальный план в «Моих планах».")
+        self._st[uid] = {"step": "newdate", "id": did, "ver": ver, "sheet": sheet}
+        cur = date.fromisoformat(d["plan"]["date"]).strftime("%d.%m.%Y")
+        await msg.answer(f"Дата отгрузки сейчас {cur}. Напишите новую дату ДД.ММ.ГГГГ или «Завтра» / «Послезавтра». "
+                         + ("В тестовом листе поменяются только даты строк этого плана; состав и количества останутся."
+                            if sheet else "Состав будет пересчитан под новую дату (сохранится новая версия)."),
+                         reply_markup=_kb([[_btn("Отмена", "cn")]]))
+
+    async def _t_newdate(self, uid, ct, msg, text, st):
+        handled, day = await self._day_from(msg, text)
+        if day is None:
+            return handled
+        d = await asyncio.to_thread(self.store.get, uid, st["id"], st["ver"])
+        old = date.fromisoformat(d["plan"]["date"])
+
+        def fmt(x):
+            return x.strftime("%d.%m.%Y")
+        if day == old:
+            self._st.pop(uid, None)
+            await msg.answer(f"В плане и так {fmt(day)}. Ничего не меняю.")
+            return True
+        if not st["sheet"]:
+            self._st.pop(uid, None)
+            if d["version"] != d["latest_version"] or d.get("exported_version") is not None:
+                await msg.answer("Эта версия устарела или уже выгружена. Откройте актуальный план в «Моих планах».")
+                return True
+            await self._revise(uid, ct, msg, d, base_rules(d), day=day)
+            return True
+        if d.get("exported_version") != st["ver"]:
+            self._st.pop(uid, None)
+            await msg.answer("План уже не в состоянии «записан в лист». Откройте его в «Моих планах».")
+            return True
+        await self._date_confirm(uid, msg, d, day)
+        return True
+
+    async def _date_confirm(self, uid, msg, d, day):
+        """Ask to confirm moving an exported plan to `day` (the sheet's date cells change)."""
+        st = self._st[uid] = {"step": "newdate", "id": d["id"], "ver": d["version"], "sheet": True, "day": day.isoformat(),
+                              "nonce": secrets.token_hex(3)}
+        old, arr = date.fromisoformat(d["plan"]["date"]), self._arrival_for(d["plan"], day)
+
+        def fmt(x):
+            return x.strftime("%d.%m.%Y")
+        await msg.answer(f"Сменить дату отгрузки плана {st['id']} с {fmt(old)} на {fmt(day)}? В тестовом листе у строк этого плана "
+                         "обновятся «Дата отгрузки (склад)», «Сборка товара (Склад)» (за день до отгрузки)"
+                         + (f" и «Плановая дата прибытия» ({fmt(date.fromisoformat(arr))})" if arr else "")
+                         + ". Вручную изменённые ячейки сборки/прибытия бот не трогает. Количества и прогнозы не пересчитываются; "
+                         "новые строки при «Обновить по листу» будут считаться уже под новую дату.",
+                         reply_markup=_kb([[_btn("Подтвердить", "dk", st["id"], st["ver"], st["nonce"]),
+                                            _btn("Отмена", "cn")]]))
+
+    async def _c_dk(self, uid, ct, msg, did, ver, nonce=""):
+        st = self._st.get(uid)
+        if (not st or st["step"] != "newdate" or st.get("nonce") != nonce or (st["id"], st["ver"]) != (did, ver)
+                or "day" not in st):
+            await msg.answer("Предложение устарело или отменено. Ничего не изменено.")
+            return
+        self._st.pop(uid)
+        day = date.fromisoformat(st["day"])
+        d = await asyncio.to_thread(self.store.get, uid, did, ver)
+        if d.get("exported_version") != ver:
+            raise _Blocked("План уже не в состоянии «записан в лист». Откройте его в «Моих планах».")
+        arr = self._arrival_for(d["plan"], day)
+
+        def work():
+            self._mem_ok()
+            if not self._owner(uid, ct):
+                raise _Blocked("Изменение отменено.")
+            url = self.sheets.set_date(d, day.isoformat(), arr)
+            try:
+                self.store.change_date(uid, did, ver, day.isoformat(), arr)
+            except Exception:
+                return url, False
+            return url, True
+        ok, res = await self._guarded(uid, ct, msg, work)
+        if not ok:
+            return
+        url, saved = res
+        if not saved:
+            await msg.answer(f"В листе дата уже {day.strftime('%d.%m.%Y')}: {url}\nВ боте сохранить не удалось — повторите "
+                             "«Изменить дату» с той же датой, повтор в листе ничего не продублирует.")
+            return
+        await msg.answer(f"Дата отгрузки изменена на {day.strftime('%d.%m.%Y')}: {url}\n"
+                         "Чтобы добавить товар к строкам и добить машину, нажмите «Обновить по листу».")
+        await self._show(msg, await asyncio.to_thread(self.store.get, uid, did, ver))
+
+    def _sc_work(self, d, force):  # worker thread
+        warn = None
+        try:
+            self.sc.ensure_fresh(self._sc_fetch or planner_sc.fetch_history, force=force)
+        except ScError as e:
+            if self.sc.refreshed_at() is None:
+                raise
+            warn = f"{e} Использую прежний снимок истории."
+        p, snap = d["plan"], self.sheets.snapshot()
+        a = self.sc.analyze([ln["wild"] for ln in p["lines"]], snap["warehouses"])
+        extra, mode = None, self._sc_mode(d)
+        if not a["full"] and a["rank"] and a["rank"][0][1] > 0 and mode:
+            wh = a["rank"][0][0]
+            allowed = sorted(self.sc.confirmed(wh))
+            plan = self._build(None, base_rules(d), p["date"], wh, p.get("arrival_date"), d, allowed=allowed, dry=True, snap=snap)
+            have = set(allowed)
+            extra = {"wh": wh, "plan": plan, "mode": mode, "ask": [w for w in plan["pool_wilds"] if planner._norm(w) not in have],
+                     "rows": [ln for ln in p["lines"] if planner._norm(ln["wild"]) not in have]}
+        return a, warn, extra
+
+    @staticmethod
+    def _sc_mode(d):
+        """«d»: a draft (replace / new date = new version); «x»: the exported version (limit later updates, move the date in
+        the sheet); None: an older version, nothing to change."""
+        if d.get("exported_version") == d["version"]:
+            return "x"
+        return "d" if d.get("exported_version") is None and d["version"] == d["latest_version"] else None
+
+    @staticmethod
+    def _sc_text(d, a, warn=None, extra=None):
+        def cut(items, n):
+            return ", ".join(items[:n]) + (f" … и ещё {len(items) - n}" if len(items) > n else "")
+        at = a["refreshed_at"]
+        out = [f"Склады для плана {d['id']} v{d['version']}: {len(a['wilds'])} wild.",
+               (f"История приёмок с {planner_sc.SINCE:%d.%m.%Y}, обновлена {at.astimezone(MSK):%d.%m.%Y}. Это «отгружали туда раньше», "
+                "а не гарантия, что склад примет сегодня.") if at else "История отгрузок ещё не загружена."]
+        if warn:
+            out.append(warn)
+        if a["full"]:
+            out.append("Весь пул можно отправить на: " + cut(a["full"], 15) + ".")
+        else:
+            if a["nodata"]:
+                out.append(f"По {len(a['nodata'])} wild данных нет: {cut(a['nodata'], 25)}. Посмотрите в кабинете WB, куда их "
+                           "принимают, и нажмите «Ввести данные из кабинета».")
+            if a["full_known"] and a["nodata"]:
+                out.append("Если по ним ограничений нет, остальным wild подходят: " + cut(a["full_known"], 15) + ".")
+            elif not a["full_known"]:
+                out.append("Нет склада, на который прошли бы все wild сразу. Ближе всего:")
+                for wh, n, miss in a["rank"][:3]:
+                    out.append(f"• {wh} — {n} из {len(a['wilds'])}; не подтверждены: {cut(miss, 8)}")
+                out.append("Посмотрите в кабинете WB, принимает ли первый склад недостающие wild, и нажмите «Ввести данные из кабинета».")
+        if extra and extra["mode"] == "d":
+            pl = extra["plan"]
+            out.append(f"Если заменить под «{extra['wh']}»: строк {len(d['plan']['lines'])} → {len(pl['lines'])}, загрузка "
+                       f"{pl['total_pallets']} из {pl['rules']['capacity']} паллет.")
+        elif extra:
+            out.append(f"План уже в листе. Для «{extra['wh']}» не подтверждены строк: {len(extra['rows'])}"
+                       + (f" ({cut(sorted({ln['wild'] for ln in extra['rows']}), 12)})" if extra["rows"] else "")
+                       + ". «Ограничить подбор» запомнит, какие wild принимает склад; пометьте эти строки в листе «Пересмотреть» и "
+                         "нажмите «Обновить по листу» — бот уберёт их и добавит замену только из подтверждённых. «Позже, добить "
+                         "машину» сдвинет дату, а «Обновить по листу» добавит товар к текущим строкам.")
+        if extra and extra["ask"]:
+            out.append("Срочные wild без подтверждения для этого склада (посмотрите в кабинете и введите — они попадут в замену): "
+                       + cut(extra["ask"], 25) + ".")
+        if a["outside"]:
+            out.append("В истории есть склады, которых нет в списке выбора склада: " + cut(a["outside"], 5) + ".")
+        return "\n".join(out)[:3900]
+
+    async def _sc_show(self, uid, msg, d, a, warn=None, extra=None):
+        i, v = d["id"], d["version"]
+        rows = [[_btn("Ввести данные из кабинета", "sm", i, v)], [_btn("Обновить историю", "sr", i, v)]]
+        if extra:
+            nonce = secrets.token_hex(3)
+            self._st[uid] = {"step": "scplan", "id": i, "ver": v, "wh": extra["wh"], "nonce": nonce}
+            if extra["mode"] == "d":
+                rows = [[_btn(f"Заменить под {extra['wh']}"[:40], "rw", i, v, nonce)],
+                        [_btn("Раньше, 20 паллет", "d2", i, v, nonce), _btn("Позже, добить машину", "d3", i, v, nonce)]] + rows
+            else:
+                rows = [[_btn(f"Ограничить подбор: {extra['wh']}"[:40], "lw", i, v, nonce)],
+                        [_btn("Позже, добить машину", "d3", i, v, nonce)]] + rows
+        await msg.answer(self._sc_text(d, a, warn, extra), reply_markup=_kb(rows))
+
+    async def _c_sc(self, uid, ct, msg, did, ver, force=False):
+        d = await asyncio.to_thread(self.store.get, uid, did, ver)
+        await msg.answer("Смотрю историю отгрузок по складам…")
+        ok, res = await self._guarded(uid, ct, msg, self._sc_work, d, force)
+        if ok:
+            await self._sc_show(uid, msg, d, *res)
+
+    async def _c_sr(self, uid, ct, msg, did, ver):
+        await self._c_sc(uid, ct, msg, did, ver, True)
+
+    async def _c_sm(self, uid, ct, msg, did, ver):
+        await asyncio.to_thread(self.store.get, uid, did, ver)
+        self._st[uid] = {"step": "scdata", "id": did, "ver": ver}
+        await msg.answer("Пришлите, куда принимают wild по данным кабинета WB: по одной строке, например\n"
+                         "wild1234: Коледино, Казань\n"
+                         "Названия складов — как в списке выбора склада. Можно сразу несколько строк. "
+                         f"Ответ действует {planner_sc.MANUAL_DAYS} дн.", reply_markup=_kb([[_btn("Отмена", "cn")]]))
+
+    _SC_LINE = re.compile(r"\s*(wild\d+(?:d\d*)?)\s*[:\-–—]\s*(.+?)\s*")
+
+    async def _t_scdata(self, uid, ct, msg, text, st):
+        rows = [self._SC_LINE.fullmatch(x) for x in text.splitlines() if x.strip()]
+        if not rows or not all(rows):
+            return False  # not in the agreed «wild: склад, склад» form: other handlers may want this text
+        d = await asyncio.to_thread(self.store.get, uid, st["id"], st["ver"])
+        ok, whs = await self._guarded(uid, ct, msg, lambda: self.sheets.snapshot()["warehouses"])
+        if not ok:
+            return True
+        names = {planner._norm(w): w for w in whs}
+        pairs, saved, bad = [], [], []
+        for m in rows:
+            w, got = planner_sc.base_wild(m.group(1)), [x.strip() for x in re.split(r"[,;]", m.group(2)) if x.strip()]
+            unknown = [x for x in got if planner._norm(x) not in names]
+            if unknown or not got:
+                bad.append(f"{m.group(1)}: нет такого склада — {', '.join(unknown) or 'пусто'}")
+                continue
+            pairs += [(w, names[planner._norm(x)]) for x in got]
+            saved.append(f"{w}: {', '.join(names[planner._norm(x)] for x in got)}")
+        self._st.pop(uid, None)
+        if pairs:
+            await asyncio.to_thread(self.sc.add_manual, pairs)
+        head = ("Сохранил:\n" + "\n".join(saved) + f"\n(действует {planner_sc.MANUAL_DAYS} дн.)") if saved else "Ничего не сохранил."
+        await msg.answer(head + ("\nНе принял (проверьте названия складов):\n" + "\n".join(bad) if bad else ""))
+        if pairs:
+            ok, res = await self._guarded(uid, ct, msg, self._sc_work, d, False)
+            if ok:
+                await self._sc_show(uid, msg, d, *res)
+        return True
+
+    # replacement / dates for the best warehouse ------------------------------------------------------------------
+    def _sc_session(self, uid, did, ver, nonce):
+        st = self._st.get(uid)
+        ok = st and st["step"] == "scplan" and st["nonce"] == nonce and (st["id"], st["ver"]) == (did, ver)
+        return st if ok else None
+
+    @staticmethod
+    def _keep_rules(d, allowed, cap=None):
+        """The plan's rules with its current lines of allowed wilds pinned as required lines: a new date then ADDS goods."""
+        rules = dict(base_rules(d))
+        if cap is not None:
+            rules["capacity"] = cap
+        have = {(f["article"], f["cabinet"]) for f in rules["fixed"]}
+        ok = set(allowed)
+        rules["fixed"] = list(rules["fixed"]) + [
+            {"article": ln["article"], "cabinet": ln["cabinet"], "quantity": ln["quantity"], "reason": "kept: добивка машины"}
+            for ln in d["plan"]["lines"] if (ln["article"], ln["cabinet"]) not in have and planner._norm(ln["wild"]) in ok]
+        return rules
+
+    async def _c_rw(self, uid, ct, msg, did, ver, nonce=""):
+        st = self._sc_session(uid, did, ver, nonce)
+        if not st:
+            await msg.answer("Кнопка устарела. Нажмите «Проверить склады» ещё раз.")
+            return
+        d = await self._sc_plan(uid, did, ver, "d")
+        self._st.pop(uid, None)
+        await self._revise(uid, ct, msg, d, base_rules(d), st["wh"], allowed=sorted(self.sc.confirmed(st["wh"])))
+
+    async def _sc_plan(self, uid, did, ver, mode=None):
+        """The plan for a replacement step, re-checked: mode «d» needs the latest unexported draft, «x» the exported version,
+        None either (an older version never)."""
+        d = await asyncio.to_thread(self.store.get, uid, did, ver)
+        if self._sc_mode(d) is None or (mode and self._sc_mode(d) != mode):
+            raise _Blocked("План изменился или устарел. Откройте актуальный план в «Моих планах» и проверьте склады заново.")
+        return d
+
+    async def _c_lw(self, uid, ct, msg, did, ver, nonce=""):
+        st = self._sc_session(uid, did, ver, nonce)
+        if not st:
+            await msg.answer("Кнопка устарела. Нажмите «Проверить склады» ещё раз.")
+            return
+        d = await self._sc_plan(uid, did, ver, "x")
+        wh, allowed = st["wh"], sorted(self.sc.confirmed(st["wh"]))
+        await asyncio.to_thread(self.store.set_limit, uid, did, ver, wh, allowed)
+        self._st.pop(uid, None)
+        rows = [ln for ln in d["plan"]["lines"] if planner._norm(ln["wild"]) not in set(allowed)]
+        await msg.answer(f"Запомнил: подбор этого плана ограничен wild, которые принимает «{wh}» ({len(allowed)}). "
+                         + (f"Строки плана без подтверждения ({len(rows)}) — пометьте в листе «Пересмотреть» и нажмите «Обновить по листу»:\n"
+                            + "\n".join(f"{ln['article']} · {ln['cabinet']} · {ln['wild']}" for ln in rows[:20])
+                            + (f"\n… и ещё {len(rows) - 20}" if len(rows) > 20 else "")
+                            if rows else "Все строки плана подтверждены для этого склада. Склад в листе: «Указать склад в листе»."))
+
+    def _sc_scan(self, d, wh, days, cap, keep):  # worker thread
+        snap, p = self.sheets.snapshot(), d["plan"]
+        allowed = sorted(self.sc.confirmed(wh))
+        rules = self._keep_rules(d, allowed, cap) if keep else dict(base_rules(d), capacity=cap)
+        out = []
+        for day in days:
+            try:
+                out.append((day, self._build(None, rules, day.isoformat(), wh, self._arrival_for(p, day), d, allowed=allowed,
+                                             dry=True, snap=snap)))
+            except ValueError:
+                out.append((day, None))
+        return out
+
+    async def _sc_dates(self, uid, ct, msg, did, ver, nonce, mode):
+        st = self._sc_session(uid, did, ver, nonce)
+        if not st:
+            await msg.answer("Кнопка устарела. Нажмите «Проверить склады» ещё раз.")
+            return
+        d = await self._sc_plan(uid, did, ver, "d" if mode == "e" else None)
+        cur, today = date.fromisoformat(d["plan"]["date"]), datetime.now(MSK).date()
+        if mode == "e":  # a smaller machine fills sooner: today .. the current date, 20 pallets
+            days, cap = [today + timedelta(n) for n in range(max(0, (cur - today).days) + 1)], 20
+        else:  # later dates bring more of the stock below target: keep the lines, add to them up to the machine
+            days, cap = [cur + timedelta(n) for n in range(8)], d["plan"]["rules"]["capacity"]
+        await msg.answer("Считаю варианты по датам…")
+        ok, res = await self._guarded(uid, ct, msg, self._sc_scan, d, st["wh"], days, cap, mode == "l")
+        if not ok:
+            return
+        out, rows = [f"«{st['wh']}», машина {cap} паллет" + ("" if mode == "e" else " (текущие строки остаются, к ним добавляется товар)") + ":"], []
+        for day, plan in res:
+            tag = " (текущая дата)" if day == cur else ""
+            out.append(f"{day:%d.%m} — " + (f"{plan['total_pallets']} из {cap} паллет, строк {len(plan['lines'])}{tag}" if plan
+                                           else f"не рассчитывается{tag}"))
+            if plan and (mode == "e" or day != cur):
+                rows.append(_btn(f"{day:%d.%m}: {plan['total_pallets']}/{cap}", "pd", did, ver, nonce, mode, f"{day:%Y%m%d}"))
+        if mode == "e" and cur <= today:
+            out.append("Раньше сегодняшнего дня отгрузку не поставить.")
+        await msg.answer("\n".join(out), reply_markup=_kb([rows[i:i + 2] for i in range(0, len(rows), 2)]) if rows else None)
+
+    async def _c_d2(self, uid, ct, msg, did, ver, nonce=""):
+        await self._sc_dates(uid, ct, msg, did, ver, nonce, "e")
+
+    async def _c_d3(self, uid, ct, msg, did, ver, nonce=""):
+        await self._sc_dates(uid, ct, msg, did, ver, nonce, "l")
+
+    async def _c_pd(self, uid, ct, msg, did, ver, nonce="", mode="", ymd=""):
+        st = self._sc_session(uid, did, ver, nonce)
+        try:
+            day = date(int(ymd[:4]), int(ymd[4:6]), int(ymd[6:]))
+        except (ValueError, IndexError):
+            day = None
+        if not st or mode not in ("e", "l") or day is None or day < datetime.now(MSK).date():
+            await msg.answer("Кнопка устарела. Нажмите «Проверить склады» ещё раз.")
+            return
+        d = await self._sc_plan(uid, did, ver, "d" if mode == "e" else None)
+        if d.get("exported_version") == d["version"]:  # in the sheet already: move its dates, the owner then presses «Обновить по листу»
+            await self._date_confirm(uid, msg, d, day)
+            return
+        allowed = sorted(self.sc.confirmed(st["wh"]))
+        rules = dict(base_rules(d), capacity=20) if mode == "e" else self._keep_rules(d, allowed)
+        self._st.pop(uid, None)
+        await self._revise(uid, ct, msg, d, rules, st["wh"], day=day, allowed=allowed)
 
     async def _c_cap(self, uid, ct, msg, did, ver, n):
         d = await self._draft(uid, did, ver)
@@ -885,7 +1290,7 @@ class PlannerController:
         def lst(items, fmt):
             out = [fmt(x) for x in items[:8]]
             return "\n".join(out) + (f"\n… и ещё {len(items) - 8}" if len(items) > 8 else "")
-        parts = [("Готово. " if final else "") + f"Обновление по листу: убрано строк «Не согласовано»: {len(s['removed'])}, "
+        parts = [("Готово. " if final else "") + f"Обновление по листу: убрано строк («Не согласовано» / «Пересмотреть»): {len(s['removed'])}, "
                  f"оставлено: {s['kept']}, добавлено новых в конец: {len(s['added'])}.",
                  f"Загрузка машины {s['total_pallets']} из {s['capacity']} паллет."]
         if s["removed"]:
@@ -906,7 +1311,21 @@ class PlannerController:
             return exp.merge(base_rules(d), sel, set(plan.get("explicit_keys") or ()))[0]
         return fn
 
-    async def _c_up(self, uid, ct, msg, did, ver):
+    def _cap_fn(self, d, cap):
+        """Rules for an update, optionally with another machine (the owner picks 20 or 33 pallets to fill up to)."""
+        fn = self._rules_fn(d)
+        return fn if cap is None else (lambda snap: dict(fn(snap), capacity=cap))
+
+    @staticmethod
+    def _cap_arg(cap):
+        if cap in (None, ""):
+            return None
+        if str(cap) not in ("20", "33"):
+            raise ValueError("Кнопка устарела.")
+        return int(cap)
+
+    async def _c_up(self, uid, ct, msg, did, ver, cap=None):
+        cap = self._cap_arg(cap)
         d = await asyncio.to_thread(self.store.get, uid, did, ver)
         if d.get("exported_version") != ver:
             raise _Blocked("Сначала запишите этот план в тестовый лист.")
@@ -914,18 +1333,22 @@ class PlannerController:
 
         def work():
             self._mem_ok()
-            return self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did), rules_fn=self._rules_fn(d))
+            return self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did), rules_fn=self._cap_fn(d, cap))
         s = await asyncio.to_thread(work)
+        other = 33 if s["capacity"] == 20 else 20
         if not s["removed"] and not s["added"]:
-            await msg.answer(f"В листе нет строк «Не согласовано», и добавлять нечего: загрузка {s['total_pallets']} из "
-                             f"{s['capacity']} паллет.")
+            await msg.answer(f"В листе нет строк «Не согласовано» или «Пересмотреть», и добавлять нечего: загрузка {s['total_pallets']} из "
+                             f"{s['capacity']} паллет. Можно добить до другой машины.",
+                             reply_markup=_kb([[_btn(f"Добить до машины {other} паллет", "up", did, ver, other)]]))
             return
         self._st[uid] = {"step": "confirm", "confirm_up": (did, ver)}
         await msg.answer(self._update_text(s) + "\n\nПеред записью источники будут перепроверены; пишу только в "
                          "«Планирование FBO — ТЕСТ».",
-                         reply_markup=_kb([[_btn("Подтвердить обновление", "uk", did, ver), _btn("Отмена", "cn")]]))
+                         reply_markup=_kb([[_btn("Подтвердить обновление", "uk", did, ver, s["capacity"]), _btn("Отмена", "cn")],
+                                           [_btn(f"Добить до машины {other} паллет", "up", did, ver, other)]]))
 
-    async def _c_uk(self, uid, ct, msg, did, ver):
+    async def _c_uk(self, uid, ct, msg, did, ver, cap=None):
+        cap = self._cap_arg(cap)
         g = self._gen.get(uid, 0)
         d = await asyncio.to_thread(self.store.get, uid, did, ver)
         if (self._st.get(uid) or {}).get("confirm_up") != (did, ver) or d.get("exported_version") != ver:
@@ -938,7 +1361,7 @@ class PlannerController:
             if not self._owner(uid, ct) or self._gen.get(uid, 0) != g:
                 raise _Blocked("Обновление отменено.")
             self._mem_ok()
-            fn = self._rules_fn(d)
+            fn = self._cap_fn(d, cap)
             pre = self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did), rules_fn=fn)
             self.store.add_rejected(uid, did, pre["refused"])  # first: a retry after a lost response must not resurrect them
             return self.sheets.reconcile(d, rejected_before=self.store.rejected(uid, did), apply=True, rules_fn=fn)
@@ -953,11 +1376,11 @@ class PlannerController:
 
     async def _c_pub(self, uid, ct, msg, did, ver):
         d = await self._draft(uid, did, ver)
-        if d["plan"]["warehouse"] is None:
-            raise _Blocked("Склад не выбран: сначала нажмите «Выбрать склад». Запись предварительного состава невозможна.")
+        no_wh = (" Склад не выбран: ячейка склада останется пустой, позже её можно заполнить кнопкой «Указать склад в листе»."
+                 if d["plan"]["warehouse"] is None else "")
         self._st[uid] = {"step": "confirm", "confirm": (did, ver)}
         await msg.answer(f"Записать план {did} v{ver} ({len(d['plan']['lines'])} строк) в лист «Планирование FBO — ТЕСТ»? "
-                         "Источники будут перепроверены перед записью; в «Отгрузка FBO» запись невозможна.",
+                         "Источники будут перепроверены перед записью; в «Отгрузка FBO» запись невозможна." + no_wh,
                          reply_markup=_kb([[_btn("Подтвердить запись", "ok", did, ver), _btn("Отмена", "cn")]]))
 
     async def _c_ok(self, uid, ct, msg, did, ver):
@@ -968,9 +1391,6 @@ class PlannerController:
             return
         if (self._st.get(uid) or {}).get("confirm") != (did, ver) or d["version"] != d["latest_version"]:
             await msg.answer("Сначала нажмите «Записать в тестовый лист» у актуальной версии.")
-            return
-        if d["plan"]["warehouse"] is None:
-            await msg.answer("Склад не выбран: запись невозможна.")
             return
         self._st.pop(uid, None)
         await msg.answer("Перепроверяю источники и записываю в тестовый лист…")

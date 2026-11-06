@@ -92,6 +92,16 @@ class CrumbTest(unittest.TestCase):
         self.assertEqual([ln["article"] for ln in r["lines"]], ["A1"])
         self.assertTrue(any("A2" in w and "only" in w for w in r["warnings"]))
 
+    def test_small_leftover_is_topped_up_with_a_line_up_to_a_tenth_of_a_pallet(self):
+        # 19.9 of 20 pallets used; w2 needs ~5000 pcs, only 100 pcs (0.1 pallet) fit: shipped as a top-up
+        trows = [T("w1", "A1", stock=100000, s=(10, 10, 10, 10), fc=0), T("w2", "A2", stock=100000, s=(1000, 1000, 1000, 1000), fc=5)]
+        prows = [PK("w1", box=10, pal=100), PK("w2", box=10, pal=1000)]
+        rules = {"capacity": 20, "fixed": [{"article": "A1", "cabinet": "C1", "quantity": 1990, "reason": "x"}]}
+        r = P.build_plan(snap(trows, prows), rules, "2026-11-05", "WH", None, min_line_qty=0)
+        self.assertEqual([(ln["article"], ln["quantity"]) for ln in r["lines"]], [("A1", 1990), ("A2", 100)])
+        self.assertIn("top-up", r["lines"][1]["reason"])
+        self.assertLessEqual(float(r["total_pallets"]), 20)
+
     def test_threshold_can_be_switched_off(self):
         self.assertEqual([ln["article"] for ln in self.build(min_cover=0)["lines"]], ["A1", "A2"])
 

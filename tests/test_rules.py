@@ -25,9 +25,20 @@ class RulesTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             choose_dt(self.receipts(), 201, date(2026, 10, 22))
         receipts = self.receipts()
-        receipts[0]['dt'] = ''
+        receipts[0]['dt'] = 'bad'
         with self.assertRaises(ValueError):
             choose_dt(receipts, 50, date(2026, 10, 22))
+        for r in receipts:
+            r['dt'] = ''
+        with self.assertRaises(ValueError):
+            choose_dt(receipts, 50, date(2026, 10, 22))
+
+    def test_empty_dt_takes_freshest_filled_dt(self):
+        receipts = self.receipts()
+        receipts[1]['dt'] = ''
+        dt, trace = choose_dt(receipts, 200, date(2026, 10, 22))
+        self.assertEqual(dt, '10131010/201026/1234567')
+        self.assertEqual(trace[-1]['dt_from_row'], 5)
 
     def test_future_receipt_is_excluded(self):
         with self.assertRaises(ValueError):

@@ -2,6 +2,8 @@
 import asyncio
 import csv
 import json
+import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -10,10 +12,13 @@ from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from wb_declarations import (PROJECT, KEY, SHIPMENTS, RECEIPTS, BASE_TEMPLATE, Sheets, parse_date,
+from dotenv import dotenv_values
+
+from wb_declarations import (is_blank_placeholder, PROJECT, KEY, SHIPMENTS, RECEIPTS, BASE_TEMPLATE, Sheets, parse_date,
     normalize, integer, index, value_at, shipment_queue, load_receipts, prepare, write_plan)
 
 REPORT = 'СПИСОК_ФАЙЛОВ.csv'
@@ -23,6 +28,64 @@ DELIVERIES = PROJECT / 'runs' / 'deliveries'
 
 def now():
     return datetime.now(ZoneInfo('Europe/Moscow'))
+
+
+# Secret scrubbing for the local error log: the log is plain text on disk, so no credential may reach it.
+HIDDEN = '[скрыто]'
+SECRET_NAMES = re.compile(r'TOKEN|PASSWORD|PASSWD|SECRET|KEY|PRIVATE|CREDENTIAL|DATABASE_URL|DSN|^PG', re.I)
+SECRET_PATTERNS = [
+    (re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)', re.S), HIDDEN),
+    (re.compile(r'(?i)\b([a-z][a-z0-9+.\-]*://)[^\s/@:]*:[^\s/@]*@'), r'\1' + HIDDEN + '@'),
+    (re.compile(r'(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]+'), 'Bearer ' + HIDDEN),
+    (re.compile(r'(?<!\d)\d{6,}:[A-Za-z0-9_-]{30,}'), HIDDEN),
+    (re.compile(r'\bAIza[0-9A-Za-z_-]{20,}'), HIDDEN),
+    # name=value / "name": "value" for any parameter whose name contains password, passwd, pwd, token, secret or key;
+    # a quoted value is hidden whole, spaces included.
+    (re.compile(r'''(?i)((?:password|passwd|pwd|token|secret|key)["']?\s*[=:]\s*)'''
+                r'''(?:"[^"]*"|'[^']*'|[^\s&"',;)]+)'''), r'\1' + HIDDEN),
+]
+
+
+def secret_values():
+    """Secret values from the process environment and the project .env (the values themselves are never logged).
+    A .env that exists but cannot be read raises: safe_traceback then logs class names and frames only."""
+    pairs = list(os.environ.items())
+    env_file = PROJECT / '.env'
+    if env_file.exists():
+        pairs += [(k, v) for k, v in dotenv_values(env_file, interpolate=False).items() if v]
+    found = set()
+    for name, value in pairs:
+        value = (value or '').strip()
+        if value and SECRET_NAMES.search(name):
+            found.update((value, quote(value, safe='')))  # hidden whatever the length: a short secret is still a secret
+    return sorted(found, key=len, reverse=True)
+
+
+def redact(text, secrets=()):
+    for value in secrets:
+        text = text.replace(value, HIDDEN)
+    for pattern, replacement in SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def stack_only(exc):
+    """Class names and frames of the exception chain without any message text."""
+    lines, seen = [], set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        lines.append(type(exc).__name__)
+        lines += [f'  {frame.filename}:{frame.lineno} in {frame.name}' for frame in traceback.extract_tb(exc.__traceback__)]
+        exc = exc.__cause__ or exc.__context__
+    return '\n'.join(lines)
+
+
+def safe_traceback(exc):
+    """Traceback of the whole chain with secrets removed; if scrubbing itself fails, only class names and frames."""
+    try:
+        return redact(''.join(traceback.format_exception(exc)), secret_values())
+    except Exception:
+        return stack_only(exc)
 
 
 def group_key(record):
@@ -38,8 +101,10 @@ def all_records(rows):
     col = index(rows[0], 'Дата отгрузки (склад)')
     dates = set()
     status = index(rows[0], 'Статус отгрузки')
+    supply = index(rows[0], 'Номер поставки')
     for row in rows[1:]:
-        if normalize(value_at(row, status)) == 'одобрено':
+        if (normalize(value_at(row, status)) == 'одобрено'
+                and not is_blank_placeholder(row, col, supply)):
             dates.add(parse_date(value_at(row, col)))
     result = []
     for date in sorted(dates):
@@ -325,7 +390,7 @@ class CacheService:
                     log = self.store.path.parent / 'refresh_error.log'
                     log.parent.mkdir(exist_ok=True)
                     with log.open('a', encoding='utf-8') as handle:
-                        handle.write(f'{now().isoformat()} {reason}\n{traceback.format_exc()}\n')
+                        handle.write(f'{now().isoformat()} {reason}\n{safe_traceback(exc)}\n')
                 except OSError:
                     pass
                 with self.store.connect() as db:
