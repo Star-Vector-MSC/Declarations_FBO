@@ -1,5 +1,6 @@
 name: Tests
 on: [push, pull_request]
+# Read-only token: a misconfigured or compromised step cannot push or change the repository.
 permissions:
   contents: read
 jobs:
